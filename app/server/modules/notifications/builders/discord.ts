@@ -10,22 +10,20 @@ export const buildDiscordShoutrrrUrl = (config: Extract<NotificationConfig, { ty
 
 	const [, , webhookId, webhookToken] = pathParts;
 
-	let shoutrrrUrl = `discord://${webhookToken}@${webhookId}`;
+	const shoutrrrUrl = new URL("discord://placeholder");
+	shoutrrrUrl.username = webhookToken;
+	shoutrrrUrl.hostname = webhookId;
 
-	const params = new URLSearchParams();
+	shoutrrrUrl.searchParams.append("splitLines", "false");
 	if (config.username) {
-		params.append("username", config.username);
+		shoutrrrUrl.searchParams.append("username", config.username);
 	}
 	if (config.avatarUrl) {
-		params.append("avatarurl", config.avatarUrl);
+		shoutrrrUrl.searchParams.append("avatarurl", config.avatarUrl);
 	}
 	if (config.threadId) {
-		params.append("thread_id", config.threadId);
+		shoutrrrUrl.searchParams.append("thread_id", config.threadId);
 	}
 
-	if (params.toString()) {
-		shoutrrrUrl += `?${params.toString()}`;
-	}
-
-	return shoutrrrUrl;
+	return shoutrrrUrl.toString().replace("/?", "?");
 };

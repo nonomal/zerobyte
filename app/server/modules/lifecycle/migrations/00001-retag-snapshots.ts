@@ -1,10 +1,11 @@
 import { eq } from "drizzle-orm";
 import { db } from "../../../db/db";
 import { backupScheduleMirrorsTable, type Repository } from "../../../db/schema";
-import { logger } from "../../../utils/logger";
+import { logger } from "@zerobyte/core/node";
 import { toMessage } from "~/server/utils/errors";
-import { exec } from "~/server/utils/spawn";
-import { addCommonArgs, buildEnv, buildRepoUrl, cleanupTemporaryKeys } from "~/server/utils/restic";
+import { safeExec } from "@zerobyte/core/node";
+import { addCommonArgs, buildEnv, buildRepoUrl, cleanupTemporaryKeys } from "@zerobyte/core/restic/server";
+import { resticDeps } from "~/server/core/restic";
 
 const migrateTag = async (
 	oldTag: string,
@@ -13,15 +14,15 @@ const migrateTag = async (
 	scheduleName: string,
 ): Promise<string | null> => {
 	const repoUrl = buildRepoUrl(repository.config);
-	const env = await buildEnv(repository.config, repository.organizationId);
+	const env = await buildEnv(repository.config, repository.organizationId, resticDeps);
 
 	const args = ["--repo", repoUrl, "tag", "--tag", oldTag, "--add", newTag, "--remove", oldTag];
 
 	addCommonArgs(args, env);
 
 	logger.info(`Migrating snapshots for schedule '${scheduleName}' from tag '${oldTag}' to '${newTag}'`);
-	const res = await exec({ command: "restic", args, env });
-	await cleanupTemporaryKeys(env);
+	const res = await safeExec({ command: resticDeps.resticCommand ?? "restic", args, env });
+	await cleanupTemporaryKeys(env, resticDeps);
 
 	if (res.exitCode !== 0) {
 		logger.error(`Restic tag failed: ${res.stderr}`);
@@ -67,7 +68,10 @@ const execute = async () => {
 				});
 
 				if (!mirrorRepo) {
-					errors.push({ name: `schedule-mirror:${schedule.name}`, error: `Associated mirror repository not found` });
+					errors.push({
+						name: `schedule-mirror:${schedule.name}`,
+						error: `Associated mirror repository not found`,
+					});
 					continue;
 				}
 

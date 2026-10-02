@@ -1,18 +1,28 @@
-ARG BUN_VERSION="1.3.9"
+FROM oven/bun:1.4.2-alpine@sha256:d888c0ae6c86d7866ff10c5aafdd9077b36aee6455b33dd270fb93c0dd5cef6f AS base
 
-FROM oven/bun:${BUN_VERSION}-alpine AS base
-
-ARG RESTIC_VERSION="0.18.1"
-ARG RCLONE_VERSION="1.73.0"
-ARG SHOUTRRR_VERSION="0.13.1"
+# renovate: datasource=github-releases depName=restic/restic versioning=semver extractVersion=^v?(?<version>.+)$
+ARG RESTIC_VERSION="0.19.1"
+# renovate: datasource=github-releases depName=rclone/rclone versioning=semver extractVersion=^v?(?<version>.+)$
+ARG RCLONE_VERSION="1.75.1"
+# renovate: datasource=github-releases depName=nicholas-fedor/shoutrrr versioning=semver extractVersion=^v?(?<version>.+)$
+ARG SHOUTRRR_VERSION="0.21.1"
 
 ENV VITE_RESTIC_VERSION=${RESTIC_VERSION} \
     VITE_RCLONE_VERSION=${RCLONE_VERSION} \
     VITE_SHOUTRRR_VERSION=${SHOUTRRR_VERSION}
 
-RUN apk update --no-cache && \
-    apk upgrade --no-cache && \
-    apk add --no-cache davfs2=1.6.1-r2 openssh-client fuse3 sshfs tini
+RUN apk add --no-cache \
+	acl \
+	attr \
+	cifs-utils \
+	davfs2 \
+	fuse3 \
+	libcrypto3=3.5.7-r0 \
+	libssl3=3.5.7-r0 \
+	openssh-client-default \
+	sshfs \
+	tini \
+	tzdata
 
 ENTRYPOINT ["/sbin/tini", "-s", "--"]
 
@@ -27,24 +37,37 @@ WORKDIR /deps
 ARG TARGETARCH
 ENV TARGETARCH=${TARGETARCH}
 
-RUN apk add --no-cache curl bzip2 unzip tar
+RUN apk add --no-cache \
+	bzip2 \
+	curl \
+	tar \
+	unzip
 
 RUN echo "Building for ${TARGETARCH}"
 RUN if [ "${TARGETARCH}" = "arm64" ]; then \
-	    curl -L -o restic.bz2 "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_arm64.bz2"; \
-      curl -L -o rclone.zip "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-arm64.zip"; \
+	    curl -fL -o restic.bz2 "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_arm64.bz2"; \
+      curl -fL -o rclone.zip "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-arm64.zip"; \
       unzip rclone.zip; \
-      curl -L -o shoutrrr.tar.gz "https://github.com/nicholas-fedor/shoutrrr/releases/download/v${SHOUTRRR_VERSION}/shoutrrr_linux_arm64v8_${SHOUTRRR_VERSION}.tar.gz"; \
+      curl -fL -o shoutrrr.tar.gz "https://github.com/nicholas-fedor/shoutrrr/releases/download/v${SHOUTRRR_VERSION}/shoutrrr_linux_arm64v8_${SHOUTRRR_VERSION}.tar.gz"; \
       elif [ "${TARGETARCH}" = "amd64" ]; then \
-      curl -L -o restic.bz2 "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"; \
-      curl -L -o rclone.zip "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"; \
+      curl -fL -o restic.bz2 "https://github.com/restic/restic/releases/download/v${RESTIC_VERSION}/restic_${RESTIC_VERSION}_linux_amd64.bz2"; \
+      curl -fL -o rclone.zip "https://github.com/rclone/rclone/releases/download/v${RCLONE_VERSION}/rclone-v${RCLONE_VERSION}-linux-amd64.zip"; \
       unzip rclone.zip; \
-      curl -L -o shoutrrr.tar.gz "https://github.com/nicholas-fedor/shoutrrr/releases/download/v$SHOUTRRR_VERSION/shoutrrr_linux_amd64_${SHOUTRRR_VERSION}.tar.gz"; \
+      curl -fL -o shoutrrr.tar.gz "https://github.com/nicholas-fedor/shoutrrr/releases/download/v$SHOUTRRR_VERSION/shoutrrr_linux_amd64_${SHOUTRRR_VERSION}.tar.gz"; \
       fi
 
 RUN bzip2 -d restic.bz2 && chmod +x restic
 RUN mv rclone-v*-linux-*/rclone /deps/rclone && chmod +x /deps/rclone
 RUN tar -xzf shoutrrr.tar.gz && chmod +x shoutrrr
+
+# ------------------------------
+# RUNTIME TOOLS
+# ------------------------------
+FROM base AS runtime-tools
+
+COPY --from=deps /deps/restic /usr/local/bin/restic
+COPY --from=deps /deps/rclone /usr/local/bin/rclone
+COPY --from=deps /deps/shoutrrr /usr/local/bin/shoutrrr
 
 # ------------------------------
 # DEVELOPMENT
@@ -63,8 +86,13 @@ COPY --from=deps /deps/rclone /usr/local/bin/rclone
 COPY --from=deps /deps/shoutrrr /usr/local/bin/shoutrrr
 
 COPY ./package.json ./bun.lock ./
+COPY ./packages/core/package.json ./packages/core/package.json
+COPY ./packages/contracts/package.json ./packages/contracts/package.json
+COPY ./apps/agent/package.json ./apps/agent/package.json
+COPY ./apps/docs/package.json ./apps/docs/package.json
+COPY ./apps/desktop/package.json ./apps/desktop/package.json
 
-RUN bun install --frozen-lockfile --ignore-scripts
+RUN VITE_GIT_HOOKS=0 bun install --frozen-lockfile --ignore-scripts --filter '!docs'
 
 COPY . .
 
@@ -79,32 +107,39 @@ FROM base AS builder
 
 ARG APP_VERSION=dev
 ENV VITE_APP_VERSION=${APP_VERSION}
+ENV PORT=4096
 
 WORKDIR /app
 
 COPY ./package.json ./bun.lock ./
-RUN bun install --frozen-lockfile
+COPY ./packages/core/package.json ./packages/core/package.json
+COPY ./packages/contracts/package.json ./packages/contracts/package.json
+COPY ./apps/agent/package.json ./apps/agent/package.json
+COPY ./apps/docs/package.json ./apps/docs/package.json
+COPY ./apps/desktop/package.json ./apps/desktop/package.json
+
+RUN VITE_GIT_HOOKS=0 bun install --frozen-lockfile --filter '!docs'
 
 COPY . .
 
 RUN bun run build
+RUN bun build apps/agent/src/index.ts --outfile .output/agent/index.mjs --target bun
 
 FROM base AS production
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
 ENV NODE_ENV="production"
+ENV PORT=4096
 
 WORKDIR /app
 
 COPY --from=builder /app/package.json ./
-RUN bun install --production --frozen-lockfile && rm -rf $HOME/.bun/install/cache
 
 COPY --from=deps /deps/restic /usr/local/bin/restic
 COPY --from=deps /deps/rclone /usr/local/bin/rclone
 COPY --from=deps /deps/shoutrrr /usr/local/bin/shoutrrr
-COPY --from=builder /app/dist/client ./dist/client
-COPY --from=builder /app/dist/server ./dist/server
+COPY --from=builder /app/.output ./.output
 COPY --from=builder /app/app/drizzle ./assets/migrations
 
 # Include third-party licenses and attribution
@@ -114,5 +149,4 @@ COPY ./LICENSE ./LICENSE.md
 
 EXPOSE 4096
 
-CMD ["bun", "run", "start"]
-
+CMD ["bun", ".output/server/index.mjs"]

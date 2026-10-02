@@ -1,4 +1,4 @@
-import { Check, Database, Eraser, HardDrive, Pencil, Play, Square, Trash2, X } from "lucide-react";
+import { Check, ChevronDown, Database, Eraser, HardDrive, Pencil, Play, Square, Trash2, X } from "lucide-react";
 import { useMemo, useState } from "react";
 import { OnOff } from "~/client/components/onoff";
 import { Button } from "~/client/components/ui/button";
@@ -12,43 +12,62 @@ import {
 	AlertDialogHeader,
 	AlertDialogTitle,
 } from "~/client/components/ui/alert-dialog";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuSeparator,
+	DropdownMenuTrigger,
+} from "~/client/components/ui/dropdown-menu";
 import type { BackupSchedule } from "~/client/lib/types";
 import { BackupProgressCard } from "./backup-progress-card";
-import { runForgetMutation } from "~/client/api-client/@tanstack/react-query.gen";
+import { cancelTaskMutation, runForgetMutation } from "~/client/api-client/@tanstack/react-query.gen";
 import { useMutation } from "@tanstack/react-query";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { parseError } from "~/client/lib/errors";
-import { Link } from "react-router";
-import { formatShortDateTime, formatTimeAgo } from "~/client/lib/datetime";
+import { handleRepositoryError, parseError } from "~/client/lib/errors";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/client/components/ui/collapsible";
+import { TimeAgo } from "~/client/components/time-ago";
+import { useTimeFormat } from "~/client/lib/datetime";
+import { cn } from "~/client/lib/utils";
+import { useBackupTask } from "../backup-tasks";
 
 type Props = {
 	schedule: BackupSchedule;
 	handleToggleEnabled: (enabled: boolean) => void;
 	handleRunBackupNow: () => void;
-	handleStopBackup: () => void;
 	handleDeleteSchedule: () => void;
-	setIsEditMode: (isEdit: boolean) => void;
 };
 
 export const ScheduleSummary = (props: Props) => {
-	const { schedule, handleToggleEnabled, handleRunBackupNow, handleStopBackup, handleDeleteSchedule, setIsEditMode } =
-		props;
+	const { schedule, handleToggleEnabled, handleRunBackupNow, handleDeleteSchedule } = props;
+	const { formatShortDateTime } = useTimeFormat();
+	const navigate = useNavigate();
 	const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 	const [showForgetConfirm, setShowForgetConfirm] = useState(false);
 	const [showStopConfirm, setShowStopConfirm] = useState(false);
+	const { activeBackupTask, backupProgress, isBackupRunning } = useBackupTask(schedule.shortId);
+
+	const cancelBackup = useMutation({
+		...cancelTaskMutation(),
+		onError: (error) => {
+			toast.error("Failed to stop backup", { description: parseError(error)?.message });
+		},
+	});
+
+	const isBackupCancelling = activeBackupTask?.status === "cancelling";
+	const isStoppingBackup = cancelBackup.isPending || isBackupCancelling;
+	const stopBackupLabel = isBackupCancelling ? "Cancelling backup..." : "Stop backup";
 
 	const runForget = useMutation({
 		...runForgetMutation(),
-		onSuccess: () => {
-			toast.success("Retention policy applied successfully");
-		},
 		onError: (error) => {
-			toast.error("Failed to apply retention policy", { description: parseError(error)?.message });
+			handleRepositoryError("Failed to apply retention policy", error, schedule.repository.shortId);
 		},
 	});
 
 	const summary = useMemo(() => {
-		const scheduleLabel = schedule ? schedule.cronExpression : "-";
+		const scheduleLabel = schedule ? schedule.cronExpression || "Manual only" : "-";
 
 		const retentionParts: string[] = [];
 		if (schedule?.retentionPolicy) {
@@ -76,35 +95,52 @@ export const ScheduleSummary = (props: Props) => {
 
 	const handleConfirmForget = () => {
 		setShowForgetConfirm(false);
-		runForget.mutate({ path: { scheduleId: schedule.id.toString() } });
+		toast.promise(runForget.mutateAsync({ path: { shortId: schedule.shortId } }), {
+			loading: "Starting cleanup...",
+			success: "Retention cleanup started",
+		});
 	};
 
 	const handleConfirmStop = () => {
 		setShowStopConfirm(false);
-		if (schedule.lastBackupStatus !== "in_progress") return;
-		handleStopBackup();
+		if (!activeBackupTask || isStoppingBackup) return;
+
+		const taskId = activeBackupTask.id;
+		cancelBackup.mutate({ path: { taskId } });
 	};
 
 	return (
 		<div className="space-y-4">
-			<Card>
+			<Card className="@container">
 				<CardHeader className="space-y-4">
-					<div className="flex flex-col @sm:flex-row @sm:items-center @sm:justify-between gap-4">
+					<div className="flex flex-col @medium:flex-row @medium:items-center @medium:justify-between gap-4">
 						<div>
 							<CardTitle>{schedule.name}</CardTitle>
 							<CardDescription className="mt-1">
-								<Link to={`/volumes/${schedule.volume.shortId}`} className="hover:underline">
+								<Link
+									to="/volumes/$volumeId"
+									className="hover:underline"
+									params={{ volumeId: schedule.volume.shortId }}
+								>
 									<HardDrive className="inline h-4 w-4 mr-2" />
 									<span>{schedule.volume.name}</span>
 								</Link>
 								<span className="mx-2">→</span>
-								<Link to={`/repositories/${schedule.repository.shortId}`} className="hover:underline">
+								<Link
+									to="/repositories/$repositoryId"
+									className="hover:underline"
+									params={{ repositoryId: schedule.repository.shortId }}
+								>
 									<Database className="inline h-4 w-4 mr-2 text-strong-accent" />
 									<span className="text-strong-accent">{schedule.repository.name}</span>
 								</Link>
 							</CardDescription>
 						</div>
-						<div className="flex items-center gap-2 justify-between @sm:justify-start">
+						<div
+							className={cn("flex items-center gap-2 justify-between @medium:justify-start", {
+								hidden: !schedule.cronExpression,
+							})}
+						>
 							<OnOff
 								isOn={schedule.enabled}
 								toggle={handleToggleEnabled}
@@ -113,54 +149,67 @@ export const ScheduleSummary = (props: Props) => {
 							/>
 						</div>
 					</div>
-					<div className="flex flex-col @lg:flex-row gap-2">
-						{schedule.lastBackupStatus === "in_progress" ? (
+					<div className="flex items-center gap-2">
+						{isBackupRunning ? (
 							<Button
 								variant="destructive"
 								size="sm"
+								loading={cancelBackup.isPending}
+								disabled={isBackupCancelling}
 								onClick={() => setShowStopConfirm(true)}
-								className="w-full @md:w-auto"
 							>
 								<Square className="h-4 w-4 mr-2" />
-								<span>Stop backup</span>
+								<span>{stopBackupLabel}</span>
 							</Button>
 						) : (
-							<Button variant="default" size="sm" onClick={handleRunBackupNow} className="w-full @md:w-auto">
+							<Button variant="default" size="sm" onClick={handleRunBackupNow}>
 								<Play className="h-4 w-4 mr-2" />
 								<span>Backup now</span>
 							</Button>
 						)}
-						{schedule.retentionPolicy && (
-							<Button
-								variant="outline"
-								size="sm"
-								loading={runForget.isPending}
-								onClick={() => setShowForgetConfirm(true)}
-								className="w-full @md:w-auto"
-							>
-								<Eraser className="h-4 w-4 mr-2" />
-								<span>Run cleanup</span>
-							</Button>
-						)}
-						<Button variant="outline" size="sm" onClick={() => setIsEditMode(true)} className="w-full @md:w-auto">
-							<Pencil className="h-4 w-4 mr-2" />
-							<span>Edit schedule</span>
-						</Button>
-						<Button
-							variant="outline"
-							size="sm"
-							onClick={() => setShowDeleteConfirm(true)}
-							className="text-destructive hover:text-destructive w-full @md:w-auto"
-						>
-							<Trash2 className="h-4 w-4 mr-2" />
-							<span>Delete</span>
-						</Button>
+						<DropdownMenu>
+							<DropdownMenuTrigger asChild>
+								<Button variant="outline" size="sm">
+									Actions
+									<ChevronDown className="h-4 w-4 ml-1" />
+								</Button>
+							</DropdownMenuTrigger>
+							<DropdownMenuContent align="end">
+								{schedule.retentionPolicy && (
+									<DropdownMenuItem
+										onClick={() => setShowForgetConfirm(true)}
+										disabled={runForget.isPending}
+									>
+										<Eraser />
+										Run cleanup
+									</DropdownMenuItem>
+								)}
+								<DropdownMenuItem
+									onClick={() =>
+										navigate({
+											to: "/backups/$backupId/edit",
+											params: { backupId: schedule.shortId },
+										})
+									}
+								>
+									<Pencil />
+									Edit schedule
+								</DropdownMenuItem>
+								<DropdownMenuSeparator />
+								<DropdownMenuItem variant="destructive" onClick={() => setShowDeleteConfirm(true)}>
+									<Trash2 />
+									Delete
+								</DropdownMenuItem>
+							</DropdownMenuContent>
+						</DropdownMenu>
 					</div>
 				</CardHeader>
-				<CardContent className="grid gap-4 grid-cols-1 @md:grid-cols-2 @lg:grid-cols-4">
-					<div>
+				<CardContent className="grid min-w-0 gap-4 grid-cols-1 @medium:grid-cols-2 @wide:grid-cols-4">
+					<div className="min-w-0">
 						<p className="text-xs uppercase text-muted-foreground">Schedule</p>
-						<p className="font-medium">{summary.scheduleLabel}</p>
+						<p className="font-medium wrap-anywhere" title={summary.scheduleLabel}>
+							{summary.scheduleLabel}
+						</p>
 					</div>
 					<div>
 						<p className="text-xs uppercase text-muted-foreground">Repository</p>
@@ -168,7 +217,7 @@ export const ScheduleSummary = (props: Props) => {
 					</div>
 					<div>
 						<p className="text-xs uppercase text-muted-foreground">Last backup</p>
-						<p className="font-medium">{formatTimeAgo(schedule.lastBackupAt)}</p>
+						<TimeAgo date={schedule.lastBackupAt} className="font-medium" />
 					</div>
 					<div>
 						<p className="text-xs uppercase text-muted-foreground">Next backup</p>
@@ -178,44 +227,70 @@ export const ScheduleSummary = (props: Props) => {
 					<div>
 						<p className="text-xs uppercase text-muted-foreground">Status</p>
 						<p className="font-medium">
-							{schedule.lastBackupStatus === "success" && "✓ Success"}
-							{schedule.lastBackupStatus === "error" && "✗ Error"}
-							{schedule.lastBackupStatus === "in_progress" && "⟳  in progress..."}
-							{schedule.lastBackupStatus === "warning" && "! Warning"}
-							{!schedule.lastBackupStatus && "—"}
+							{!isBackupRunning && schedule.lastBackupStatus === "success" && "✓ Success"}
+							{!isBackupRunning && schedule.lastBackupStatus === "error" && "✗ Error"}
+							{isBackupRunning && (isBackupCancelling ? "⟳  Cancelling backup..." : "⟳  in progress...")}
+							{!isBackupRunning && schedule.lastBackupStatus === "warning" && "! Warning"}
+							{!isBackupRunning && !schedule.lastBackupStatus && "—"}
 						</p>
 					</div>
 
-					{schedule.lastBackupStatus === "warning" && (
-						<div className="@md:col-span-2 @lg:col-span-4">
-							<p className="text-xs uppercase text-muted-foreground">Warning Details</p>
-							<p className="font-mono text-sm text-yellow-600 whitespace-pre-wrap wrap-break-word">
-								{schedule.lastBackupError ??
-									"Last backup completed with warnings. Check your container logs for more details."}
-							</p>
-						</div>
-					)}
-
-					{schedule.lastBackupError && schedule.lastBackupStatus === "error" && (
-						<div className="@md:col-span-2 @lg:col-span-4">
-							<p className="text-xs uppercase text-muted-foreground">Error details</p>
-							<p className="font-mono text-sm text-red-600 whitespace-pre-wrap wrap-break-word">
-								{schedule.lastBackupError}
-							</p>
-						</div>
-					)}
+					{!isBackupRunning &&
+						(schedule.lastBackupStatus === "warning" || schedule.lastBackupStatus === "error") && (
+							<div className="@medium:col-span-2 @wide:col-span-4">
+								<Collapsible
+									className={cn("border border-border/50 rounded-lg overflow-hidden", {
+										"border-yellow-500/20 bg-yellow-500/5": schedule.lastBackupStatus === "warning",
+										"border-red-500/20 bg-red-500/5": schedule.lastBackupStatus === "error",
+									})}
+								>
+									<CollapsibleTrigger
+										className={cn("w-full justify-start p-3 hover:bg-muted/50 transition-colors", {
+											"hover:bg-yellow-500/10": schedule.lastBackupStatus === "warning",
+											"hover:bg-red-500/10": schedule.lastBackupStatus === "error",
+										})}
+									>
+										<span>
+											{schedule.lastBackupStatus === "warning"
+												? "Warning details"
+												: "Error details"}
+										</span>
+									</CollapsibleTrigger>
+									<CollapsibleContent
+										className={cn("border-t border-border/50 bg-muted/30", {
+											"border-yellow-500/20 bg-yellow-500/8":
+												schedule.lastBackupStatus === "warning",
+											"border-red-500/20 bg-red-500/8": schedule.lastBackupStatus === "error",
+										})}
+									>
+										<div className="p-3">
+											<p
+												className={cn("font-mono text-sm whitespace-pre-wrap wrap-break-word", {
+													"text-yellow-600": schedule.lastBackupStatus === "warning",
+													"text-red-600": schedule.lastBackupStatus === "error",
+												})}
+											>
+												{schedule.lastBackupError ??
+													"No additional details available. check your container logs for more information."}
+											</p>
+										</div>
+									</CollapsibleContent>
+								</Collapsible>
+							</div>
+						)}
 				</CardContent>
 			</Card>
 
-			{schedule.lastBackupStatus === "in_progress" && <BackupProgressCard scheduleId={schedule.id} />}
+			{isBackupRunning && <BackupProgressCard progress={backupProgress} />}
 
 			<AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
 				<AlertDialogContent>
 					<AlertDialogHeader>
 						<AlertDialogTitle>Delete backup schedule?</AlertDialogTitle>
 						<AlertDialogDescription>
-							Are you sure you want to delete this backup schedule for <strong>{schedule.volume.name}</strong>? This
-							action cannot be undone. Existing snapshots will not be deleted.
+							Are you sure you want to delete this backup schedule for{" "}
+							<strong>{schedule.volume.name}</strong>? This action cannot be undone. Existing snapshots
+							will not be deleted.
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<div className="flex gap-3 justify-end">
@@ -235,8 +310,8 @@ export const ScheduleSummary = (props: Props) => {
 					<AlertDialogHeader>
 						<AlertDialogTitle>Run retention policy cleanup?</AlertDialogTitle>
 						<AlertDialogDescription>
-							This will apply the retention policy and permanently delete old snapshots according to the configured
-							rules ({summary.retentionLabel}). This action cannot be undone.
+							This will apply the retention policy and permanently delete old snapshots according to the
+							configured rules ({summary.retentionLabel}). This action cannot be undone.
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<div className="flex gap-3 justify-end">
@@ -264,6 +339,7 @@ export const ScheduleSummary = (props: Props) => {
 						<AlertDialogCancel>Cancel</AlertDialogCancel>
 						<AlertDialogAction
 							onClick={handleConfirmStop}
+							disabled={isStoppingBackup}
 							className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
 						>
 							Stop backup

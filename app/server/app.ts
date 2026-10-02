@@ -1,43 +1,46 @@
-import { Scalar } from "@scalar/hono-api-reference";
+import type { Context, Next } from "hono";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
-import { logger as honoLogger } from "hono/logger";
 import { secureHeaders } from "hono/secure-headers";
 import { rateLimiter } from "hono-rate-limiter";
-import { openAPIRouteHandler } from "hono-openapi";
+import { apiDocsHandler, createOpenApiHandler } from "./api-docs";
 import { authController } from "./modules/auth/auth.controller";
-import { requireAuth } from "./modules/auth/auth.middleware";
+import { ssoController } from "./modules/sso/sso.controller";
+import { handleAuthCallbackErrors } from "./modules/sso/middlewares/handle-auth-callback-errors";
+import { conditionalRequireAuth } from "./modules/auth/auth.middleware";
 import { repositoriesController } from "./modules/repositories/repositories.controller";
 import { systemController } from "./modules/system/system.controller";
 import { volumeController } from "./modules/volumes/volume.controller";
 import { backupScheduleController } from "./modules/backups/backups.controller";
 import { eventsController } from "./modules/events/events.controller";
 import { notificationsController } from "./modules/notifications/notifications.controller";
+import { apiKeysController } from "./modules/api-keys/api-keys.controller";
+import { desktopController } from "./modules/desktop/desktop.controller";
+import { tasksController } from "./modules/tasks/tasks.controller";
 import { handleServiceError } from "./utils/errors";
-import { logger } from "./utils/logger";
+import { logger } from "@zerobyte/core/node";
 import { config } from "./core/config";
 import { auth } from "~/server/lib/auth";
+import { db } from "./db/db";
+import { invalidateAuthSession, isSessionAuthSourceAllowed } from "./modules/auth/helpers";
 
-export const generalDescriptor = (app: Hono) =>
-	openAPIRouteHandler(app, {
-		documentation: {
-			info: {
-				title: "Zerobyte API",
-				version: "1.0.0",
-				description: "API for managing volumes",
-			},
-			servers: [{ url: `http://${config.serverIp}:4096`, description: "Development Server" }],
-		},
-	});
+const requestLogger = async (c: Context, next: Next) => {
+	const method = c.req.method;
+	const path = c.req.path;
+	const start = performance.now();
 
-export const scalarDescriptor = Scalar({
-	title: "Zerobyte API Docs",
-	pageTitle: "Zerobyte API Docs",
-	url: "/api/v1/openapi.json",
-});
+	logger.debug(`<-- ${method} ${path}`);
+
+	try {
+		await next();
+	} finally {
+		logger.debug(`--> ${method} ${path} ${c.res.status} ${Math.round(performance.now() - start)}ms`);
+	}
+};
 
 export const createApp = () => {
+	db.run("PRAGMA foreign_keys = ON;");
 	const app = new Hono();
 
 	if (config.trustedOrigins) {
@@ -46,21 +49,19 @@ export const createApp = () => {
 
 	if (config.environment === "production") {
 		app.use(secureHeaders());
-		app.use(honoLogger());
+		app.use(requestLogger);
 	}
 
-	if (!config.disableRateLimiting) {
-		app.use(
-			rateLimiter({
-				windowMs: 60 * 5 * 1000,
-				limit: 1000,
-				keyGenerator: (c) => c.req.header("x-forwarded-for") ?? "",
-				skip: () => {
-					return config.__prod__ === false;
-				},
-			}),
-		);
-	}
+	app.use(
+		rateLimiter({
+			windowMs: 60 * 5 * 1000,
+			limit: 1000,
+			keyGenerator: (c) => c.req.header("x-forwarded-for") ?? "",
+			skip: () => {
+				return config.flags.disableRateLimiting;
+			},
+		}),
+	);
 
 	app.use(
 		bodyLimit({
@@ -69,30 +70,57 @@ export const createApp = () => {
 		}),
 	);
 
-	app
-		.get("healthcheck", (c) => c.json({ status: "ok" }))
+	app.get("/api/healthcheck", (c) => c.json({ status: "ok" }))
 		.route("/api/v1/auth", authController)
+		.route("/api/v1/auth", apiKeysController)
+		.route("/api/v1/auth", ssoController)
 		.route("/api/v1/volumes", volumeController)
 		.route("/api/v1/repositories", repositoriesController)
 		.route("/api/v1/backups", backupScheduleController)
 		.route("/api/v1/notifications", notificationsController)
 		.route("/api/v1/system", systemController)
+		.route("/api/v1/tasks", tasksController)
+		.route("/api/v1/desktop", desktopController)
 		.route("/api/v1/events", eventsController);
 
-	app.on(["POST", "GET"], "/api/auth/*", (c) => auth.handler(c.req.raw));
-	app.get("/api/v1/openapi.json", generalDescriptor(app));
-	app.get("/api/v1/docs", requireAuth, scalarDescriptor);
+	app.use("/api/auth/*", handleAuthCallbackErrors);
+	app.on(["POST", "GET"], "/api/auth/*", async (c) => {
+		const pathname = new URL(c.req.url).pathname;
+		if (pathname.startsWith("/api/auth/api-key/")) {
+			return c.json({ message: "API key management is only supported through API v1 routes" }, 404);
+		}
+
+		if (pathname === "/api/auth/organization/remove-member" || pathname === "/api/auth/organization/leave") {
+			return c.json({ message: "Organization member removal is only supported through API v1 routes" }, 404);
+		}
+
+		if (c.req.header("x-api-key")) {
+			return c.json({ message: "API key authentication is only supported for API v1 routes" }, 401);
+		}
+
+		const session = await auth.api.getSession({ headers: c.req.raw.headers });
+		if (session && !isSessionAuthSourceAllowed(session.session.authSource)) {
+			await invalidateAuthSession(session.session.token, c);
+
+			return c.json<unknown>({ message: "Invalid or expired session" }, 401);
+		}
+
+		return auth.handler(c.req.raw);
+	});
+	const openApiHandler = createOpenApiHandler(app);
+	app.get("/api/v1/openapi.json", conditionalRequireAuth(config.__prod__), openApiHandler);
+	app.get("/api/v1/docs", conditionalRequireAuth(config.__prod__), apiDocsHandler);
 
 	app.onError((err, c) => {
-		logger.error(`${c.req.url}: ${err.message}`);
+		const { status, message, details } = handleServiceError(err);
+
+		logger.error(`${c.req.path}: ${message}`);
 
 		if (err.cause instanceof Error) {
 			logger.error(err.cause.message);
 		}
 
-		const { status, message } = handleServiceError(err);
-
-		return c.json({ message }, status as 500);
+		return c.json(details ? { message, details } : { message }, status as 500);
 	});
 
 	return app;

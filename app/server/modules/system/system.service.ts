@@ -2,29 +2,57 @@ import { getCapabilities } from "../../core/capabilities";
 import { config } from "../../core/config";
 import type { UpdateInfoDto } from "./system.dto";
 import semver from "semver";
-import { cache } from "../../utils/cache";
-import { logger } from "~/server/utils/logger";
+import { cache, cacheKeys } from "../../utils/cache";
+import { logger } from "@zerobyte/core/node";
 import { db } from "../../db/db";
 import { appMetadataTable } from "../../db/schema";
-import { REGISTRATION_ENABLED_KEY } from "~/client/lib/constants";
+import { PASSWORD_LOGIN_DISABLED_KEY, REGISTRATION_ENABLED_KEY } from "~/server/core/constants";
+import type { BackendType } from "@zerobyte/contracts/volumes";
+import type { RepositoryBackend } from "@zerobyte/core/restic";
+import { serverHasRuntimeFeature } from "~/server/lib/permission-service";
 
 const CACHE_TTL = 60 * 60;
 
 const getSystemInfo = async () => {
+	const capabilities = await getCapabilities();
+	const volumeBackends: BackendType[] = ["directory"];
+	const repositoryBackends: RepositoryBackend[] = ["local", "s3", "r2", "gcs", "azure", "sftp", "rest"];
+
+	if (serverHasRuntimeFeature("remoteVolumeBackends")) {
+		if (capabilities.sysAdmin) {
+			volumeBackends.push("nfs", "smb", "webdav", "sftp");
+		}
+
+		if (capabilities.sysAdmin && capabilities.rclone) {
+			volumeBackends.push("rclone");
+		}
+
+		if (capabilities.rclone) {
+			repositoryBackends.push("rclone");
+		}
+	}
+
 	return {
-		capabilities: await getCapabilities(),
+		runtime: config.runtime,
+		capabilities: {
+			rclone: capabilities.rclone,
+			sysAdmin: capabilities.sysAdmin,
+			volumeBackends,
+			repositoryBackends,
+		},
 	};
 };
 
 interface GitHubRelease {
 	tag_name: string;
+	prerelease: boolean;
 	html_url: string;
 	published_at: string;
 	body: string;
 }
 
 const getUpdates = async (): Promise<UpdateInfoDto> => {
-	const CACHE_KEY = `system:updates:${config.appVersion}`;
+	const CACHE_KEY = cacheKeys.system.githubReleases(config.appVersion);
 
 	const cached = cache.get<UpdateInfoDto>(CACHE_KEY);
 	if (cached) {
@@ -35,13 +63,12 @@ const getUpdates = async (): Promise<UpdateInfoDto> => {
 		const controller = new AbortController();
 		const timeoutId = setTimeout(() => controller.abort(), 5000);
 
-		const response = await fetch("https://api.github.com/repos/nicotsx/zerobyte/releases", {
+		const response = await fetch("https://api.github.com/repos/nicotsx/zerobyte/releases?per_page=100", {
 			signal: controller.signal,
 			headers: {
 				"User-Agent": "zerobyte-app",
 			},
-		});
-		clearTimeout(timeoutId);
+		}).finally(() => clearTimeout(timeoutId));
 
 		if (!response.ok) {
 			throw new Error(`GitHub API returned ${response.status}`);
@@ -50,14 +77,16 @@ const getUpdates = async (): Promise<UpdateInfoDto> => {
 		const releases = (await response.json()) as GitHubRelease[];
 		const currentVersion = config.appVersion;
 
-		const formattedReleases = releases.map((r) => ({
-			version: r.tag_name,
-			url: r.html_url,
-			publishedAt: r.published_at,
-			body: r.body,
-		}));
+		const formattedReleases = releases
+			.filter((r) => !r.prerelease)
+			.map((r) => ({
+				version: r.tag_name,
+				url: r.html_url,
+				publishedAt: r.published_at,
+				body: r.body,
+			}));
 
-		const latestRelease = formattedReleases[0];
+		const latestRelease = formattedReleases.find((release) => semver.valid(release.version));
 		const latestVersion = latestRelease?.version ?? currentVersion;
 
 		const hasUpdate = !!(
@@ -107,9 +136,41 @@ const setRegistrationEnabled = async (enabled: boolean) => {
 	logger.info(`Registration enabled set to: ${enabled}`);
 };
 
+const isPasswordLoginDisabled = async () => {
+	const result = await db.query.appMetadataTable.findFirst({
+		where: { key: PASSWORD_LOGIN_DISABLED_KEY },
+	});
+
+	return result?.value === "true";
+};
+
+const setPasswordLoginDisabled = async (disabled: boolean) => {
+	const now = Date.now();
+
+	await db
+		.insert(appMetadataTable)
+		.values({
+			key: PASSWORD_LOGIN_DISABLED_KEY,
+			value: JSON.stringify(disabled),
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoUpdate({
+			target: appMetadataTable.key,
+			set: { value: JSON.stringify(disabled), updatedAt: now },
+		});
+
+	logger.info(`Password login disabled set to: ${disabled}`);
+};
+
+const isDevPanelEnabled = () => config.flags.enableDevPanel;
+
 export const systemService = {
 	getSystemInfo,
 	getUpdates,
 	isRegistrationEnabled,
 	setRegistrationEnabled,
+	isPasswordLoginDisabled,
+	setPasswordLoginDisabled,
+	isDevPanelEnabled,
 };

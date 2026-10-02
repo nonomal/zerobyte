@@ -1,0 +1,222 @@
+import { beforeEach, describe, expect, test } from "vitest";
+import { db, sqlite } from "~/server/db/db";
+import { account, invitation, member, organization, sessionsTable, ssoProvider, usersTable } from "~/server/db/schema";
+import {
+	createOrganization,
+	createSession,
+	createUser,
+	dropTrigger,
+	escapeSqlLiteral,
+	randomId,
+	randomSlug,
+} from "~/test/helpers/user-org";
+import { ssoService } from "../sso.service";
+
+const DELETE_SSO_PROVIDER_ROLLBACK_TRIGGER = "delete_sso_provider_sessions_abort";
+
+describe("ssoService.deleteSsoProvider", () => {
+	beforeEach(async () => {
+		dropTrigger(DELETE_SSO_PROVIDER_ROLLBACK_TRIGGER);
+		await db.delete(member);
+		await db.delete(account);
+		await db.delete(sessionsTable);
+		await db.delete(invitation);
+		await db.delete(ssoProvider);
+		await db.delete(organization);
+		await db.delete(usersTable);
+	});
+
+	test("does not delete accounts when provider belongs to another organization", async () => {
+		const orgA = await createOrganization("Org A");
+		const orgB = await createOrganization("Org B");
+		const providerOwner = await createUser(`${randomSlug("owner")}@example.com`);
+		const accountUser = await createUser(`${randomSlug("member")}@example.com`);
+
+		const providerId = `oidc-${randomSlug("provider")}`;
+
+		await db.insert(ssoProvider).values({
+			id: randomId(),
+			providerId,
+			organizationId: orgB,
+			userId: providerOwner,
+			issuer: "https://issuer.example.com",
+			domain: "example.com",
+		});
+
+		await db.insert(account).values({
+			id: randomId(),
+			accountId: randomSlug("acct"),
+			providerId,
+			userId: accountUser,
+		});
+
+		const deleted = await ssoService.deleteSsoProvider(providerId, orgA);
+
+		expect(deleted).toBe(false);
+
+		const remainingProvider = await db.query.ssoProvider.findFirst({
+			where: { providerId },
+			columns: { id: true },
+		});
+		const remainingAccounts = await db.query.account.findMany({
+			where: { providerId },
+			columns: { id: true },
+		});
+
+		expect(remainingProvider).not.toBeUndefined();
+		expect(remainingAccounts).toHaveLength(1);
+	});
+
+	test("deletes provider and linked accounts in the active organization", async () => {
+		const org = await createOrganization("Org A");
+		const providerOwner = await createUser(`${randomSlug("owner")}@example.com`);
+		const accountUserA = await createUser(`${randomSlug("member-a")}@example.com`);
+		const accountUserB = await createUser(`${randomSlug("member-b")}@example.com`);
+
+		const providerId = `oidc-${randomSlug("provider")}`;
+
+		await db.insert(ssoProvider).values({
+			id: randomId(),
+			providerId,
+			organizationId: org,
+			userId: providerOwner,
+			issuer: "https://issuer.example.com",
+			domain: "example.com",
+		});
+
+		await db.insert(account).values([
+			{
+				id: randomId(),
+				accountId: randomSlug("acct-a"),
+				providerId,
+				userId: accountUserA,
+			},
+			{
+				id: randomId(),
+				accountId: randomSlug("acct-b"),
+				providerId,
+				userId: accountUserB,
+			},
+		]);
+		await createSession({ userId: accountUserA });
+		await createSession({ userId: accountUserB });
+
+		const deleted = await ssoService.deleteSsoProvider(providerId, org);
+
+		expect(deleted).toBe(true);
+
+		const remainingProvider = await db.query.ssoProvider.findFirst({
+			where: { providerId },
+			columns: { id: true },
+		});
+		const remainingAccounts = await db.query.account.findMany({
+			where: { providerId },
+			columns: { id: true },
+		});
+		const remainingSessions = await db.query.sessionsTable.findMany({
+			where: { userId: { in: [accountUserA, accountUserB] } },
+			columns: { id: true },
+		});
+
+		expect(remainingProvider).toBeUndefined();
+		expect(remainingAccounts).toHaveLength(0);
+		expect(remainingSessions).toHaveLength(0);
+	});
+
+	test("deleting a reserved provider id never deletes credential accounts", async () => {
+		const org = await createOrganization("Org A");
+		const providerOwner = await createUser(`${randomSlug("owner")}@example.com`);
+		const credentialUser = await createUser(`${randomSlug("credential")}@example.com`);
+
+		await db.insert(ssoProvider).values({
+			id: randomId(),
+			providerId: "credential",
+			organizationId: org,
+			userId: providerOwner,
+			issuer: "https://issuer.example.com",
+			domain: "example.com",
+		});
+
+		await db.insert(account).values({
+			id: randomId(),
+			accountId: credentialUser,
+			providerId: "credential",
+			userId: credentialUser,
+		});
+
+		const deleted = await ssoService.deleteSsoProvider("credential", org);
+
+		expect(deleted).toBe(true);
+
+		const remainingProvider = await db.query.ssoProvider.findFirst({
+			where: { providerId: "credential" },
+			columns: { id: true },
+		});
+		const remainingAccounts = await db.query.account.findMany({
+			where: { providerId: "credential" },
+			columns: { id: true },
+		});
+
+		expect(remainingProvider).toBeUndefined();
+		expect(remainingAccounts).toHaveLength(1);
+	});
+
+	test("deleteSsoProvider rolls back account and provider deletion when session revocation fails", async () => {
+		const org = await createOrganization("Org A");
+		const providerOwner = await createUser(`${randomSlug("owner")}@example.com`);
+		const accountUser = await createUser(`${randomSlug("member")}@example.com`);
+
+		const providerId = `oidc-${randomSlug("provider")}`;
+
+		await db.insert(ssoProvider).values({
+			id: randomId(),
+			providerId,
+			organizationId: org,
+			userId: providerOwner,
+			issuer: "https://issuer.example.com",
+			domain: "example.com",
+		});
+
+		await db.insert(account).values({
+			id: randomId(),
+			accountId: randomSlug("acct"),
+			providerId,
+			userId: accountUser,
+		});
+		await createSession({ userId: accountUser });
+
+		sqlite.exec(`
+			CREATE TRIGGER ${DELETE_SSO_PROVIDER_ROLLBACK_TRIGGER}
+			BEFORE DELETE ON sessions_table
+			WHEN OLD.user_id = '${escapeSqlLiteral(accountUser)}'
+			BEGIN
+				SELECT RAISE(ABORT, 'forced deleteSsoProvider rollback');
+			END;
+		`);
+
+		try {
+			await expect(ssoService.deleteSsoProvider(providerId, org)).rejects.toMatchObject({
+				cause: { message: "forced deleteSsoProvider rollback" },
+			});
+		} finally {
+			dropTrigger(DELETE_SSO_PROVIDER_ROLLBACK_TRIGGER);
+		}
+
+		const remainingProvider = await db.query.ssoProvider.findFirst({
+			where: { providerId },
+			columns: { id: true },
+		});
+		const remainingAccounts = await db.query.account.findMany({
+			where: { providerId },
+			columns: { id: true },
+		});
+		const remainingSessions = await db.query.sessionsTable.findMany({
+			where: { userId: accountUser },
+			columns: { id: true },
+		});
+
+		expect(remainingProvider).not.toBeUndefined();
+		expect(remainingAccounts).toHaveLength(1);
+		expect(remainingSessions).toHaveLength(1);
+	});
+});

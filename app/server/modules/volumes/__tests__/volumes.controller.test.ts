@@ -1,8 +1,46 @@
-import { test, describe, expect } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { db } from "~/server/db/db";
+import { volumesTable } from "~/server/db/schema";
 import { createApp } from "~/server/app";
 import { createTestSession, getAuthHeaders } from "~/test/helpers/auth";
+import { generateShortId } from "~/server/utils/id";
+import { config } from "~/server/core/config";
 
 const app = createApp();
+
+let session: Awaited<ReturnType<typeof createTestSession>>;
+let previousEnableLocalAgent: boolean;
+
+beforeAll(async () => {
+	previousEnableLocalAgent = config.flags.enableLocalAgent;
+	config.flags.enableLocalAgent = false;
+	session = await createTestSession();
+});
+
+afterAll(() => {
+	config.flags.enableLocalAgent = previousEnableLocalAgent;
+});
+
+const createManagedVolumeRecord = async (organizationId: string) => {
+	const [volume] = await db
+		.insert(volumesTable)
+		.values({
+			shortId: generateShortId(),
+			provisioningId: `provisioned:${organizationId}:${generateShortId()}`,
+			name: `Managed-${Date.now()}`,
+			type: "directory",
+			status: "mounted",
+			config: {
+				backend: "directory",
+				path: "/tmp",
+			},
+			autoRemount: true,
+			organizationId,
+		})
+		.returning();
+
+	return volume;
+};
 
 describe("volumes security", () => {
 	test("should return 401 if no session cookie is provided", async () => {
@@ -22,10 +60,8 @@ describe("volumes security", () => {
 	});
 
 	test("should return 200 if session is valid", async () => {
-		const { token } = await createTestSession();
-
 		const res = await app.request("/api/v1/volumes", {
-			headers: getAuthHeaders(token),
+			headers: session.headers,
 		});
 
 		expect(res.status).toBe(200);
@@ -67,9 +103,8 @@ describe("volumes security", () => {
 
 	describe("input validation", () => {
 		test("should return 404 for non-existent volume", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/volumes/non-existent-volume", {
-				headers: getAuthHeaders(token),
+				headers: session.headers,
 			});
 
 			expect(res.status).toBe(404);
@@ -78,11 +113,10 @@ describe("volumes security", () => {
 		});
 
 		test("should return 400 for invalid payload on create", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/volumes", {
 				method: "POST",
 				headers: {
-					...getAuthHeaders(token),
+					...session.headers,
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({
@@ -91,6 +125,46 @@ describe("volumes security", () => {
 			});
 
 			expect(res.status).toBe(400);
+		});
+
+		test("should mark provisioned volumes as managed", async () => {
+			const volume = await createManagedVolumeRecord(session.organizationId);
+
+			const res = await app.request(`/api/v1/volumes/${volume.shortId}`, { headers: session.headers });
+
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			expect(body.volume.provisioningId).toBeDefined();
+		});
+
+		test("should allow updates for managed volumes", async () => {
+			const volume = await createManagedVolumeRecord(session.organizationId);
+
+			const res = await app.request(`/api/v1/volumes/${volume.shortId}`, {
+				method: "PUT",
+				headers: {
+					...session.headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					name: "Updated volume",
+				}),
+			});
+
+			expect(res.status).toBe(200);
+			const body = await res.json();
+			expect(body.name).toBe("Updated volume");
+		});
+
+		test("should allow deletion for managed volumes", async () => {
+			const volume = await createManagedVolumeRecord(session.organizationId);
+
+			const res = await app.request(`/api/v1/volumes/${volume.shortId}`, {
+				method: "DELETE",
+				headers: session.headers,
+			});
+
+			expect(res.status).toBe(200);
 		});
 	});
 });

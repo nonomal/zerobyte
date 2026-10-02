@@ -1,0 +1,37 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { z } from "zod";
+import { RouteError } from "~/client/components/route-error";
+import { getVolumeOptions } from "~/client/api-client/@tanstack/react-query.gen";
+import { VolumeDetails } from "~/client/modules/volumes/routes/volume-details";
+
+export const Route = createFileRoute("/(dashboard)/volumes/$volumeId/")({
+	component: RouteComponent,
+	errorComponent: RouteError,
+	loader: async ({ params, context }) => {
+		const res = await context.queryClient.ensureQueryData({
+			...getVolumeOptions({ path: { shortId: params.volumeId } }),
+		});
+
+		return res;
+	},
+	validateSearch: z.object({ tab: z.string().optional() }),
+	staticData: {
+		breadcrumb: (match) => [
+			{ label: "Volumes", href: "/volumes" },
+			{ label: match.loaderData?.volume.name || "Volume Details" },
+		],
+	},
+	head: ({ loaderData }) => ({
+		meta: [
+			{ title: `Zerobyte - ${loaderData?.volume.name}` },
+			{
+				name: "description",
+				content: "View and manage volume details, configuration, and files.",
+			},
+		],
+	}),
+});
+
+function RouteComponent() {
+	return <VolumeDetails volumeId={Route.useParams().volumeId} />;
+}

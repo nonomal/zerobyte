@@ -2,22 +2,29 @@ import { Hono } from "hono";
 import { validator } from "hono-openapi";
 import {
 	createBackupScheduleBody,
+	createBackupScheduleResponse,
 	createBackupScheduleDto,
 	deleteBackupScheduleDto,
 	getBackupScheduleDto,
+	getBackupScheduleResponse,
 	getBackupScheduleForVolumeDto,
+	getBackupScheduleForVolumeResponse,
 	listBackupSchedulesDto,
+	listBackupSchedulesResponse,
 	runBackupNowDto,
 	runForgetDto,
-	stopBackupDto,
 	updateBackupScheduleDto,
 	updateBackupScheduleBody,
+	updateBackupScheduleResponse,
 	getScheduleMirrorsDto,
 	updateScheduleMirrorsDto,
 	updateScheduleMirrorsBody,
 	getMirrorCompatibilityDto,
 	reorderBackupSchedulesDto,
 	reorderBackupSchedulesBody,
+	syncMirrorBody,
+	syncMirrorDto,
+	startMirrorStatusDto,
 	type CreateBackupScheduleDto,
 	type DeleteBackupScheduleDto,
 	type GetBackupScheduleDto,
@@ -25,12 +32,13 @@ import {
 	type ListBackupSchedulesResponseDto,
 	type RunBackupNowDto,
 	type RunForgetDto,
-	type StopBackupDto,
 	type UpdateBackupScheduleDto,
 	type GetScheduleMirrorsDto,
 	type UpdateScheduleMirrorsDto,
 	type GetMirrorCompatibilityDto,
 	type ReorderBackupSchedulesDto,
+	type SyncMirrorDto,
+	type StartMirrorStatusDto,
 } from "./backups.dto";
 import { backupsService } from "./backups.service";
 import {
@@ -42,117 +50,121 @@ import {
 } from "../notifications/notifications.dto";
 import { notificationsService } from "../notifications/notifications.service";
 import { requireAuth } from "../auth/auth.middleware";
-import { backupsExecutionService } from "./backups.execution";
-import { logger } from "~/server/utils/logger";
+import { asShortId } from "~/server/utils/branded";
+import { getScheduleByIdOrShortId } from "./helpers/backup-schedule-lookups";
 
 export const backupScheduleController = new Hono()
 	.use(requireAuth)
 	.get("/", listBackupSchedulesDto, async (c) => {
 		const schedules = await backupsService.listSchedules();
 
-		return c.json<ListBackupSchedulesResponseDto>(schedules, 200);
+		return c.json<ListBackupSchedulesResponseDto>(listBackupSchedulesResponse.parse(schedules), 200);
 	})
-	.get("/:scheduleId", getBackupScheduleDto, async (c) => {
-		const scheduleId = c.req.param("scheduleId");
-		const schedule = await backupsService.getScheduleById(Number(scheduleId));
+	.get("/:shortId", getBackupScheduleDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const schedule = await getScheduleByIdOrShortId(shortId);
 
-		return c.json<GetBackupScheduleDto>(schedule, 200);
+		return c.json<GetBackupScheduleDto>(getBackupScheduleResponse.parse(schedule), 200);
 	})
-	.get("/volume/:volumeId", getBackupScheduleForVolumeDto, async (c) => {
-		const volumeId = c.req.param("volumeId");
-		const schedule = await backupsService.getScheduleForVolume(Number(volumeId));
+	.get("/volume/:volumeShortId", getBackupScheduleForVolumeDto, async (c) => {
+		const volumeShortId = asShortId(c.req.param("volumeShortId"));
+		const schedule = await backupsService.getScheduleForVolume(volumeShortId);
 
-		return c.json<GetBackupScheduleForVolumeResponseDto>(schedule, 200);
+		return c.json<GetBackupScheduleForVolumeResponseDto>(getBackupScheduleForVolumeResponse.parse(schedule), 200);
 	})
 	.post("/", createBackupScheduleDto, validator("json", createBackupScheduleBody), async (c) => {
 		const body = c.req.valid("json");
 		const schedule = await backupsService.createSchedule(body);
 
-		return c.json<CreateBackupScheduleDto>(schedule, 201);
+		return c.json<CreateBackupScheduleDto>(createBackupScheduleResponse.parse(schedule), 201);
 	})
-	.patch("/:scheduleId", updateBackupScheduleDto, validator("json", updateBackupScheduleBody), async (c) => {
-		const scheduleId = c.req.param("scheduleId");
+	.patch("/:shortId", updateBackupScheduleDto, validator("json", updateBackupScheduleBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const body = c.req.valid("json");
-		const schedule = await backupsService.updateSchedule(Number(scheduleId), body);
+		const schedule = await backupsService.updateSchedule(shortId, body);
 
-		return c.json<UpdateBackupScheduleDto>(schedule, 200);
+		return c.json<UpdateBackupScheduleDto>(updateBackupScheduleResponse.parse(schedule), 200);
 	})
-	.delete("/:scheduleId", deleteBackupScheduleDto, async (c) => {
-		const scheduleId = c.req.param("scheduleId");
-		await backupsService.deleteSchedule(Number(scheduleId));
+	.delete("/:shortId", deleteBackupScheduleDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		await backupsService.deleteSchedule(shortId);
 
 		return c.json<DeleteBackupScheduleDto>({ success: true }, 200);
 	})
-	.post("/:scheduleId/run", runBackupNowDto, async (c) => {
-		const scheduleId = c.req.param("scheduleId");
-		const result = await backupsExecutionService.validateBackupExecution(Number(scheduleId), true);
-
-		if (result.type === "failure") {
-			throw result.error;
+	.post("/:shortId/run", runBackupNowDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const schedule = await getScheduleByIdOrShortId(shortId);
+		const backupStart = await backupsService.executeBackup(schedule.id, true);
+		if (!backupStart) {
+			throw new Error("Manual backup start was skipped");
 		}
 
-		if (result.type === "skipped") {
-			return c.json<RunBackupNowDto>({ success: true }, 200);
-		}
-
-		backupsExecutionService.executeBackup(Number(scheduleId), true).catch((err) => {
-			logger.error(`Error executing manual backup for schedule ${scheduleId}:`, err);
-		});
-
-		return c.json<RunBackupNowDto>({ success: true }, 200);
+		return c.json<RunBackupNowDto>(backupStart, 202);
 	})
-	.post("/:scheduleId/stop", stopBackupDto, async (c) => {
-		const scheduleId = c.req.param("scheduleId");
-		await backupsExecutionService.stopBackup(Number(scheduleId));
+	.post("/:shortId/forget", runForgetDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const schedule = await getScheduleByIdOrShortId(shortId);
+		const result = await backupsService.runForget(schedule.id);
 
-		return c.json<StopBackupDto>({ success: true }, 200);
+		return c.json<RunForgetDto>(result, 202);
 	})
-	.post("/:scheduleId/forget", runForgetDto, async (c) => {
-		const scheduleId = c.req.param("scheduleId");
-		await backupsExecutionService.runForget(Number(scheduleId));
-
-		return c.json<RunForgetDto>({ success: true }, 200);
-	})
-	.get("/:scheduleId/notifications", getScheduleNotificationsDto, async (c) => {
-		const scheduleId = Number.parseInt(c.req.param("scheduleId"), 10);
-		const assignments = await notificationsService.getScheduleNotifications(scheduleId);
+	.get("/:shortId/notifications", getScheduleNotificationsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const schedule = await getScheduleByIdOrShortId(shortId);
+		const assignments = await notificationsService.getScheduleNotifications(schedule.id);
 
 		return c.json<GetScheduleNotificationsDto>(assignments, 200);
 	})
 	.put(
-		"/:scheduleId/notifications",
+		"/:shortId/notifications",
 		updateScheduleNotificationsDto,
 		validator("json", updateScheduleNotificationsBody),
 		async (c) => {
-			const scheduleId = Number.parseInt(c.req.param("scheduleId"), 10);
+			const shortId = asShortId(c.req.param("shortId"));
+			const schedule = await getScheduleByIdOrShortId(shortId);
 			const body = c.req.valid("json");
-			const assignments = await notificationsService.updateScheduleNotifications(scheduleId, body.assignments);
+			const assignments = await notificationsService.updateScheduleNotifications(schedule.id, body.assignments);
 
 			return c.json<UpdateScheduleNotificationsDto>(assignments, 200);
 		},
 	)
-	.get("/:scheduleId/mirrors", getScheduleMirrorsDto, async (c) => {
-		const scheduleId = Number.parseInt(c.req.param("scheduleId"), 10);
-		const mirrors = await backupsService.getMirrors(scheduleId);
+	.get("/:shortId/mirrors", getScheduleMirrorsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const mirrors = await backupsService.getMirrors(shortId);
 
 		return c.json<GetScheduleMirrorsDto>(mirrors, 200);
 	})
-	.put("/:scheduleId/mirrors", updateScheduleMirrorsDto, validator("json", updateScheduleMirrorsBody), async (c) => {
-		const scheduleId = Number.parseInt(c.req.param("scheduleId"), 10);
+	.put("/:shortId/mirrors", updateScheduleMirrorsDto, validator("json", updateScheduleMirrorsBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const body = c.req.valid("json");
-		const mirrors = await backupsService.updateMirrors(scheduleId, body);
+		const mirrors = await backupsService.updateMirrors(shortId, body);
 
 		return c.json<UpdateScheduleMirrorsDto>(mirrors, 200);
 	})
-	.get("/:scheduleId/mirrors/compatibility", getMirrorCompatibilityDto, async (c) => {
-		const scheduleId = Number.parseInt(c.req.param("scheduleId"), 10);
-		const compatibility = await backupsService.getMirrorCompatibility(scheduleId);
+	.post("/:shortId/mirrors/:mirrorShortId/status", startMirrorStatusDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const mirrorShortId = asShortId(c.req.param("mirrorShortId"));
+		const result = await backupsService.startMirrorStatus(shortId, mirrorShortId);
+
+		return c.json<StartMirrorStatusDto>(result, 202);
+	})
+	.post("/:shortId/mirrors/:mirrorShortId/sync", syncMirrorDto, validator("json", syncMirrorBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const mirrorShortId = asShortId(c.req.param("mirrorShortId"));
+		const body = c.req.valid("json");
+		const result = await backupsService.startMirrorSync(shortId, mirrorShortId, body.snapshotIds);
+
+		return c.json<SyncMirrorDto>(result, 202);
+	})
+	.get("/:shortId/mirrors/compatibility", getMirrorCompatibilityDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const compatibility = await backupsService.getMirrorCompatibility(shortId);
 
 		return c.json<GetMirrorCompatibilityDto>(compatibility, 200);
 	})
 	.post("/reorder", reorderBackupSchedulesDto, validator("json", reorderBackupSchedulesBody), async (c) => {
 		const body = c.req.valid("json");
-		await backupsService.reorderSchedules(body.scheduleIds);
+		await backupsService.reorderSchedules(body.scheduleShortIds.map(asShortId));
 
 		return c.json<ReorderBackupSchedulesDto>({ success: true }, 200);
 	});

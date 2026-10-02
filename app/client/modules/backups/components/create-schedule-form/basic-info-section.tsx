@@ -24,7 +24,7 @@ export const BasicInfoSection = ({ form, volume }: BasicInfoSectionProps) => {
 				control={form.control}
 				name="name"
 				render={({ field }) => (
-					<FormItem className="@md:col-span-2">
+					<FormItem className="@medium:col-span-2">
 						<FormLabel>Backup name</FormLabel>
 						<FormControl>
 							<Input placeholder="My backup" {...field} />
@@ -39,16 +39,16 @@ export const BasicInfoSection = ({ form, volume }: BasicInfoSectionProps) => {
 				control={form.control}
 				name="repositoryId"
 				render={({ field }) => (
-					<FormItem className="@md:col-span-2">
+					<FormItem className="@medium:col-span-2">
 						<FormLabel>Backup repository</FormLabel>
 						<FormControl>
-							<Select {...field} onValueChange={field.onChange}>
+							<Select {...field} onValueChange={field.onChange} value={field.value ?? ""}>
 								<SelectTrigger>
 									<SelectValue placeholder="Select a repository" />
 								</SelectTrigger>
 								<SelectContent>
 									{repositoriesData?.map((repo) => (
-										<SelectItem key={repo.id} value={repo.id}>
+										<SelectItem key={repo.shortId} value={repo.shortId}>
 											<span className="flex items-center gap-2">
 												<RepositoryIcon backend={repo.type} />
 												{repo.name}

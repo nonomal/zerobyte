@@ -1,24 +1,36 @@
-import { reactRouter } from "@react-router/dev/vite";
 import tailwindcss from "@tailwindcss/vite";
 import { defineConfig } from "vite";
-import tsconfigPaths from "vite-tsconfig-paths";
-import { reactRouterHonoServer } from "react-router-hono-server/dev";
-import babel from "vite-plugin-babel";
+import { tanstackStart } from "@tanstack/react-start/plugin/vite";
+import { nitro } from "nitro/vite";
+import viteReact, { reactCompilerPreset } from "@vitejs/plugin-react";
+import babel from "@rolldown/plugin-babel";
 
 export default defineConfig({
+	clearScreen: false,
 	plugins: [
-		reactRouterHonoServer({ runtime: "bun" }),
-		reactRouter(),
-		babel({
-			filter: /\.[jt]sx?$/,
-			babelConfig: {
-				presets: ["@babel/preset-typescript"],
-				plugins: [["babel-plugin-react-compiler"]],
-			},
+		tanstackStart({
+			srcDirectory: "app",
+			router: { routesDirectory: "routes" },
+			importProtection: { behavior: "error" },
 		}),
+		nitro({ preset: "bun", plugins: ["./app/server/plugins/bootstrap.ts"] }),
+		viteReact(),
+		babel({ presets: [reactCompilerPreset()] }),
 		tailwindcss(),
-		tsconfigPaths(),
 	],
+	resolve: {
+		tsconfigPaths: true,
+	},
+	environments: {
+		ssr: {
+			build: {
+				rollupOptions: {
+					external: [/\/app\/server\/(?!lib\/functions\/)/],
+					makeAbsoluteExternalsRelative: false,
+				},
+			},
+		},
+	},
 	build: {
 		outDir: "dist",
 		sourcemap: false,
@@ -29,5 +41,10 @@ export default defineConfig({
 	server: {
 		host: "0.0.0.0",
 		port: 3000,
+		https:
+			process.env.ZEROBYTE_RUNTIME === "desktop"
+				? { cert: process.env.NITRO_SSL_CERT, key: process.env.NITRO_SSL_KEY }
+				: undefined,
+		allowedHosts: [".ts.net"],
 	},
 });

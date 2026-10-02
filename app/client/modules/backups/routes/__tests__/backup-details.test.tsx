@@ -1,0 +1,352 @@
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { fromAny } from "@total-typescript/shoehorn";
+import { HttpResponse, http, server } from "~/test/msw/server";
+import { cleanup, createTestQueryClient, render, screen } from "~/test/test-utils";
+
+vi.mock("@tanstack/react-router", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("@tanstack/react-router")>();
+
+	return {
+		...actual,
+		Link: (({ children }: { children?: ReactNode }) => <a href="/">{children}</a>) as typeof actual.Link,
+		useNavigate: (() => vi.fn(async () => {})) as typeof actual.useNavigate,
+		useSearch: (() => ({})) as typeof actual.useSearch,
+	};
+});
+
+vi.mock("~/client/lib/datetime", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("~/client/lib/datetime")>();
+
+	return {
+		...actual,
+		useTimeFormat: () => ({
+			...actual.useTimeFormat(),
+			formatDateTime: () => "2026-03-26 00:00",
+		}),
+	};
+});
+
+vi.mock("~/client/modules/backups/components/schedule-notifications-config", () => ({
+	ScheduleNotificationsConfig: ({ destinations }: { destinations: Array<{ id: number; name: string }> }) => (
+		<ul>
+			{destinations.map((destination) => (
+				<li key={destination.id}>{destination.name}</li>
+			))}
+		</ul>
+	),
+}));
+
+vi.mock("~/client/modules/backups/components/schedule-mirrors-config", () => ({
+	ScheduleMirrorsConfig: ({ repositories }: { repositories: Array<{ shortId: string; name: string }> }) => (
+		<ul>
+			{repositories.map((repository) => (
+				<li key={repository.shortId}>{repository.name}</li>
+			))}
+		</ul>
+	),
+}));
+
+vi.mock("~/client/modules/backups/components/schedule-summary", () => ({
+	ScheduleSummary: ({ schedule }: { schedule: { name: string } }) => (
+		<div>
+			<h1>{schedule.name}</h1>
+			<button type="button">Backup now</button>
+		</div>
+	),
+}));
+
+import { ScheduleDetailsPage } from "../backup-details";
+
+class MockEventSource {
+	static instances: MockEventSource[] = [];
+
+	onerror: ((event: Event) => void) | null = null;
+	private listeners = new Map<string, Set<(event: Event) => void>>();
+
+	constructor(public url: string) {
+		MockEventSource.instances.push(this);
+	}
+
+	addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+		const listeners = this.listeners.get(type) ?? new Set<(event: Event) => void>();
+		const callback = typeof listener === "function" ? listener : (event: Event) => listener.handleEvent(event);
+		listeners.add(callback);
+		this.listeners.set(type, listeners);
+	}
+
+	emit(type: string, data: unknown) {
+		const event = new MessageEvent(type, {
+			data: JSON.stringify(data),
+		});
+
+		for (const listener of this.listeners.get(type) ?? []) {
+			listener(event);
+		}
+	}
+
+	close() {}
+
+	static reset() {
+		MockEventSource.instances = [];
+	}
+}
+
+const schedule = {
+	shortId: "backup-1",
+	name: "Backup 1",
+	repositoryId: "repo-1",
+	repository: { shortId: "repo-1", name: "Repo 1" },
+	volume: {
+		shortId: "vol-1",
+		name: "Volume 1",
+		config: { backend: "directory", path: "/mnt" },
+	},
+	enabled: true,
+	cronExpression: "0 0 * * *",
+	retentionPolicy: null,
+	lastBackupAt: 1711411200000,
+	nextBackupAt: 1711497600000,
+	lastBackupStatus: null,
+	lastBackupError: null,
+	includePaths: ["/project"],
+	includePatterns: [],
+	excludePatterns: [],
+	excludeIfPresent: [],
+	oneFileSystem: false,
+	customResticParams: [],
+	backupWebhooks: null,
+};
+
+const repository = { shortId: "repo-1", name: "Repo 1", type: "local" };
+const mirrorRepository = { shortId: "repo-2", name: "Repo 2", type: "s3" };
+const notificationDestination = { id: 1, name: "Ntfy", provider: "ntfy", enabled: true };
+
+const snapshot = {
+	short_id: "snap-1",
+	paths: ["/mnt/project"],
+	tags: ["backup-1"],
+	time: new Date("2026-03-26T00:00:00.000Z").getTime(),
+	size: 2097152,
+	duration: 12,
+	retentionCategories: [],
+	summary: {
+		files_new: 10,
+		files_changed: 5,
+		files_unmodified: 85,
+		dirs_new: 2,
+		dirs_changed: 1,
+		dirs_unmodified: 17,
+		data_blobs: 20,
+		tree_blobs: 5,
+		data_added: 1048576,
+		data_added_packed: 524288,
+		total_files_processed: 100,
+		total_bytes_processed: 2097152,
+		backup_start: "2026-03-26T00:00:00.000Z",
+		backup_end: "2026-03-26T00:00:12.000Z",
+	},
+};
+
+const deleteSnapshotsTask = {
+	id: "task-delete",
+	kind: "deleteSnapshots",
+	status: "running",
+	resourceType: "repository",
+	resourceId: "repo-1",
+	operationKey: null,
+	targetAgentId: null,
+	input: {
+		kind: "deleteSnapshots",
+		repositoryId: "repo-1",
+		snapshotIds: ["snap-1"],
+	},
+	progress: null,
+	result: null,
+	error: null,
+	cancellationRequested: false,
+	createdAt: 1711411200000,
+	startedAt: 1711411200000,
+	updatedAt: 1711411200000,
+	finishedAt: null,
+};
+
+const mockScheduleDetailsRequests = (
+	options: {
+		scheduleOverride?: Record<string, unknown>;
+		onScheduleRequest?: () => void;
+		snapshots?: () => Array<typeof snapshot>;
+		tasks?: () => Array<typeof deleteSnapshotsTask>;
+		repositories?: () => Array<typeof repository>;
+		destinations?: () => Array<typeof notificationDestination>;
+	} = {},
+) => {
+	server.use(
+		http.get("/api/v1/backups/:shortId", () => {
+			options.onScheduleRequest?.();
+			return HttpResponse.json({ ...schedule, ...options.scheduleOverride });
+		}),
+		http.get("/api/v1/repositories", () => {
+			return HttpResponse.json(options.repositories ? options.repositories() : [repository]);
+		}),
+		http.get("/api/v1/notifications/destinations", () => {
+			return HttpResponse.json(options.destinations ? options.destinations() : []);
+		}),
+		http.get("/api/v1/repositories/:shortId/snapshots", () => {
+			return HttpResponse.json(options.snapshots ? options.snapshots() : [snapshot]);
+		}),
+		http.delete("/api/v1/repositories/:shortId/snapshots/:snapshotId", () => {
+			return HttpResponse.json({ taskId: "task-delete", status: "started" }, { status: 202 });
+		}),
+		http.get(/\/api\/v1\/tasks(?:\?.*)?$/, () => {
+			return HttpResponse.json(options.tasks ? options.tasks() : []);
+		}),
+		http.get("/api/v1/repositories/:shortId/snapshots/:snapshotId/files", () => {
+			return HttpResponse.json({
+				files: [
+					{ name: "project", path: "/mnt/project", type: "dir" },
+					{ name: "a.txt", path: "/mnt/project/a.txt", type: "file" },
+				],
+			});
+		}),
+		http.get("/api/v1/backups/:shortId/notifications", () => {
+			return HttpResponse.json([]);
+		}),
+		http.get("/api/v1/backups/:shortId/mirrors", () => {
+			return HttpResponse.json([]);
+		}),
+		http.get("/api/v1/backups/:shortId/mirrors/compatibility", () => {
+			return HttpResponse.json([]);
+		}),
+	);
+};
+
+beforeEach(() => {
+	MockEventSource.reset();
+	globalThis.EventSource = MockEventSource as unknown as typeof EventSource;
+});
+
+afterEach(() => {
+	cleanup();
+	MockEventSource.reset();
+});
+
+describe("ScheduleDetailsPage", () => {
+	test("renders the real schedule details page with the selected snapshot", async () => {
+		mockScheduleDetailsRequests();
+
+		render(
+			<ScheduleDetailsPage
+				loaderData={fromAny({
+					schedule,
+					scheduleNotifs: [],
+					mirrors: [],
+					snapshots: [snapshot],
+				})}
+				scheduleId="backup-1"
+				initialSnapshotId="snap-1"
+			/>,
+			{ withSuspense: true },
+		);
+
+		expect(await screen.findByRole("heading", { name: "Backup 1" })).toBeTruthy();
+		expect(screen.getByRole("button", { name: "Backup now" })).toBeTruthy();
+		expect(screen.getByText("Snapshots")).toBeTruthy();
+		expect(screen.getByText("Files processed")).toBeTruthy();
+		expect(screen.getByRole("link", { name: /restore/i })).toBeTruthy();
+		expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+	});
+
+	test("shows snapshot loading state instead of empty state while an empty snapshot list refetches", async () => {
+		let resolveSnapshots: () => void = () => {};
+		const snapshotsResponse = new Promise<Response>((resolve) => {
+			resolveSnapshots = () => resolve(HttpResponse.json([snapshot]));
+		});
+
+		server.use(
+			http.get("/api/v1/backups/:shortId", () => HttpResponse.json(schedule)),
+			http.get("/api/v1/repositories", () => HttpResponse.json([repository])),
+			http.get("/api/v1/notifications/destinations", () => HttpResponse.json([])),
+			http.get(/\/api\/v1\/tasks(?:\?.*)?$/, () => HttpResponse.json([])),
+			http.get("/api/v1/repositories/:shortId/snapshots", () => snapshotsResponse),
+		);
+
+		render(
+			<ScheduleDetailsPage
+				loaderData={fromAny({
+					schedule,
+					scheduleNotifs: [],
+					mirrors: [],
+					snapshots: [],
+				})}
+				scheduleId="backup-1"
+			/>,
+			{ withSuspense: true },
+		);
+
+		expect(await screen.findByText("Loading snapshots...")).toBeTruthy();
+		expect(screen.queryByText("No snapshots available")).toBeNull();
+		resolveSnapshots();
+		expect(await screen.findByText("Snapshots")).toBeTruthy();
+	});
+
+	test("does not poll the schedule while a backup is running", async () => {
+		let runningScheduleRequests = 0;
+
+		mockScheduleDetailsRequests({
+			scheduleOverride: { lastBackupStatus: "in_progress" },
+			onScheduleRequest: () => {
+				runningScheduleRequests += 1;
+			},
+		});
+
+		render(
+			<ScheduleDetailsPage
+				loaderData={fromAny({
+					schedule: fromAny({ ...schedule, lastBackupStatus: "in_progress" }),
+					scheduleNotifs: [],
+					mirrors: [],
+					snapshots: [snapshot],
+				})}
+				scheduleId="backup-1"
+			/>,
+			{ withSuspense: true },
+		);
+
+		expect(await screen.findByRole("heading", { name: "Backup 1" })).toBeTruthy();
+		await new Promise((resolve) => setTimeout(resolve, 1200));
+		expect(runningScheduleRequests).toBe(1);
+	});
+
+	test("shows repositories and destinations created after the page was loaded without a reload", async () => {
+		const repositories = [repository];
+		const destinations: Array<typeof notificationDestination> = [];
+		mockScheduleDetailsRequests({ repositories: () => repositories, destinations: () => destinations });
+
+		const queryClient = createTestQueryClient();
+
+		render(
+			<ScheduleDetailsPage
+				loaderData={fromAny({
+					schedule,
+					scheduleNotifs: [],
+					mirrors: [],
+					snapshots: [snapshot],
+				})}
+				scheduleId="backup-1"
+			/>,
+			{ withSuspense: true, queryClient },
+		);
+
+		expect(await screen.findByRole("heading", { name: "Backup 1" })).toBeTruthy();
+		expect(screen.queryByText("Repo 2")).toBeNull();
+		expect(screen.queryByText("Ntfy")).toBeNull();
+
+		repositories.push(mirrorRepository);
+		destinations.push(notificationDestination);
+		await queryClient.invalidateQueries();
+
+		expect(await screen.findByText("Repo 2")).toBeTruthy();
+		expect(await screen.findByText("Ntfy")).toBeTruthy();
+	});
+});

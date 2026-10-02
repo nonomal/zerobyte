@@ -1,0 +1,97 @@
+import { z } from "zod";
+import { addCommonArgs } from "../helpers/add-common-args";
+import { buildEnv } from "../helpers/build-env";
+import { buildRepoUrl } from "../helpers/build-repo-url";
+import { cleanupTemporaryKeys } from "../helpers/cleanup-temporary-keys";
+import { resticSnapshotSummarySchema } from "../restic-dto";
+import type { RepositoryConfig } from "../schemas";
+import { logger, safeSpawn } from "../../node";
+import type { ResticDeps } from "../types";
+import { Data, Effect } from "effect";
+import { toMessage } from "../../utils";
+import { isResticError } from "../error";
+
+class ResticSnapshotsCommandError extends Data.TaggedError("ResticSnapshotsCommandError")<{
+	cause: unknown;
+	message: string;
+}> {}
+
+const snapshotInfoSchema = z.object({
+	gid: z.number().optional(),
+	hostname: z.string(),
+	id: z.string(),
+	parent: z.string().optional(),
+	paths: z.array(z.string()),
+	program_version: z.string().optional(),
+	short_id: z.string(),
+	time: z.string(),
+	uid: z.number().optional(),
+	username: z.string().optional(),
+	tags: z.array(z.string()).optional(),
+	summary: resticSnapshotSummarySchema.optional(),
+});
+
+export const snapshots = (
+	config: RepositoryConfig,
+	options: { tags?: string[]; organizationId: string; signal?: AbortSignal },
+	deps: ResticDeps,
+) => {
+	return Effect.tryPromise({
+		try: async () => {
+			const { tags, organizationId, signal } = options;
+
+			const repoUrl = buildRepoUrl(config);
+			const env = await buildEnv(config, organizationId, deps);
+			try {
+				const args = ["--repo", repoUrl, "snapshots"];
+
+				if (tags && tags.length > 0) {
+					for (const tag of tags) {
+						args.push("--tag", tag);
+					}
+				}
+
+				addCommonArgs(args, env, config);
+
+				const stdoutLines: string[] = [];
+				const res = await safeSpawn({
+					command: deps.resticCommand ?? "restic",
+					args,
+					env,
+					signal,
+					onStdout: (line) => {
+						stdoutLines.push(line);
+					},
+				});
+
+				if (res.exitCode !== 0) {
+					const errorMessage = res.stderr || res.error;
+					logger.error(`Restic snapshots retrieval failed: ${errorMessage}`);
+					throw new Error(`Restic snapshots retrieval failed: ${errorMessage}`);
+				}
+
+				const result = snapshotInfoSchema.array().safeParse(JSON.parse(stdoutLines.join("\n")));
+
+				if (!result.success) {
+					logger.error(`Restic snapshots output validation failed: ${result.error.message}`);
+					throw new Error(`Restic snapshots output validation failed: ${result.error.message}`);
+				}
+
+				return result.data;
+			} finally {
+				await cleanupTemporaryKeys(env, deps);
+			}
+		},
+
+		catch: (error) => {
+			if (isResticError(error)) {
+				return error;
+			}
+
+			return new ResticSnapshotsCommandError({
+				cause: error,
+				message: toMessage(error),
+			});
+		},
+	});
+};

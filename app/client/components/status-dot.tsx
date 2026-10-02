@@ -12,8 +12,8 @@ interface StatusDotProps {
 export const StatusDot = ({ variant, label, animated }: StatusDotProps) => {
 	const statusMapping = {
 		success: {
-			color: "bg-green-500",
-			colorLight: "bg-emerald-400",
+			color: "bg-success shadow-[0_0_8px_rgba(16,185,129,0.5)]",
+			colorLight: "bg-success/60",
 			animated: animated ?? true,
 		},
 		neutral: {
@@ -40,12 +40,12 @@ export const StatusDot = ({ variant, label, animated }: StatusDotProps) => {
 
 	return (
 		<Tooltip>
-			<TooltipTrigger>
+			<TooltipTrigger asChild aria-label={label}>
 				<span className="relative flex size-3 mx-auto">
 					{statusMapping?.animated && (
 						<span
 							className={cn(
-								"absolute inline-flex h-full w-full animate-ping rounded-full opacity-75",
+								"absolute inline-flex h-full w-full animate-[ping_3s_cubic-bezier(0,0,0.2,1)_infinite] rounded-full opacity-50",
 								`${statusMapping.colorLight}`,
 							)}
 						/>
@@ -54,7 +54,7 @@ export const StatusDot = ({ variant, label, animated }: StatusDotProps) => {
 				</span>
 			</TooltipTrigger>
 			<TooltipContent>
-				<p>{label}</p>
+				<p className="capitalize">{label}</p>
 			</TooltipContent>
 		</Tooltip>
 	);

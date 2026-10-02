@@ -1,0 +1,11 @@
+import type { TaskDto } from "~/schemas/tasks";
+
+export const taskChangedEventName = "task:changed";
+export const tasksSnapshotEventName = "tasks:snapshot";
+export const taskEventNames = [taskChangedEventName, tasksSnapshotEventName] as const;
+
+export type TaskEventName = (typeof taskEventNames)[number];
+export type TaskEventPayloadMap = {
+	[taskChangedEventName]: TaskDto;
+	[tasksSnapshotEventName]: TaskDto[];
+};

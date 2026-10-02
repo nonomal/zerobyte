@@ -1,64 +1,75 @@
-import { useEffect, useState } from "react";
-import { ByteSize, formatBytes } from "~/client/components/bytes-size";
+import { useId } from "react";
+import { ByteSize } from "~/client/components/bytes-size";
+import { useFormatBytes } from "~/client/hooks/use-format-bytes";
+import { useRootLoaderData } from "~/client/hooks/use-root-loader-data";
 import { Card } from "~/client/components/ui/card";
 import { Progress } from "~/client/components/ui/progress";
-import { type BackupProgressEvent, useServerEvents } from "~/client/hooks/use-server-events";
-import { formatDuration } from "~/utils/utils";
+import type { BackupTask } from "../backup-tasks";
+import { formatDuration } from "~/client/lib/datetime";
+import { getActiveBackupPercent, hasCoherentBackupEta } from "./backup-progress";
 
 type Props = {
-	scheduleId: number;
+	progress: NonNullable<BackupTask["progress"]>["progress"] | null;
 };
 
-export const BackupProgressCard = ({ scheduleId }: Props) => {
-	const { addEventListener } = useServerEvents();
-	const [progress, setProgress] = useState<BackupProgressEvent | null>(null);
+export const BackupProgressCard = ({ progress }: Props) => {
+	const formatBytes = useFormatBytes();
+	const { locale } = useRootLoaderData();
+	const progressHeadingId = useId();
 
-	useEffect(() => {
-		const unsubscribe = addEventListener("backup:progress", (data) => {
-			const progressData = data as BackupProgressEvent;
-			if (progressData.scheduleId === scheduleId) {
-				setProgress(progressData);
-			}
-		});
+	const {
+		percent_done = 0,
+		bytes_done = 0,
+		total_bytes = 0,
+		seconds_elapsed = 0,
+		files_done = 0,
+		total_files = 0,
+	} = progress ?? {};
 
-		const unsubscribeComplete = addEventListener("backup:completed", (data) => {
-			const completedData = data as { scheduleId: number };
-			if (completedData.scheduleId === scheduleId) {
-				setProgress(null);
-			}
-		});
-
-		return () => {
-			unsubscribe();
-			unsubscribeComplete();
-		};
-	}, [addEventListener, scheduleId]);
-
-	const percentDone = progress ? Math.round(progress.percent_done * 100) : 0;
-	const currentFile = progress?.current_files[0] || "";
+	const percentDone = progress ? getActiveBackupPercent(percent_done) : 0;
+	const currentFile = progress?.current_files?.[0] || "";
 	const fileName = currentFile.split("/").pop() || currentFile;
-	const speed = progress ? formatBytes(progress.bytes_done / progress.seconds_elapsed) : null;
+	const hasElapsedTime = Number.isFinite(seconds_elapsed) && seconds_elapsed > 0;
+	const bytesPerSecond = hasElapsedTime ? bytes_done / seconds_elapsed : 0;
+	const speed = hasElapsedTime && Number.isFinite(bytesPerSecond) ? formatBytes(bytesPerSecond) : null;
+	const secondsRemaining = progress?.seconds_remaining ?? 0;
+	const hasCoherentEta = hasCoherentBackupEta({
+		bytesDone: bytes_done,
+		totalBytes: total_bytes,
+		secondsElapsed: seconds_elapsed,
+		secondsRemaining,
+	});
+	const eta = hasCoherentEta ? formatDuration(secondsRemaining) : null;
+	const isFinitePercent = Number.isFinite(percent_done);
+	const isScanningForMoreData = progress !== null && isFinitePercent && percent_done >= 1;
+	const progressLabel = isScanningForMoreData ? `${percentDone}% · scanning` : `${percentDone}%`;
 
 	return (
 		<Card className="p-4">
 			<div className="flex items-center justify-between">
 				<div className="flex items-center gap-2">
 					<div className="h-4 w-4 animate-spin rounded-full border-2 border-primary border-t-transparent" />
-					<span className="font-medium">Backup in progress</span>
+					<h2 id={progressHeadingId} className="font-medium">
+						Backup in progress
+					</h2>
 				</div>
-				<span className="text-sm font-medium text-primary">{progress ? `${percentDone}%` : "—"}</span>
+				<span className="text-sm font-medium text-primary">{progress ? progressLabel : "—"}</span>
 			</div>
 
-			<Progress value={percentDone} className="h-2" />
+			<Progress aria-labelledby={progressHeadingId} value={percentDone} className="h-2" />
 
 			<div className="grid grid-cols-2 gap-4 text-sm">
 				<div>
 					<p className="text-xs uppercase text-muted-foreground">Files</p>
 					<p className="font-medium">
 						{progress ? (
-							<>
-								{progress.files_done.toLocaleString()} / {progress.total_files.toLocaleString()}
-							</>
+							isScanningForMoreData ? (
+								<>{files_done.toLocaleString(locale)} processed</>
+							) : (
+								<>
+									{files_done.toLocaleString(locale)} / {total_files.toLocaleString(locale)}
+								</>
+							)
 						) : (
 							"—"
 						)}
@@ -68,9 +79,18 @@ export const BackupProgressCard = ({ scheduleId }: Props) => {
 					<p className="text-xs uppercase text-muted-foreground">Data</p>
 					<p className="font-medium">
 						{progress ? (
-							<>
-								<ByteSize bytes={progress.bytes_done} /> / <ByteSize bytes={progress.total_bytes} />
-							</>
+							isScanningForMoreData ? (
+								<>
+									<ByteSize bytes={bytes_done} base={1024} />
+									&nbsp;processed
+								</>
+							) : (
+								<>
+									<ByteSize bytes={bytes_done} base={1024} />
+									&nbsp;/&nbsp;
+									<ByteSize bytes={total_bytes} base={1024} />
+								</>
+							)
 						) : (
 							"—"
 						)}
@@ -78,13 +98,17 @@ export const BackupProgressCard = ({ scheduleId }: Props) => {
 				</div>
 				<div>
 					<p className="text-xs uppercase text-muted-foreground">Elapsed</p>
-					<p className="font-medium">{progress ? formatDuration(progress.seconds_elapsed) : "—"}</p>
+					<p className="font-medium">{progress ? formatDuration(seconds_elapsed) : "—"}</p>
 				</div>
 				<div>
-					<p className="text-xs uppercase text-muted-foreground">Speed</p>
+					<p className="text-xs uppercase text-muted-foreground">Processing speed</p>
 					<p className="font-medium">
-						{progress ? (progress.seconds_elapsed > 0 ? `${speed?.text} ${speed?.unit}/s` : "Calculating...") : "—"}
+						{progress ? (speed ? `${speed.text} ${speed.unit}/s` : "Calculating...") : "—"}
 					</p>
+				</div>
+				<div>
+					<p className="text-xs uppercase text-muted-foreground">ETA</p>
+					<p className="font-medium">{progress ? (eta ?? "Calculating...") : "—"}</p>
 				</div>
 			</div>
 

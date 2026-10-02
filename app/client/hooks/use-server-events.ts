@@ -1,235 +1,177 @@
+import { type QueryClient, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import {
+	applyServerEventEffects,
+	getServerEventAliases,
+	invalidateServerEventQueries,
+} from "~/client/events/server-event-effects";
+import { logger } from "~/client/lib/logger";
+import { serverEventNames, type ServerEventPayloadMap } from "~/schemas/server-events";
 
-type ServerEventType =
-	| "connected"
-	| "heartbeat"
-	| "backup:started"
-	| "backup:progress"
-	| "backup:completed"
-	| "volume:mounted"
-	| "volume:unmounted"
-	| "volume:updated"
-	| "mirror:started"
-	| "mirror:completed"
-	| "doctor:started"
-	| "doctor:completed"
-	| "doctor:cancelled";
+type LifecycleEventPayloadMap = {
+	connected: { type: "connected"; timestamp: number };
+	heartbeat: { timestamp: number };
+};
 
-export interface BackupEvent {
-	scheduleId: number;
-	volumeName: string;
-	repositoryName: string;
-	status?: "success" | "error";
-}
+type ServerEventsPayloadMap = LifecycleEventPayloadMap & ServerEventPayloadMap;
+type ServerEventType = keyof ServerEventsPayloadMap;
 
-export interface BackupProgressEvent {
-	scheduleId: number;
-	volumeName: string;
-	repositoryName: string;
-	seconds_elapsed: number;
-	percent_done: number;
-	total_files: number;
-	files_done: number;
-	total_bytes: number;
-	bytes_done: number;
-	current_files: string[];
-}
+type EventHandler<T extends ServerEventType> = (data: ServerEventsPayloadMap[T]) => void;
+type EventHandlerSet<T extends ServerEventType> = Set<EventHandler<T>>;
+type EventHandlerMap = {
+	[K in ServerEventType]?: EventHandlerSet<K>;
+};
 
-export interface VolumeEvent {
-	volumeName: string;
-}
+type SharedServerEventsState = {
+	eventSource: EventSource | null;
+	handlers: EventHandlerMap;
+	queryClient: QueryClient | null;
+	subscribers: number;
+};
 
-export interface MirrorEvent {
-	scheduleId: number;
-	repositoryId: string;
-	repositoryName: string;
-	status?: "success" | "error";
-	error?: string;
-}
+const sharedState: SharedServerEventsState = {
+	eventSource: null,
+	handlers: {},
+	queryClient: null,
+	subscribers: 0,
+};
 
-export interface DoctorEvent {
-	repositoryId: string;
-	repositoryName: string;
-	error?: string;
-}
+const parseEventData = <T extends ServerEventType>(event: Event): ServerEventsPayloadMap[T] =>
+	JSON.parse((event as MessageEvent<string>).data) as ServerEventsPayloadMap[T];
 
-export interface DoctorCompletedEvent extends DoctorEvent {
-	success: boolean;
-	completedAt: number;
-	steps: Array<{
-		step: string;
-		success: boolean;
-		output: string | null;
-		error: string | null;
-	}>;
-}
+const emit = <T extends ServerEventType>(eventName: T, data: ServerEventsPayloadMap[T]) => {
+	const handlers = sharedState.handlers[eventName] as EventHandlerSet<T> | undefined;
+	handlers?.forEach((handler) => {
+		handler(data);
+	});
+};
 
-type EventHandler = (data: unknown) => void;
+const emitEventAndAliases = <T extends keyof ServerEventPayloadMap>(eventName: T, data: ServerEventPayloadMap[T]) => {
+	emit(eventName, data as ServerEventsPayloadMap[T]);
+
+	for (const alias of getServerEventAliases(eventName)) {
+		emit(alias, data as ServerEventsPayloadMap[typeof alias]);
+	}
+};
+
+const applyEffectsForEvent = <T extends keyof ServerEventPayloadMap>(eventName: T, data: ServerEventPayloadMap[T]) => {
+	if (!sharedState.queryClient) {
+		return;
+	}
+
+	applyServerEventEffects(sharedState.queryClient, eventName, data);
+};
+
+const connectEventSource = (queryClient: QueryClient) => {
+	sharedState.queryClient = queryClient;
+	if (sharedState.eventSource) {
+		return;
+	}
+
+	const eventSource = new EventSource("/api/v1/events");
+	sharedState.eventSource = eventSource;
+
+	eventSource.addEventListener("connected", (event) => {
+		const data = parseEventData<"connected">(event);
+		invalidateServerEventQueries(queryClient);
+		logger.info("[SSE] Connected to server events");
+		emit("connected", data);
+	});
+
+	eventSource.addEventListener("heartbeat", (event) => {
+		emit("heartbeat", parseEventData<"heartbeat">(event));
+	});
+
+	for (const eventName of serverEventNames) {
+		eventSource.addEventListener(eventName, (event) => {
+			const data = parseEventData<typeof eventName>(event);
+			logger.info(`[SSE] ${eventName}:`, data);
+
+			applyEffectsForEvent(eventName, data);
+			emitEventAndAliases(eventName, data);
+		});
+	}
+
+	eventSource.onerror = (error) => {
+		logger.error("[SSE] Connection error:", error);
+	};
+};
+
+const disconnectEventSource = () => {
+	if (!sharedState.eventSource) {
+		return;
+	}
+
+	logger.info("[SSE] Disconnecting from server events");
+	sharedState.eventSource.close();
+	sharedState.eventSource = null;
+	sharedState.queryClient = null;
+	sharedState.handlers = {};
+};
+
+const addSharedEventListener = <T extends ServerEventType>(
+	eventName: T,
+	handler: EventHandler<T>,
+	options?: { signal?: AbortSignal },
+) => {
+	if (options?.signal?.aborted) {
+		return () => {};
+	}
+
+	const existingHandlers = sharedState.handlers[eventName] as EventHandlerSet<T> | undefined;
+	const eventHandlers = existingHandlers ?? new Set<EventHandler<T>>();
+	eventHandlers.add(handler);
+	sharedState.handlers[eventName] = eventHandlers as EventHandlerMap[T];
+
+	const unsubscribe = () => {
+		const handlers = sharedState.handlers[eventName] as EventHandlerSet<T> | undefined;
+		handlers?.delete(handler);
+		if (handlers && handlers.size === 0) {
+			delete sharedState.handlers[eventName];
+		}
+		if (options?.signal) {
+			options.signal.removeEventListener("abort", unsubscribe);
+		}
+	};
+
+	if (options?.signal) {
+		options.signal.addEventListener("abort", unsubscribe, { once: true });
+	}
+
+	return unsubscribe;
+};
 
 /**
  * Hook to listen to Server-Sent Events (SSE) from the backend
- * Automatically handles cache invalidation for backup and volume events
+ * Automatically applies the configured cache effects for global server events
  */
-export function useServerEvents() {
+export function useServerEvents({ enabled = true }: { enabled?: boolean } = {}) {
 	const queryClient = useQueryClient();
-	const eventSourceRef = useRef<EventSource | null>(null);
-	const handlersRef = useRef<Map<ServerEventType, Set<EventHandler>>>(new Map());
+	const hasMountedRef = useRef(false);
 
 	useEffect(() => {
-		const eventSource = new EventSource("/api/v1/events");
-		eventSourceRef.current = eventSource;
-
-		eventSource.addEventListener("connected", () => {
-			console.info("[SSE] Connected to server events");
-		});
-
-		eventSource.addEventListener("heartbeat", () => {});
-
-		eventSource.addEventListener("backup:started", (e) => {
-			const data = JSON.parse(e.data) as BackupEvent;
-			console.info("[SSE] Backup started:", data);
-
-			handlersRef.current.get("backup:started")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("backup:progress", (e) => {
-			const data = JSON.parse(e.data) as BackupProgressEvent;
-
-			handlersRef.current.get("backup:progress")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("backup:completed", (e) => {
-			const data = JSON.parse(e.data) as BackupEvent;
-			console.info("[SSE] Backup completed:", data);
-
-			void queryClient.invalidateQueries();
-			void queryClient.refetchQueries();
-
-			handlersRef.current.get("backup:completed")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("volume:mounted", (e) => {
-			const data = JSON.parse(e.data) as VolumeEvent;
-			console.info("[SSE] Volume mounted:", data);
-
-			handlersRef.current.get("volume:mounted")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("volume:unmounted", (e) => {
-			const data = JSON.parse(e.data) as VolumeEvent;
-			console.info("[SSE] Volume unmounted:", data);
-
-			handlersRef.current.get("volume:unmounted")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("volume:updated", (e) => {
-			const data = JSON.parse(e.data) as VolumeEvent;
-			console.info("[SSE] Volume updated:", data);
-
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("volume:updated")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("volume:status_changed", (e) => {
-			const data = JSON.parse(e.data) as VolumeEvent;
-			console.info("[SSE] Volume status updated:", data);
-
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("volume:updated")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("mirror:started", (e) => {
-			const data = JSON.parse(e.data) as MirrorEvent;
-			console.info("[SSE] Mirror copy started:", data);
-
-			handlersRef.current.get("mirror:started")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("mirror:completed", (e) => {
-			const data = JSON.parse(e.data) as MirrorEvent;
-			console.info("[SSE] Mirror copy completed:", data);
-
-			// Invalidate queries to refresh mirror status in the UI
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("mirror:completed")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("doctor:started", (e) => {
-			const data = JSON.parse(e.data) as DoctorEvent;
-			console.info("[SSE] Doctor started:", data);
-
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("doctor:started")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("doctor:completed", (e) => {
-			const data = JSON.parse(e.data) as DoctorCompletedEvent;
-			console.info("[SSE] Doctor completed:", data);
-
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("doctor:completed")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.addEventListener("doctor:cancelled", (e) => {
-			const data = JSON.parse(e.data) as DoctorEvent;
-			console.info("[SSE] Doctor cancelled:", data);
-
-			void queryClient.invalidateQueries();
-
-			handlersRef.current.get("doctor:cancelled")?.forEach((handler) => {
-				handler(data);
-			});
-		});
-
-		eventSource.onerror = (error) => {
-			console.error("[SSE] Connection error:", error);
-		};
-
-		return () => {
-			console.info("[SSE] Disconnecting from server events");
-			eventSource.close();
-			eventSourceRef.current = null;
-		};
-	}, [queryClient]);
-
-	const addEventListener = (event: ServerEventType, handler: EventHandler) => {
-		if (!handlersRef.current.has(event)) {
-			handlersRef.current.set(event, new Set());
+		if (!enabled) {
+			return;
 		}
-		handlersRef.current.get(event)?.add(handler);
+
+		connectEventSource(queryClient);
+		if (!hasMountedRef.current) {
+			sharedState.subscribers += 1;
+			hasMountedRef.current = true;
+		}
 
 		return () => {
-			handlersRef.current.get(event)?.delete(handler);
-		};
-	};
+			if (!hasMountedRef.current) {
+				return;
+			}
 
-	return { addEventListener };
+			hasMountedRef.current = false;
+			sharedState.subscribers = Math.max(0, sharedState.subscribers - 1);
+			if (sharedState.subscribers === 0) {
+				disconnectEventSource();
+			}
+		};
+	}, [enabled, queryClient]);
+
+	return { addEventListener: addSharedEventListener };
 }

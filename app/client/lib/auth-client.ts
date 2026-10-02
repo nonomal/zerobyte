@@ -1,6 +1,14 @@
 import { createAuthClient } from "better-auth/react";
-import { twoFactorClient, usernameClient, adminClient, organizationClient } from "better-auth/client/plugins";
-import { inferAdditionalFields } from "better-auth/client/plugins";
+import {
+	twoFactorClient,
+	usernameClient,
+	adminClient,
+	organizationClient,
+	inferAdditionalFields,
+} from "better-auth/client/plugins";
+import { ssoClient } from "@better-auth/sso/client";
+import { passkeyClient } from "@better-auth/passkey/client";
+import { apiKeyClient } from "@better-auth/api-key/client";
 import type { auth } from "~/server/lib/auth";
 
 export const authClient = createAuthClient({
@@ -9,6 +17,9 @@ export const authClient = createAuthClient({
 		usernameClient(),
 		adminClient(),
 		organizationClient(),
+		ssoClient(),
 		twoFactorClient(),
+		passkeyClient(),
+		apiKeyClient(),
 	],
 });

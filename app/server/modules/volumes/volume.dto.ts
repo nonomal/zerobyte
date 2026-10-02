@@ -1,28 +1,19 @@
-import { type } from "arktype";
+import { z } from "zod";
 import { describeRoute, resolver } from "hono-openapi";
-import { BACKEND_STATUS, BACKEND_TYPES, volumeConfigSchema } from "~/schemas/volumes";
+import {
+	browseFilesystemResponseSchema,
+	listVolumeFilesResponseSchema,
+	publicVolumeSchema,
+	statfsSchema,
+	testVolumeConnectionResponseSchema,
+	volumeConfigSchema,
+	volumeOperationResultSchema,
+} from "@zerobyte/contracts/volumes";
 
-export const volumeSchema = type({
-	id: "number",
-	shortId: "string",
-	name: "string",
-	type: type.valueOf(BACKEND_TYPES),
-	status: type.valueOf(BACKEND_STATUS),
-	lastError: "string | null",
-	createdAt: "number",
-	updatedAt: "number",
-	lastHealthCheck: "number",
-	config: volumeConfigSchema,
-	autoRemount: "boolean",
-});
+const volumeSchema = publicVolumeSchema;
 
-export type VolumeDto = typeof volumeSchema.infer;
-
-/**
- * List all volumes
- */
-export const listVolumesResponse = volumeSchema.array();
-export type ListVolumesDto = typeof listVolumesResponse.infer;
+const listVolumesResponse = volumeSchema.array();
+export type ListVolumesDto = z.infer<typeof listVolumesResponse>;
 
 export const listVolumesDto = describeRoute({
 	description: "List all volumes",
@@ -40,16 +31,13 @@ export const listVolumesDto = describeRoute({
 	},
 });
 
-/**
- * Create a new volume
- */
-export const createVolumeBody = type({
-	name: "string",
+export const createVolumeBody = z.object({
+	name: z.string(),
 	config: volumeConfigSchema,
 });
 
-export const createVolumeResponse = volumeSchema;
-export type CreateVolumeDto = typeof createVolumeResponse.infer;
+const createVolumeResponse = volumeSchema;
+export type CreateVolumeDto = z.infer<typeof createVolumeResponse>;
 
 export const createVolumeDto = describeRoute({
 	description: "Create a new volume",
@@ -67,13 +55,9 @@ export const createVolumeDto = describeRoute({
 	},
 });
 
-/**
- * Delete a volume
- */
-export const deleteVolumeResponse = type({
-	message: "string",
+const deleteVolumeResponse = z.object({
+	message: z.string(),
 });
-export type DeleteVolumeDto = typeof deleteVolumeResponse.infer;
 
 export const deleteVolumeDto = describeRoute({
 	description: "Delete a volume",
@@ -91,21 +75,13 @@ export const deleteVolumeDto = describeRoute({
 	},
 });
 
-const statfsSchema = type({
-	total: "number",
-	used: "number",
-	free: "number",
-});
-
-const getVolumeResponse = type({
+const getVolumeResponse = z.object({
 	volume: volumeSchema,
 	statfs: statfsSchema,
 });
 
-export type GetVolumeDto = typeof getVolumeResponse.infer;
-/**
- * Get a volume
- */
+export type GetVolumeDto = z.infer<typeof getVolumeResponse>;
+
 export const getVolumeDto = describeRoute({
 	description: "Get a volume by name",
 	operationId: "getVolume",
@@ -125,19 +101,16 @@ export const getVolumeDto = describeRoute({
 	},
 });
 
-/**
- * Update a volume
- */
-export const updateVolumeBody = type({
-	name: "string?",
-	autoRemount: "boolean?",
+export const updateVolumeBody = z.object({
+	name: z.string().optional(),
+	autoRemount: z.boolean().optional(),
 	config: volumeConfigSchema.optional(),
 });
 
-export type UpdateVolumeBody = typeof updateVolumeBody.infer;
+export type UpdateVolumeBody = z.infer<typeof updateVolumeBody>;
 
-export const updateVolumeResponse = volumeSchema;
-export type UpdateVolumeDto = typeof updateVolumeResponse.infer;
+const updateVolumeResponse = volumeSchema;
+export type UpdateVolumeDto = z.infer<typeof updateVolumeResponse>;
 
 export const updateVolumeDto = describeRoute({
 	description: "Update a volume's configuration",
@@ -158,18 +131,11 @@ export const updateVolumeDto = describeRoute({
 	},
 });
 
-/**
- * Test connection
- */
-export const testConnectionBody = type({
+export const testConnectionBody = z.object({
 	config: volumeConfigSchema,
 });
 
-export const testConnectionResponse = type({
-	success: "boolean",
-	message: "string",
-});
-export type TestConnectionDto = typeof testConnectionResponse.infer;
+const testConnectionResponse = testVolumeConnectionResponseSchema;
 
 export const testConnectionDto = describeRoute({
 	description: "Test connection to backend",
@@ -187,14 +153,7 @@ export const testConnectionDto = describeRoute({
 	},
 });
 
-/**
- * Mount volume
- */
-export const mountVolumeResponse = type({
-	error: "string?",
-	status: type.valueOf(BACKEND_STATUS),
-});
-export type MountVolumeDto = typeof mountVolumeResponse.infer;
+const mountVolumeResponse = volumeOperationResultSchema;
 
 export const mountVolumeDto = describeRoute({
 	description: "Mount a volume",
@@ -212,14 +171,7 @@ export const mountVolumeDto = describeRoute({
 	},
 });
 
-/**
- * Unmount volume
- */
-export const unmountVolumeResponse = type({
-	error: "string?",
-	status: type.valueOf(BACKEND_STATUS),
-});
-export type UnmountVolumeDto = typeof unmountVolumeResponse.infer;
+const unmountVolumeResponse = volumeOperationResultSchema;
 
 export const unmountVolumeDto = describeRoute({
 	description: "Unmount a volume",
@@ -237,11 +189,7 @@ export const unmountVolumeDto = describeRoute({
 	},
 });
 
-export const healthCheckResponse = type({
-	error: "string?",
-	status: type.valueOf(BACKEND_STATUS),
-});
-export type HealthCheckDto = typeof healthCheckResponse.infer;
+const healthCheckResponse = volumeOperationResultSchema;
 
 export const healthCheckDto = describeRoute({
 	description: "Perform a health check on a volume",
@@ -262,31 +210,13 @@ export const healthCheckDto = describeRoute({
 	},
 });
 
-/**
- * List files in a volume
- */
-const fileEntrySchema = type({
-	name: "string",
-	path: "string",
-	type: type.enumerated("file", "directory"),
-	size: "number?",
-	modifiedAt: "number?",
-});
+const listFilesResponse = listVolumeFilesResponseSchema;
+export type ListFilesDto = z.infer<typeof listFilesResponse>;
 
-export const listFilesResponse = type({
-	files: fileEntrySchema.array(),
-	path: "string",
-	offset: "number",
-	limit: "number",
-	total: "number",
-	hasMore: "boolean",
-});
-export type ListFilesDto = typeof listFilesResponse.infer;
-
-export const listFilesQuery = type({
-	path: "string?",
-	offset: "string.integer?",
-	limit: "string.integer?",
+export const listFilesQuery = z.object({
+	path: z.string().optional(),
+	offset: z.coerce.number().int().optional(),
+	limit: z.coerce.number().int().optional(),
 });
 
 export const listFilesDto = describeRoute({
@@ -305,14 +235,8 @@ export const listFilesDto = describeRoute({
 	},
 });
 
-/**
- * Browse filesystem directories
- */
-export const browseFilesystemResponse = type({
-	directories: fileEntrySchema.array(),
-	path: "string",
-});
-export type BrowseFilesystemDto = typeof browseFilesystemResponse.infer;
+const browseFilesystemResponse = browseFilesystemResponseSchema;
+export type BrowseFilesystemDto = z.infer<typeof browseFilesystemResponse>;
 
 export const browseFilesystemDto = describeRoute({
 	description: "Browse directories on the host filesystem",

@@ -1,19 +1,19 @@
 **
 
-!turbo.json
 !bun.lock
 !package.json
+!.gitignore
+!bunfig.toml
 
 !**/package.json
 !**/bun.lock
 !**/tsconfig.json
 !**/vite.config.ts
-!**/react-router.config.ts
-!**/build.ts
 !**/components.json
 
-!src/**
 !app/**
+!apps/agent/**
+!packages/**
 !public/**
 
 # License files and attributions
@@ -22,3 +22,7 @@
 !LICENSES/**
 
 node_modules/**
+dist/**
+.output/**
+app/test/integration/artifacts/**
+**/node_modules/**

@@ -1,19 +1,31 @@
 import { eq, and } from "drizzle-orm";
-import { BadRequestError, ConflictError, InternalServerError, NotFoundError } from "http-errors-enhanced";
+import { BadRequestError, InternalServerError, NotFoundError } from "http-errors-enhanced";
 import { db } from "../../db/db";
 import {
 	notificationDestinationsTable,
 	backupScheduleNotificationsTable,
 	type NotificationDestination,
 } from "../../db/schema";
-import { cryptoUtils } from "../../utils/crypto";
-import { logger } from "../../utils/logger";
+import { logger, sanitizeSensitiveData } from "@zerobyte/core/node";
 import { sendNotification } from "../../utils/shoutrrr";
+import { formatDuration } from "~/lib/datetime";
 import { buildShoutrrrUrl } from "./builders";
 import { notificationConfigSchema, type NotificationConfig, type NotificationEvent } from "~/schemas/notifications";
+import type { ResticBackupRunSummaryDto } from "@zerobyte/core/restic";
 import { toMessage } from "../../utils/errors";
-import { type } from "arktype";
+import { config as serverConfig } from "~/server/core/config";
 import { getOrganizationId } from "~/server/core/request-context";
+import { formatBytes } from "~/utils/format-bytes";
+import { decryptNotificationConfig, encryptNotificationConfig } from "./notification-config-secrets";
+import { serverEvents } from "~/server/core/events";
+import { assertNotificationTargetAllowed } from "./utils/notification-target-policy";
+import { normalizeRequiredName } from "~/server/utils/names";
+
+const MAX_DELIVERY_ERROR_LENGTH = 2048;
+
+const formatDeliveryError = (error?: string) => {
+	return sanitizeSensitiveData(error ?? "Unknown error").slice(0, MAX_DELIVERY_ERROR_LENGTH);
+};
 
 const listDestinations = async () => {
 	const organizationId = getOrganizationId();
@@ -37,118 +49,22 @@ const getDestination = async (id: number) => {
 	return destination;
 };
 
-async function encryptSensitiveFields(config: NotificationConfig): Promise<NotificationConfig> {
-	switch (config.type) {
-		case "email":
-			return {
-				...config,
-				password: config.password ? await cryptoUtils.sealSecret(config.password) : undefined,
-			};
-		case "slack":
-			return {
-				...config,
-				webhookUrl: await cryptoUtils.sealSecret(config.webhookUrl),
-			};
-		case "discord":
-			return {
-				...config,
-				webhookUrl: await cryptoUtils.sealSecret(config.webhookUrl),
-			};
-		case "gotify":
-			return {
-				...config,
-				token: await cryptoUtils.sealSecret(config.token),
-			};
-		case "ntfy":
-			return {
-				...config,
-				password: config.password ? await cryptoUtils.sealSecret(config.password) : undefined,
-			};
-		case "pushover":
-			return {
-				...config,
-				apiToken: await cryptoUtils.sealSecret(config.apiToken),
-			};
-		case "telegram":
-			return {
-				...config,
-				botToken: await cryptoUtils.sealSecret(config.botToken),
-			};
-		case "generic":
-			return config;
-		case "custom":
-			return {
-				...config,
-				shoutrrrUrl: await cryptoUtils.sealSecret(config.shoutrrrUrl),
-			};
-		default:
-			return config;
-	}
-}
-
-async function decryptSensitiveFields(config: NotificationConfig): Promise<NotificationConfig> {
-	switch (config.type) {
-		case "email":
-			return {
-				...config,
-				password: config.password ? await cryptoUtils.resolveSecret(config.password) : undefined,
-			};
-		case "slack":
-			return {
-				...config,
-				webhookUrl: await cryptoUtils.resolveSecret(config.webhookUrl),
-			};
-		case "discord":
-			return {
-				...config,
-				webhookUrl: await cryptoUtils.resolveSecret(config.webhookUrl),
-			};
-		case "gotify":
-			return {
-				...config,
-				token: await cryptoUtils.resolveSecret(config.token),
-			};
-		case "ntfy":
-			return {
-				...config,
-				password: config.password ? await cryptoUtils.resolveSecret(config.password) : undefined,
-			};
-		case "pushover":
-			return {
-				...config,
-				apiToken: await cryptoUtils.resolveSecret(config.apiToken),
-			};
-		case "telegram":
-			return {
-				...config,
-				botToken: await cryptoUtils.resolveSecret(config.botToken),
-			};
-		case "generic":
-			return config;
-		case "custom":
-			return {
-				...config,
-				shoutrrrUrl: await cryptoUtils.resolveSecret(config.shoutrrrUrl),
-			};
-		default:
-			return config;
-	}
-}
-
 const createDestination = async (name: string, config: NotificationConfig) => {
 	const organizationId = getOrganizationId();
-	const trimmedName = name.trim();
+	const normalizedName = normalizeRequiredName(name);
 
-	if (trimmedName.length === 0) {
+	if (normalizedName === null) {
 		throw new BadRequestError("Name cannot be empty");
 	}
 
-	const encryptedConfig = await encryptSensitiveFields(config);
+	assertNotificationTargetAllowed(config, serverConfig.webhookAllowedOrigins);
+
+	const encryptedConfig = await encryptNotificationConfig(config);
 
 	const [created] = await db
 		.insert(notificationDestinationsTable)
 		.values({
-			name: trimmedName,
+			name: normalizedName,
 			type: config.type,
 			config: encryptedConfig,
 			organizationId,
@@ -178,31 +94,43 @@ const updateDestination = async (
 	};
 
 	if (updates.name !== undefined) {
-		const trimmedName = updates.name.trim();
-		if (trimmedName.length === 0) {
+		const normalizedName = normalizeRequiredName(updates.name);
+		if (normalizedName === null) {
 			throw new BadRequestError("Name cannot be empty");
 		}
-		updateData.name = trimmedName;
+		updateData.name = normalizedName;
 	}
 
 	if (updates.enabled !== undefined) {
 		updateData.enabled = updates.enabled;
 	}
 
-	const newConfig = notificationConfigSchema(updates.config || existing.config);
-	if (newConfig instanceof type.errors) {
-		throw new BadRequestError("Invalid notification configuration");
-	}
+	if (updates.config !== undefined) {
+		const newConfigResult = notificationConfigSchema.safeParse(updates.config);
+		if (!newConfigResult.success) {
+			throw new BadRequestError("Invalid notification configuration");
+		}
+		const newConfig = newConfigResult.data;
+		const resolvedConfig = await decryptNotificationConfig(newConfig);
+		const existingConfig = await decryptNotificationConfig(existing.config);
 
-	const encryptedConfig = await encryptSensitiveFields(newConfig);
-	updateData.config = encryptedConfig;
-	updateData.type = newConfig.type;
+		if (JSON.stringify(resolvedConfig) !== JSON.stringify(existingConfig)) {
+			assertNotificationTargetAllowed(resolvedConfig, serverConfig.webhookAllowedOrigins);
+
+			const encryptedConfig = await encryptNotificationConfig(newConfig);
+			updateData.config = encryptedConfig;
+			updateData.type = newConfig.type;
+		}
+	}
 
 	const [updated] = await db
 		.update(notificationDestinationsTable)
 		.set(updateData)
 		.where(
-			and(eq(notificationDestinationsTable.id, id), eq(notificationDestinationsTable.organizationId, organizationId)),
+			and(
+				eq(notificationDestinationsTable.id, id),
+				eq(notificationDestinationsTable.organizationId, organizationId),
+			),
 		)
 		.returning();
 
@@ -219,28 +147,58 @@ const deleteDestination = async (id: number) => {
 	await db
 		.delete(notificationDestinationsTable)
 		.where(
-			and(eq(notificationDestinationsTable.id, id), eq(notificationDestinationsTable.organizationId, organizationId)),
+			and(
+				eq(notificationDestinationsTable.id, id),
+				eq(notificationDestinationsTable.organizationId, organizationId),
+			),
 		);
+};
+
+const updateDeliveryStatus = async (destinationId: number, result: { success: boolean; error?: string }) => {
+	const [updated] = await db
+		.update(notificationDestinationsTable)
+		.set({
+			status: result.success ? "healthy" : "error",
+			lastChecked: Date.now(),
+			lastError: result.success ? null : formatDeliveryError(result.error),
+			updatedAt: Date.now(),
+		})
+		.where(eq(notificationDestinationsTable.id, destinationId))
+		.returning();
+
+	if (updated) {
+		serverEvents.emit("notification:updated", {
+			organizationId: updated.organizationId,
+			notificationId: updated.id,
+			notificationName: updated.name,
+			status: updated.status,
+		});
+	}
 };
 
 const testDestination = async (id: number) => {
 	const destination = await getDestination(id);
+	let result: Awaited<ReturnType<typeof sendNotification>>;
 
-	if (!destination.enabled) {
-		throw new ConflictError("Cannot test disabled notification destination");
+	try {
+		const decryptedConfig = await decryptNotificationConfig(destination.config);
+		assertNotificationTargetAllowed(decryptedConfig, serverConfig.webhookAllowedOrigins);
+
+		const shoutrrrUrl = buildShoutrrrUrl(decryptedConfig);
+
+		logger.debug("Testing notification with Shoutrrr URL:", shoutrrrUrl);
+
+		result = await sendNotification({
+			shoutrrrUrl,
+			title: "Zerobyte Test Notification",
+			body: `This is a test notification from Zerobyte for destination: ${destination.name}`,
+		});
+	} catch (error) {
+		await updateDeliveryStatus(destination.id, { success: false, error: toMessage(error) });
+		throw error;
 	}
 
-	const decryptedConfig = await decryptSensitiveFields(destination.config);
-
-	const shoutrrrUrl = buildShoutrrrUrl(decryptedConfig);
-
-	logger.debug("Testing notification with Shoutrrr URL:", shoutrrrUrl);
-
-	const result = await sendNotification({
-		shoutrrrUrl,
-		title: "Zerobyte Test Notification",
-		body: `This is a test notification from Zerobyte for destination: ${destination.name}`,
-	});
+	await updateDeliveryStatus(destination.id, result);
 
 	if (!result.success) {
 		throw new InternalServerError(`Failed to send test notification: ${result.error}`);
@@ -301,7 +259,9 @@ const updateScheduleNotifications = async (
 		}
 	}
 
-	await db.delete(backupScheduleNotificationsTable).where(eq(backupScheduleNotificationsTable.scheduleId, scheduleId));
+	await db
+		.delete(backupScheduleNotificationsTable)
+		.where(eq(backupScheduleNotificationsTable.scheduleId, scheduleId));
 
 	if (assignments.length > 0) {
 		await db.insert(backupScheduleNotificationsTable).values(
@@ -315,6 +275,70 @@ const updateScheduleNotifications = async (
 	return getScheduleNotifications(scheduleId);
 };
 
+const formatBytesText = (bytes: number) => {
+	const { text, unit } = formatBytes(bytes, {
+		base: 1024,
+		locale: "en-US",
+		fallback: "-",
+	});
+
+	return unit ? `${text} ${unit}` : text;
+};
+
+const buildBackupNotificationLines = (summary?: ResticBackupRunSummaryDto) => {
+	if (!summary) return [];
+
+	const safeNumber = (value: number | undefined) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+	const safeCountText = (value: number | undefined) => safeNumber(value).toLocaleString();
+	const safeBytesText = (value: number | undefined) => formatBytesText(safeNumber(value));
+	const safeDurationText = (value: number | undefined) =>
+		typeof value === "number" && Number.isFinite(value) ? formatDuration(Math.round(value)) : "N/A";
+
+	const hasDetailedStats = summary.files_new || summary.files_changed || summary.dirs_new || summary.data_blobs;
+
+	if (!hasDetailedStats) {
+		const lines: (string | null)[] = [];
+
+		if (summary.total_duration) {
+			lines.push(`Duration: ${Math.round(summary.total_duration)}s`);
+		}
+		if (summary.total_files_processed !== undefined) {
+			lines.push(`Files: ${summary.total_files_processed.toLocaleString()}`);
+		}
+		if (summary.total_bytes_processed !== undefined) {
+			lines.push(`Size: ${safeBytesText(summary.total_bytes_processed)}`);
+		}
+		if (summary.snapshot_id) {
+			lines.push(`Snapshot: ${summary.snapshot_id}`);
+		}
+
+		return lines.filter((line): line is string => Boolean(line));
+	}
+
+	const snapshotText = summary.snapshot_id ?? "N/A";
+
+	const lines = [
+		"Overview:",
+		`- Data added: ${safeBytesText(summary.data_added)}`,
+		summary.data_added_packed !== undefined ? `- Data stored: ${safeBytesText(summary.data_added_packed)}` : null,
+		`- Total files processed: ${safeCountText(summary.total_files_processed)}`,
+		`- Total bytes processed: ${safeBytesText(summary.total_bytes_processed)}`,
+		"Backup Statistics:",
+		`- Files new: ${safeCountText(summary.files_new)}`,
+		`- Files changed: ${safeCountText(summary.files_changed)}`,
+		`- Files unmodified: ${safeCountText(summary.files_unmodified)}`,
+		`- Dirs new: ${safeCountText(summary.dirs_new)}`,
+		`- Dirs changed: ${safeCountText(summary.dirs_changed)}`,
+		`- Dirs unmodified: ${safeCountText(summary.dirs_unmodified)}`,
+		`- Data blobs: ${safeCountText(summary.data_blobs)}`,
+		`- Tree blobs: ${safeCountText(summary.tree_blobs)}`,
+		`- Total duration: ${safeDurationText(summary.total_duration)}`,
+		`- Snapshot: ${snapshotText}`,
+	];
+
+	return lines.filter(Boolean);
+};
+
 const sendBackupNotification = async (
 	scheduleId: number,
 	event: NotificationEvent,
@@ -323,10 +347,7 @@ const sendBackupNotification = async (
 		repositoryName: string;
 		scheduleName?: string;
 		error?: string;
-		duration?: number;
-		filesProcessed?: number;
-		bytesProcessed?: string;
-		snapshotId?: string;
+		summary?: ResticBackupRunSummaryDto;
 	},
 ) => {
 	try {
@@ -366,14 +387,12 @@ const sendBackupNotification = async (
 
 		for (const assignment of relevantAssignments) {
 			try {
-				const decryptedConfig = await decryptSensitiveFields(assignment.destination.config);
+				const decryptedConfig = await decryptNotificationConfig(assignment.destination.config);
+				assertNotificationTargetAllowed(decryptedConfig, serverConfig.webhookAllowedOrigins);
 				const shoutrrrUrl = buildShoutrrrUrl(decryptedConfig);
 
-				const result = await sendNotification({
-					shoutrrrUrl,
-					title,
-					body,
-				});
+				const result = await sendNotification({ shoutrrrUrl, title, body });
+				await updateDeliveryStatus(assignment.destination.id, result);
 
 				if (result.success) {
 					logger.info(
@@ -385,6 +404,7 @@ const sendBackupNotification = async (
 					);
 				}
 			} catch (error) {
+				await updateDeliveryStatus(assignment.destination.id, { success: false, error: toMessage(error) });
 				logger.error(
 					`Error sending notification to ${assignment.destination.name} for backup ${scheduleId}: ${toMessage(error)}`,
 				);
@@ -402,13 +422,11 @@ function buildNotificationMessage(
 		repositoryName: string;
 		scheduleName?: string;
 		error?: string;
-		duration?: number;
-		filesProcessed?: number;
-		bytesProcessed?: string;
-		snapshotId?: string;
+		summary?: ResticBackupRunSummaryDto;
 	},
 ) {
 	const backupName = context.scheduleName ?? "backup";
+	const notificationLines = buildBackupNotificationLines(context.summary);
 
 	switch (event) {
 		case "start":
@@ -423,38 +441,34 @@ function buildNotificationMessage(
 					.join("\n"),
 			};
 
-		case "success":
+		case "success": {
+			const bodyLines = [
+				`Volume: ${context.volumeName}`,
+				`Repository: ${context.repositoryName}`,
+				context.scheduleName ? `Schedule: ${context.scheduleName}` : null,
+				...notificationLines,
+			];
+
 			return {
 				title: `Zerobyte ${backupName} completed successfully`,
-				body: [
-					`Volume: ${context.volumeName}`,
-					`Repository: ${context.repositoryName}`,
-					context.scheduleName ? `Schedule: ${context.scheduleName}` : null,
-					context.duration ? `Duration: ${Math.round(context.duration / 1000)}s` : null,
-					context.filesProcessed !== undefined ? `Files: ${context.filesProcessed}` : null,
-					context.bytesProcessed ? `Size: ${context.bytesProcessed}` : null,
-					context.snapshotId ? `Snapshot: ${context.snapshotId}` : null,
-				]
-					.filter(Boolean)
-					.join("\n"),
+				body: bodyLines.filter(Boolean).join("\n"),
 			};
+		}
 
-		case "warning":
+		case "warning": {
+			const bodyLines = [
+				`Volume: ${context.volumeName}`,
+				`Repository: ${context.repositoryName}`,
+				context.scheduleName ? `Schedule: ${context.scheduleName}` : null,
+				context.error ? `Warning: ${context.error}` : null,
+				...notificationLines,
+			];
+
 			return {
 				title: `Zerobyte ${backupName} completed with warnings`,
-				body: [
-					`Volume: ${context.volumeName}`,
-					`Repository: ${context.repositoryName}`,
-					context.scheduleName ? `Schedule: ${context.scheduleName}` : null,
-					context.duration ? `Duration: ${Math.round(context.duration / 1000)}s` : null,
-					context.filesProcessed !== undefined ? `Files: ${context.filesProcessed}` : null,
-					context.bytesProcessed ? `Size: ${context.bytesProcessed}` : null,
-					context.snapshotId ? `Snapshot: ${context.snapshotId}` : null,
-					context.error ? `Warning: ${context.error}` : null,
-				]
-					.filter(Boolean)
-					.join("\n"),
+				body: bodyLines.filter(Boolean).join("\n"),
 			};
+		}
 
 		case "failure":
 			return {

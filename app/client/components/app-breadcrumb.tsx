@@ -1,4 +1,5 @@
-import { Link, useMatches, type UIMatch } from "react-router";
+import { Fragment } from "react";
+import { useMatches, Link } from "@tanstack/react-router";
 import {
 	Breadcrumb,
 	BreadcrumbItem,
@@ -13,25 +14,22 @@ export interface BreadcrumbItemData {
 	href?: string;
 }
 
-interface RouteHandle {
-	breadcrumb?: (match: UIMatch) => BreadcrumbItemData[] | null;
-}
+type BreadcrumbFunction = (match: ReturnType<typeof useMatches>[number]) => BreadcrumbItemData[] | null;
 
 export function AppBreadcrumb() {
 	const matches = useMatches();
 
-	// Find the last match with a breadcrumb handler
 	const lastMatchWithBreadcrumb = [...matches].reverse().find((match) => {
-		const handle = match.handle as RouteHandle | undefined;
-		return handle?.breadcrumb;
+		const breadcrumbFn = match.staticData?.breadcrumb as BreadcrumbFunction | undefined;
+		return breadcrumbFn;
 	});
 
 	if (!lastMatchWithBreadcrumb) {
 		return null;
 	}
 
-	const handle = lastMatchWithBreadcrumb.handle as RouteHandle;
-	const breadcrumbs = handle.breadcrumb?.(lastMatchWithBreadcrumb);
+	const breadcrumbFn = lastMatchWithBreadcrumb.staticData?.breadcrumb as BreadcrumbFunction;
+	const breadcrumbs = breadcrumbFn?.(lastMatchWithBreadcrumb);
 
 	if (!breadcrumbs || breadcrumbs.length === 0) {
 		return null;
@@ -44,7 +42,7 @@ export function AppBreadcrumb() {
 					const isLast = index === breadcrumbs.length - 1;
 
 					return (
-						<div key={`${breadcrumb.label}-${index}`} className="contents">
+						<Fragment key={`${breadcrumb.label}-${index}`}>
 							<BreadcrumbItem>
 								{isLast || !breadcrumb.href ? (
 									<BreadcrumbPage>{breadcrumb.label}</BreadcrumbPage>
@@ -55,7 +53,7 @@ export function AppBreadcrumb() {
 								)}
 							</BreadcrumbItem>
 							{!isLast && <BreadcrumbSeparator />}
-						</div>
+						</Fragment>
 					);
 				})}
 			</BreadcrumbList>

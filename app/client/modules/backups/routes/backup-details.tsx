@@ -1,9 +1,7 @@
-import { useId, useState } from "react";
-import { useQuery, useMutation } from "@tanstack/react-query";
-import { redirect, useNavigate } from "react-router";
+import { useState } from "react";
+import { useQuery, useMutation, useSuspenseQuery } from "@tanstack/react-query";
+import { useSearch } from "@tanstack/react-router";
 import { toast } from "sonner";
-import { Save, X } from "lucide-react";
-import { Button } from "~/client/components/ui/button";
 import {
 	AlertDialog,
 	AlertDialogAction,
@@ -18,92 +16,75 @@ import {
 	getBackupScheduleOptions,
 	runBackupNowMutation,
 	deleteBackupScheduleMutation,
+	listNotificationDestinationsOptions,
+	listRepositoriesOptions,
 	listSnapshotsOptions,
 	updateBackupScheduleMutation,
-	stopBackupMutation,
 	deleteSnapshotMutation,
 } from "~/client/api-client/@tanstack/react-query.gen";
-import { parseError } from "~/client/lib/errors";
-import { getCronExpression } from "~/utils/utils";
-import { CreateScheduleForm, type BackupScheduleFormValues } from "../components/create-schedule-form";
+import { useDeletingSnapshots } from "~/client/modules/repositories/snapshots/delete-tasks";
+import { parseError, handleRepositoryError } from "~/client/lib/errors";
 import { ScheduleSummary } from "../components/schedule-summary";
-import type { Route } from "./+types/backup-details";
 import { SnapshotFileBrowser } from "../components/snapshot-file-browser";
 import { SnapshotTimeline } from "../components/snapshot-timeline";
-import {
-	getBackupSchedule,
-	getScheduleMirrors,
-	getScheduleNotifications,
-	listNotificationDestinations,
-	listRepositories,
-} from "~/client/api-client";
 import { ScheduleNotificationsConfig } from "../components/schedule-notifications-config";
 import { ScheduleMirrorsConfig } from "../components/schedule-mirrors-config";
+import { BackupSummaryCard } from "~/client/components/backup-summary-card";
 import { cn } from "~/client/lib/utils";
+import { getVolumeMountPath } from "~/client/lib/volume-path";
+import type { BackupSchedule, ScheduleMirror, ScheduleNotification, Snapshot } from "~/client/lib/types";
+import { useNavigate } from "@tanstack/react-router";
 
-export const handle = {
-	breadcrumb: (match: Route.MetaArgs) => {
-		const data = match.loaderData;
-		return [{ label: "Backups", href: "/backups" }, { label: data.schedule.name }];
-	},
-};
-
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Backup Job Details" },
-		{
-			name: "description",
-			content: "View and manage backup job configuration, schedule, and snapshots.",
-		},
-	];
-}
-
-export const clientLoader = async ({ params }: Route.LoaderArgs) => {
-	const [schedule, notifs, repos, scheduleNotifs, mirrors] = await Promise.all([
-		getBackupSchedule({ path: { scheduleId: params.id } }),
-		listNotificationDestinations(),
-		listRepositories(),
-		getScheduleNotifications({ path: { scheduleId: params.id } }),
-		getScheduleMirrors({ path: { scheduleId: params.id } }),
-	]);
-
-	if (!schedule.data) return redirect("/backups");
-
-	return {
-		schedule: schedule.data,
-		notifs: notifs.data,
-		repos: repos.data,
-		scheduleNotifs: scheduleNotifs.data,
-		scheduleMirrors: mirrors.data,
+type Props = {
+	loaderData: {
+		schedule: BackupSchedule;
+		scheduleNotifs: ScheduleNotification[];
+		mirrors: ScheduleMirror[];
+		snapshots?: Snapshot[];
 	};
+	scheduleId: string;
+	initialSnapshotId?: string;
 };
 
-export default function ScheduleDetailsPage({ params, loaderData }: Route.ComponentProps) {
+export function ScheduleDetailsPage(props: Props) {
+	const { loaderData, scheduleId, initialSnapshotId } = props;
+
 	const navigate = useNavigate();
-	const [isEditMode, setIsEditMode] = useState(false);
-	const formId = useId();
-	const [selectedSnapshotId, setSelectedSnapshotId] = useState<string>();
+	const searchParams = useSearch({ from: "/(dashboard)/backups/$backupId/" });
+	const [selectedSnapshotId, setSelectedSnapshotId] = useState<string | undefined>(initialSnapshotId);
 	const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 	const [snapshotToDelete, setSnapshotToDelete] = useState<string | null>(null);
 
-	const { data: schedule } = useQuery({
-		...getBackupScheduleOptions({ path: { scheduleId: params.id } }),
-		initialData: loaderData.schedule,
+	const { data: schedule } = useSuspenseQuery({
+		...getBackupScheduleOptions({ path: { shortId: scheduleId } }),
+	});
+	const { deletingSnapshotIds } = useDeletingSnapshots(schedule.repository.shortId);
+
+	const { data: repositories } = useSuspenseQuery({
+		...listRepositoriesOptions(),
+	});
+
+	const { data: notificationDestinations } = useSuspenseQuery({
+		...listNotificationDestinationsOptions(),
 	});
 
 	const {
 		data: snapshots,
-		isLoading,
+		isFetching,
+		isPending,
 		failureReason,
 	} = useQuery({
-		...listSnapshotsOptions({ path: { id: schedule.repository.id }, query: { backupId: schedule.shortId } }),
+		...listSnapshotsOptions({
+			path: { shortId: schedule.repository.shortId },
+			query: { backupId: schedule.shortId },
+		}),
+		initialData: loaderData.snapshots,
 	});
 
 	const updateSchedule = useMutation({
 		...updateBackupScheduleMutation(),
 		onSuccess: () => {
 			toast.success("Backup schedule saved successfully");
-			setIsEditMode(false);
 		},
 		onError: (error) => {
 			toast.error("Failed to save backup schedule", {
@@ -118,17 +99,7 @@ export default function ScheduleDetailsPage({ params, loaderData }: Route.Compon
 			toast.success("Backup started successfully");
 		},
 		onError: (error) => {
-			toast.error("Failed to start backup", { description: parseError(error)?.message });
-		},
-	});
-
-	const stopBackup = useMutation({
-		...stopBackupMutation(),
-		onSuccess: () => {
-			toast.success("Backup stopped successfully");
-		},
-		onError: (error) => {
-			toast.error("Failed to stop backup", { description: parseError(error)?.message });
+			handleRepositoryError("Failed to start backup", error, schedule.repository.shortId);
 		},
 	});
 
@@ -136,7 +107,7 @@ export default function ScheduleDetailsPage({ params, loaderData }: Route.Compon
 		...deleteBackupScheduleMutation(),
 		onSuccess: () => {
 			toast.success("Backup schedule deleted successfully");
-			void navigate("/backups");
+			void navigate({ to: "/backups" });
 		},
 		onError: (error) => {
 			toast.error("Failed to delete backup schedule", { description: parseError(error)?.message });
@@ -148,59 +119,27 @@ export default function ScheduleDetailsPage({ params, loaderData }: Route.Compon
 		onSuccess: () => {
 			setShowDeleteConfirm(false);
 			setSnapshotToDelete(null);
-			if (selectedSnapshotId === snapshotToDelete) {
-				setSelectedSnapshotId(undefined);
-			}
 		},
 	});
 
-	const handleSubmit = (formValues: BackupScheduleFormValues) => {
-		if (!schedule) return;
-
-		const cronExpression = getCronExpression(
-			formValues.frequency,
-			formValues.dailyTime,
-			formValues.weeklyDay,
-			formValues.monthlyDays,
-			formValues.cronExpression,
-		);
-
-		const retentionPolicy: Record<string, number> = {};
-		if (formValues.keepLast) retentionPolicy.keepLast = formValues.keepLast;
-		if (formValues.keepHourly) retentionPolicy.keepHourly = formValues.keepHourly;
-		if (formValues.keepDaily) retentionPolicy.keepDaily = formValues.keepDaily;
-		if (formValues.keepWeekly) retentionPolicy.keepWeekly = formValues.keepWeekly;
-		if (formValues.keepMonthly) retentionPolicy.keepMonthly = formValues.keepMonthly;
-		if (formValues.keepYearly) retentionPolicy.keepYearly = formValues.keepYearly;
-
-		updateSchedule.mutate({
-			path: { scheduleId: schedule.id.toString() },
-			body: {
-				name: formValues.name,
-				repositoryId: formValues.repositoryId,
-				enabled: schedule.enabled,
-				cronExpression,
-				retentionPolicy: Object.keys(retentionPolicy).length > 0 ? retentionPolicy : undefined,
-				includePatterns: formValues.includePatterns,
-				excludePatterns: formValues.excludePatterns,
-				excludeIfPresent: formValues.excludeIfPresent,
-				oneFileSystem: formValues.oneFileSystem,
-			},
-		});
-	};
-
 	const handleToggleEnabled = (enabled: boolean) => {
 		updateSchedule.mutate({
-			path: { scheduleId: schedule.id.toString() },
+			path: { shortId: schedule.shortId },
 			body: {
+				name: schedule.name,
 				repositoryId: schedule.repositoryId,
 				enabled,
 				cronExpression: schedule.cronExpression,
 				retentionPolicy: schedule.retentionPolicy || undefined,
+				includePaths: schedule.includePaths || [],
 				includePatterns: schedule.includePatterns || [],
 				excludePatterns: schedule.excludePatterns || [],
 				excludeIfPresent: schedule.excludeIfPresent || [],
 				oneFileSystem: schedule.oneFileSystem,
+				customResticParams: schedule.customResticParams || [],
+				backupWebhooks: schedule.backupWebhooks,
+				maxRetries: schedule.maxRetries,
+				retryDelay: schedule.retryDelay,
 			},
 		});
 	};
@@ -214,77 +153,70 @@ export default function ScheduleDetailsPage({ params, loaderData }: Route.Compon
 		if (snapshotToDelete) {
 			toast.promise(
 				deleteSnapshot.mutateAsync({
-					path: { id: schedule.repository.shortId, snapshotId: snapshotToDelete },
+					path: { shortId: schedule.repository.shortId, snapshotId: snapshotToDelete },
 				}),
 				{
-					loading: "Deleting snapshot...",
-					success: "Snapshot deleted successfully",
+					loading: "Starting snapshot deletion...",
+					success: "Snapshot deletion started",
 					error: (error) => parseError(error)?.message || "Failed to delete snapshot",
 				},
 			);
 		}
 	};
 
-	if (isEditMode) {
-		return (
-			<div>
-				<CreateScheduleForm volume={schedule.volume} initialValues={schedule} onSubmit={handleSubmit} formId={formId} />
-				<div className="flex justify-end mt-4 gap-2">
-					<Button type="submit" className="ml-auto" variant="primary" form={formId} loading={updateSchedule.isPending}>
-						<Save className="h-4 w-4 mr-2" />
-						Update schedule
-					</Button>
-					<Button variant="outline" onClick={() => setIsEditMode(false)}>
-						<X className="h-4 w-4 mr-2" />
-						Cancel
-					</Button>
-				</div>
-			</div>
-		);
-	}
+	const handleSnapshotSelect = (snapshotId: string) => {
+		setSelectedSnapshotId(snapshotId);
+		void navigate({
+			to: ".",
+			search: () => ({ ...searchParams, snapshot: snapshotId }),
+			resetScroll: false,
+		});
+	};
 
 	const selectedSnapshot = snapshots?.find((s) => s.short_id === selectedSnapshotId);
+	const isLoadingSnapshots = isPending || (isFetching && !snapshots?.length);
 
 	return (
 		<div className="flex flex-col gap-6">
 			<ScheduleSummary
 				handleToggleEnabled={handleToggleEnabled}
-				handleRunBackupNow={() => runBackupNow.mutate({ path: { scheduleId: schedule.id.toString() } })}
-				handleStopBackup={() => stopBackup.mutate({ path: { scheduleId: schedule.id.toString() } })}
-				handleDeleteSchedule={() => deleteSchedule.mutate({ path: { scheduleId: schedule.id.toString() } })}
-				setIsEditMode={setIsEditMode}
+				handleRunBackupNow={() => runBackupNow.mutate({ path: { shortId: schedule.shortId } })}
+				handleDeleteSchedule={() => deleteSchedule.mutate({ path: { shortId: schedule.shortId } })}
 				schedule={schedule}
 			/>
-			<div className={cn({ hidden: !loaderData.notifs?.length })}>
+			<div className={cn({ hidden: notificationDestinations.length === 0 })}>
 				<ScheduleNotificationsConfig
-					scheduleId={schedule.id}
-					destinations={loaderData.notifs ?? []}
+					scheduleShortId={schedule.shortId}
+					destinations={notificationDestinations}
 					initialData={loaderData.scheduleNotifs ?? []}
 				/>
 			</div>
-			<div className={cn({ hidden: !loaderData.repos?.length || loaderData.repos.length < 2 })}>
+			<div className={cn({ hidden: repositories.length < 2 })}>
 				<ScheduleMirrorsConfig
-					scheduleId={schedule.id}
-					primaryRepositoryId={schedule.repositoryId}
-					repositories={loaderData.repos ?? []}
-					initialData={loaderData.scheduleMirrors ?? []}
+					scheduleShortId={schedule.shortId}
+					primaryRepositoryId={schedule.repository.shortId}
+					repositories={repositories}
+					initialData={loaderData.mirrors ?? []}
 				/>
 			</div>
 			<SnapshotTimeline
-				loading={isLoading}
+				loading={isLoadingSnapshots}
 				snapshots={snapshots ?? []}
 				snapshotId={selectedSnapshot?.short_id}
+				deletingSnapshotIds={deletingSnapshotIds}
 				error={failureReason?.message}
-				onSnapshotSelect={setSelectedSnapshotId}
+				onSnapshotSelect={handleSnapshotSelect}
 			/>
+			<BackupSummaryCard summary={selectedSnapshot?.summary} />
 			{selectedSnapshot && (
 				<SnapshotFileBrowser
 					key={selectedSnapshot?.short_id}
 					snapshot={selectedSnapshot}
 					repositoryId={schedule.repository.shortId}
-					backupId={schedule.id.toString()}
+					backupId={schedule.shortId}
+					displayBasePath={getVolumeMountPath(schedule.volume)}
 					onDeleteSnapshot={handleDeleteSnapshot}
-					isDeletingSnapshot={deleteSnapshot.isPending}
+					isDeletingSnapshot={deleteSnapshot.isPending || deletingSnapshotIds.has(selectedSnapshot.short_id)}
 				/>
 			)}
 
@@ -293,8 +225,8 @@ export default function ScheduleDetailsPage({ params, loaderData }: Route.Compon
 					<AlertDialogHeader>
 						<AlertDialogTitle>Delete snapshot?</AlertDialogTitle>
 						<AlertDialogDescription>
-							This action cannot be undone. This will permanently delete the snapshot and all its data from the
-							repository.
+							This action cannot be undone. This will permanently delete the snapshot and all its data
+							from the repository.
 						</AlertDialogDescription>
 					</AlertDialogHeader>
 					<AlertDialogFooter>

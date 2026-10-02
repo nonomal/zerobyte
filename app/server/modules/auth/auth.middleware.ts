@@ -1,33 +1,88 @@
 import { createMiddleware } from "hono/factory";
 import { auth } from "~/server/lib/auth";
 import { db } from "~/server/db/db";
-import { withContext } from "~/server/core/request-context";
+import { getPermission, hasFeature, withContext } from "~/server/core/request-context";
+import { getApiKeyOrganizationId } from "../api-keys/api-keys.service";
+import type { AuthSource, Permission, RuntimeFeature } from "~/lib/permission-policy";
+import { getSessionAuthSource, invalidateAuthSession, isSessionAuthSourceAllowed } from "./helpers";
+
+const API_KEY_HEADER = "x-api-key";
+type AuthenticatedUser = {
+	id: string;
+	email: string;
+	username: string;
+	hasDownloadedResticPassword: boolean;
+	role?: string | null | undefined;
+	banned?: boolean | null | undefined;
+};
 
 declare module "hono" {
 	interface ContextVariableMap {
-		user: {
-			id: string;
-			username: string;
-			hasDownloadedResticPassword: boolean;
-			role?: string | null | undefined;
-		};
+		user: AuthenticatedUser;
 		organizationId: string;
+		membership: { role: string };
+		authSource: AuthSource;
 	}
 }
+
+export const conditionalRequireAuth = (shouldRequireAuth: boolean) =>
+	createMiddleware(async (c, next) => {
+		if (shouldRequireAuth) {
+			return requireAuth(c, next);
+		}
+
+		await next();
+	});
 
 /**
  * Middleware to require authentication
  * Verifies the session cookie and attaches user to context
  */
 export const requireAuth = createMiddleware(async (c, next) => {
-	const sess = await auth.api.getSession({
-		headers: c.req.raw.headers,
-	});
+	const apiKeyValue = c.req.header(API_KEY_HEADER);
+	let authSource: AuthSource = apiKeyValue ? "api-key" : "browser-session";
+	let user: AuthenticatedUser | undefined;
+	let activeOrganizationId: string | null | undefined;
 
-	const { user, session } = sess ?? {};
-	const { activeOrganizationId } = session ?? {};
+	if (apiKeyValue && !c.req.path.startsWith("/api/v1")) {
+		return c.json<unknown>({ message: "API key authentication is only supported for API v1 routes" }, 401);
+	}
 
-	if (!user || !session || !activeOrganizationId) {
+	if (apiKeyValue) {
+		const verification = await auth.api.verifyApiKey({ body: { key: apiKeyValue } });
+		const apiKey = verification?.valid ? verification.key : null;
+
+		if (!apiKey) {
+			return c.json<unknown>({ message: "Invalid or expired session" }, 401);
+		}
+
+		user = await db.query.usersTable.findFirst({ where: { id: apiKey.referenceId } });
+		activeOrganizationId = await getApiKeyOrganizationId(apiKey.id);
+	} else {
+		const sess = await auth.api.getSession({ headers: c.req.raw.headers });
+
+		if (sess) {
+			if (!isSessionAuthSourceAllowed(sess.session.authSource)) {
+				await invalidateAuthSession(sess.session.token, c);
+
+				return c.json<unknown>({ message: "Invalid or expired session" }, 401);
+			}
+
+			user = sess.user;
+			activeOrganizationId = sess.session.activeOrganizationId;
+			authSource = getSessionAuthSource(sess.session.authSource);
+		}
+	}
+
+	if (!user) {
+		return c.json<unknown>({ message: "Invalid or expired session" }, 401);
+	}
+
+	if (authSource === "api-key" && user.banned) {
+		return c.json<unknown>({ message: "Invalid or expired session" }, 401);
+	}
+
+	if (!activeOrganizationId) {
 		return c.json<unknown>({ message: "Invalid or expired session" }, 401);
 	}
 
@@ -43,27 +98,76 @@ export const requireAuth = createMiddleware(async (c, next) => {
 
 	c.set("user", user);
 	c.set("organizationId", activeOrganizationId);
+	c.set("membership", membership);
+	c.set("authSource", authSource);
 
-	await withContext({ organizationId: activeOrganizationId, userId: user.id }, async () => {
+	await withContext(
+		{
+			organizationId: activeOrganizationId,
+			userId: user.id,
+			instanceRole: user.role,
+			orgRole: membership.role,
+			authSource,
+		},
+		async () => {
+			await next();
+		},
+	);
+});
+
+export const requireBrowserSession = createMiddleware(async (c, next) => {
+	if (c.get("authSource") !== "browser-session") {
+		return c.json({ message: "Browser session required" }, 401);
+	}
+
+	await next();
+});
+
+export const requireUserSession = createMiddleware(async (c, next) => {
+	if (c.get("authSource") === "api-key") {
+		return c.json({ message: "Browser session required" }, 401);
+	}
+
+	await next();
+});
+
+export const requireRuntimeFeature = (feature: RuntimeFeature) =>
+	createMiddleware(async (c, next) => {
+		if (!hasFeature(feature)) {
+			return c.json({ message: "Not available in desktop mode" }, 403);
+		}
+
 		await next();
 	});
-});
+
+export const requirePermission = (permission: Permission) =>
+	createMiddleware(async (c, next) => {
+		const result = getPermission(permission);
+
+		if (result.allowed) {
+			await next();
+			return;
+		}
+
+		if (result.reason === "runtime") {
+			return c.json({ message: "Not available in desktop mode" }, 403);
+		}
+
+		if (result.reason === "authSource") {
+			return c.json({ message: "Browser session required" }, 401);
+		}
+
+		return c.json({ message: "Forbidden" }, 403);
+	});
 
 /**
  * Middleware to require organization owner or admin role
  * Verifies the user has the required role in the current organization
  */
 export const requireOrgAdmin = createMiddleware(async (c, next) => {
-	const user = c.get("user");
-	const organizationId = c.get("organizationId");
+	const { role } = c.get("membership");
 
-	const membership = await db.query.member.findFirst({
-		where: {
-			AND: [{ userId: user.id }, { organizationId: organizationId }],
-		},
-	});
-
-	if (!membership || (membership.role !== "owner" && membership.role !== "admin")) {
+	if (role !== "owner" && role !== "admin") {
 		return c.json({ message: "Forbidden" }, 403);
 	}
 
@@ -71,6 +175,10 @@ export const requireOrgAdmin = createMiddleware(async (c, next) => {
 });
 
 export const requireAdmin = createMiddleware(async (c, next) => {
+	if (c.get("authSource") !== "browser-session") {
+		return c.json({ message: "Browser session required" }, 401);
+	}
+
 	const user = c.get("user");
 
 	if (!user || user.role !== "admin") {

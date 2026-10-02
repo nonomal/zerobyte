@@ -1,8 +1,8 @@
-import CronExpressionParser from "cron-parser";
-import path from "node:path";
+import { CronExpressionParser } from "cron-parser";
+import { createBackupOptions as createAgentBackupOptions } from "../../../../apps/agent/src/commands/helpers/backup.helpers";
 import type { BackupSchedule } from "~/server/db/schema";
 import { toMessage } from "~/server/utils/errors";
-import { logger } from "~/server/utils/logger";
+import { logger } from "@zerobyte/core/node";
 
 export const calculateNextRun = (cronExpression: string) => {
 	try {
@@ -19,26 +19,41 @@ export const calculateNextRun = (cronExpression: string) => {
 	}
 };
 
-export const processPattern = (pattern: string, volumePath: string) => {
-	const isNegated = pattern.startsWith("!");
-	const p = isNegated ? pattern.slice(1) : pattern;
-
-	const relative = path.relative(volumePath, p);
-	const isInsideVolume = !relative.startsWith("..") && !path.isAbsolute(relative);
-
-	if (isInsideVolume || !p.startsWith("/")) {
-		return pattern;
+export const isValidCron = (expression: string) => {
+	try {
+		CronExpressionParser.parse(expression);
+		return true;
+	} catch {
+		return false;
 	}
-
-	const processed = path.join(volumePath, p.slice(1));
-	return isNegated ? `!${processed}` : processed;
 };
 
-export const createBackupOptions = (schedule: BackupSchedule, volumePath: string, signal: AbortSignal) => ({
-	tags: [schedule.shortId],
-	oneFileSystem: schedule.oneFileSystem,
-	signal,
-	exclude: schedule.excludePatterns ? schedule.excludePatterns.map((p) => processPattern(p, volumePath)) : undefined,
-	excludeIfPresent: schedule.excludeIfPresent ?? undefined,
-	include: schedule.includePatterns ? schedule.includePatterns.map((p) => processPattern(p, volumePath)) : undefined,
-});
+export const validateScheduleTiming = (schedule: { cronExpression: string; enabled: boolean }) => {
+	if (schedule.cronExpression && !isValidCron(schedule.cronExpression)) {
+		return "Invalid cron expression";
+	}
+
+	if (schedule.enabled && !schedule.cronExpression) {
+		return "Enabled schedules require a cron expression";
+	}
+
+	return null;
+};
+
+export const createBackupOptions = (schedule: BackupSchedule, volumePath: string, signal?: AbortSignal) =>
+	createAgentBackupOptions(
+		{
+			scheduleId: schedule.shortId,
+			options: {
+				oneFileSystem: schedule.oneFileSystem,
+				excludePatterns: schedule.excludePatterns,
+				excludeIfPresent: schedule.excludeIfPresent,
+				includePaths: schedule.includePaths,
+				includePatterns: schedule.includePatterns,
+				customResticParams: schedule.customResticParams,
+				compressionMode: "auto",
+			},
+		},
+		volumePath,
+		signal,
+	);

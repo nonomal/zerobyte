@@ -1,93 +1,55 @@
-import { formatDistanceToNow, isValid } from "date-fns";
+import { useEffect, useMemo, useState } from "react";
+import { useRootLoaderData } from "~/client/hooks/use-root-loader-data";
+import { rawFormatters, type DateInput } from "~/lib/datetime";
 
-// 1/10/2026, 2:30 PM
-export function formatDateTime(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
+export {
+	DATE_FORMATS,
+	DEFAULT_TIME_FORMAT,
+	formatDuration,
+	inferDateTimePreferences,
+	rawFormatters,
+	TIME_FORMATS,
+} from "~/lib/datetime";
+export type { DateFormatPreference, DateInput, TimeFormatPreference } from "~/lib/datetime";
 
-	return Intl.DateTimeFormat(navigator.languages, {
-		month: "numeric",
-		day: "numeric",
-		year: "numeric",
-		hour: "numeric",
-		minute: "numeric",
-	}).format(d);
-}
+export function useTimeFormat() {
+	const { locale, timeZone, dateFormat, timeFormat, now } = useRootLoaderData();
+	const [currentNow, setCurrentNow] = useState(now);
 
-// Jan 10, 2026
-export function formatDateWithMonth(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-	return Intl.DateTimeFormat(navigator.languages, {
-		month: "short",
-		day: "numeric",
-		year: "numeric",
-	}).format(d);
-}
+	useEffect(() => {
+		const nextNow = Date.now();
+		// oxlint-disable-next-line react/set-state-in-effect -- Replace the SSR timestamp with the client clock only after hydration.
+		setCurrentNow(nextNow === now ? now : nextNow);
+	}, [now]);
 
-// 1/10/2026
-export function formatDate(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-
-	return Intl.DateTimeFormat(navigator.languages, {
-		month: "numeric",
-		day: "numeric",
-		year: "numeric",
-	}).format(d);
-}
-
-// 1/10
-export function formatShortDate(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-
-	return Intl.DateTimeFormat(navigator.languages, {
-		month: "numeric",
-		day: "numeric",
-	}).format(d);
-}
-
-// 1/10, 2:30 PM
-export function formatShortDateTime(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-
-	return Intl.DateTimeFormat(navigator.languages, {
-		month: "numeric",
-		day: "numeric",
-		hour: "numeric",
-		minute: "numeric",
-	}).format(d);
-}
-
-// 2:30 PM
-export function formatTime(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-
-	return Intl.DateTimeFormat(navigator.languages, {
-		hour: "numeric",
-		minute: "numeric",
-	}).format(d);
-}
-
-// 5 minutes ago
-export function formatTimeAgo(date: Date | string | number | null | undefined): string {
-	if (!date) return "Never";
-	const d = new Date(date);
-	if (!isValid(d)) return "Invalid Date";
-
-	const timeAgo = formatDistanceToNow(d, {
-		addSuffix: true,
-		includeSeconds: true,
-	});
-
-	return timeAgo.replace("about ", "").replace("over ", "").replace("almost ", "").replace("less than ", "");
+	return useMemo(
+		() => ({
+			formatDateTime: (date: DateInput) =>
+				rawFormatters.formatDateTime(date, { locale, timeZone, dateFormat, timeFormat }),
+			formatDateTimeWithSeconds: (date: DateInput) =>
+				rawFormatters.formatDateTimeWithSeconds(date, { locale, timeZone, dateFormat, timeFormat }),
+			formatDateWithMonth: (date: DateInput) =>
+				rawFormatters.formatDateWithMonth(date, {
+					locale,
+					timeZone,
+					dateFormat,
+					timeFormat,
+				}),
+			formatDate: (date: DateInput) =>
+				rawFormatters.formatDate(date, { locale, timeZone, dateFormat, timeFormat }),
+			formatShortDate: (date: DateInput) =>
+				rawFormatters.formatShortDate(date, { locale, timeZone, dateFormat, timeFormat }),
+			formatShortDateTime: (date: DateInput) =>
+				rawFormatters.formatShortDateTime(date, {
+					locale,
+					timeZone,
+					dateFormat,
+					timeFormat,
+				}),
+			formatTime: (date: DateInput) =>
+				rawFormatters.formatTime(date, { locale, timeZone, dateFormat, timeFormat }),
+			formatTimeAgo: (date: DateInput) => rawFormatters.formatTimeAgo(date, currentNow),
+		}),
+		[locale, timeZone, currentNow, dateFormat, timeFormat],
+	);
 }

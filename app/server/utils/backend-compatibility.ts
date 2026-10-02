@@ -1,9 +1,9 @@
-import type { RepositoryConfig } from "~/schemas/restic";
+import type { RepositoryConfig } from "@zerobyte/core/restic";
 import { cryptoUtils } from "./crypto";
 
 type BackendConflictGroup = "s3" | "gcs" | "azure" | "rest" | "sftp" | null;
 
-export const getBackendConflictGroup = (backend: string): BackendConflictGroup => {
+const getBackendConflictGroup = (backend: string): BackendConflictGroup => {
 	switch (backend) {
 		case "s3":
 		case "r2":
@@ -24,10 +24,7 @@ export const getBackendConflictGroup = (backend: string): BackendConflictGroup =
 	}
 };
 
-export const hasCompatibleCredentials = async (
-	config1: RepositoryConfig,
-	config2: RepositoryConfig,
-): Promise<boolean> => {
+const hasCompatibleCredentials = async (config1: RepositoryConfig, config2: RepositoryConfig): Promise<boolean> => {
 	const group1 = getBackendConflictGroup(config1.backend);
 	const group2 = getBackendConflictGroup(config2.backend);
 
@@ -92,7 +89,7 @@ export const hasCompatibleCredentials = async (
 	}
 };
 
-export interface CompatibilityResult {
+interface CompatibilityResult {
 	repositoryId: string;
 	compatible: boolean;
 	reason: string | null;

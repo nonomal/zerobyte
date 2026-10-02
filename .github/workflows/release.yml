@@ -8,16 +8,16 @@ on:
       - "v*.*.*-alpha.*"
 
 permissions:
-  contents: write
-  packages: write
-  security-events: write
+  contents: read
 
 jobs:
   determine-release-type:
     runs-on: ubuntu-latest
+    permissions: {}
     outputs:
       release_type: ${{ steps.set-type.outputs.release_type }}
       tagname: ${{ github.ref_name }}
+      is_minor_release: ${{ steps.set-type.outputs.is_minor_release }}
     steps:
       - name: Set release type
         id: set-type
@@ -31,74 +31,60 @@ jobs:
             echo "release_type=release" >> $GITHUB_OUTPUT
           fi
 
+          if [[ $TAG =~ ^v[0-9]+\.[0-9]+\.0$ ]]; then
+            echo "is_minor_release=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_minor_release=false" >> $GITHUB_OUTPUT
+          fi
+
   checks:
     uses: ./.github/workflows/checks.yml
 
   e2e-tests:
     uses: ./.github/workflows/e2e.yml
 
+  integration-tests:
+    uses: ./.github/workflows/integration.yml
+
   build-images:
+    environment: release
     timeout-minutes: 15
-    needs: [determine-release-type, checks, e2e-tests]
+    needs: [determine-release-type, checks, e2e-tests, integration-tests]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           ref: ${{ github.ref }}
 
       - name: Log in to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
         with:
           driver: cloud
           endpoint: "meienberger/runtipi-builder"
           install: true
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
         with:
           registry: ghcr.io
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          target: production
-          platforms: linux/amd64
-          push: false
-          load: true
-          tags: local/zerobyte:ci
-          build-args: |
-            APP_VERSION=${{ needs.determine-release-type.outputs.tagname }}
-
-      - name: Scan new image for vulnerabilities
-        if: needs.determine-release-type.outputs.release_type == 'release'
-        uses: anchore/scan-action@v7
-        id: scan
-        with:
-          image: local/zerobyte:ci
-          fail-build: true
-          only-fixed: true
-          severity-cutoff: critical
-
-      - name: upload Anchore scan report
-        if: needs.determine-release-type.outputs.release_type == 'release'
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: ${{ steps.scan.outputs.sarif }}
-
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/zerobyte
           tags: |
@@ -110,7 +96,7 @@ jobs:
             latest=${{ needs.determine-release-type.outputs.release_type == 'release' }}
 
       - name: Push images to GitHub Container Registry
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           target: production
@@ -125,12 +111,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-images, determine-release-type]
     if: needs.determine-release-type.outputs.release_type == 'release'
+    permissions:
+      contents: write
     outputs:
       id: ${{ steps.create_release.outputs.id }}
     steps:
       - name: Create GitHub release
         id: create_release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -140,4 +128,77 @@ jobs:
           name: ${{ needs.determine-release-type.outputs.tagname }}
           draft: false
           prerelease: true
-          files: cli/runtipi-cli-*
+
+  build-desktop:
+    needs: publish-release
+    if: false
+    permissions:
+      actions: read
+      contents: read
+    uses: ./.github/workflows/desktop-build.yml
+    with:
+      version: ${{ github.ref_name }}
+    secrets: inherit
+
+  publish-desktop-assets:
+    needs: build-desktop
+    runs-on: ubuntu-latest
+    permissions:
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download DMG
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-macos-release
+          path: release-assets
+
+      - name: Download Windows installer
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-windows-release
+          path: release-assets
+
+      - name: Download Linux AppImage
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: desktop-linux-release
+          path: release-assets
+
+      - name: Attest desktop release artifacts
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            release-assets/*.dmg
+            release-assets/*.exe
+            release-assets/*.AppImage
+
+      - name: Upload desktop release assets
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            release-assets/*.dmg
+            release-assets/*.exe
+            release-assets/*.AppImage
+          fail_on_unmatched_files: true
+
+  request-docs-version-update:
+    uses: ./.github/workflows/request-docs-version-update.yml
+    needs: [publish-release, determine-release-type]
+    if: needs.determine-release-type.outputs.release_type == 'release' && needs.determine-release-type.outputs.is_minor_release == 'true'
+    with:
+      release_tag: ${{ needs.determine-release-type.outputs.tagname }}
+      base_branch: ${{ github.event.repository.default_branch }}
+    secrets:
+      COPILOT_ASSIGNMENT_TOKEN: ${{ secrets.COPILOT_ASSIGNMENT_TOKEN }}
+
+  deploy-api-docs:
+    needs: publish-release
+    uses: ./.github/workflows/api-docs-deploy.yml
+    secrets:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

@@ -1,18 +1,30 @@
 import { db } from "~/server/db/db";
 import { faker } from "@faker-js/faker";
 import { backupSchedulesTable, type BackupScheduleInsert } from "~/server/db/schema";
-import { ensureTestOrganization, TEST_ORG_ID } from "./organization";
+import { createTestOrganization, ensureTestOrganization, TEST_ORG_ID } from "./organization";
+import { createTestVolume } from "./volume";
+import { createTestRepository } from "./repository";
+import { generateShortId } from "~/server/utils/id";
 
 export const createTestBackupSchedule = async (overrides: Partial<BackupScheduleInsert> = {}) => {
-	await ensureTestOrganization();
+	const organizationId = overrides.organizationId ?? TEST_ORG_ID;
+
+	if (organizationId === TEST_ORG_ID) {
+		await ensureTestOrganization();
+	} else {
+		await createTestOrganization({ id: organizationId });
+	}
+
+	const volumeId = overrides.volumeId ?? (await createTestVolume({ organizationId })).id;
+	const repositoryId = overrides.repositoryId ?? (await createTestRepository({ organizationId })).id;
 
 	const backup: BackupScheduleInsert = {
 		name: faker.system.fileName(),
 		cronExpression: "0 0 * * *",
-		repositoryId: "repo_123",
-		volumeId: 1,
-		shortId: faker.string.uuid(),
-		organizationId: TEST_ORG_ID,
+		repositoryId,
+		volumeId,
+		shortId: generateShortId(),
+		organizationId,
 		...overrides,
 	};
 

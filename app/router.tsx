@@ -1,0 +1,53 @@
+import { createRouter } from "@tanstack/react-router";
+import { setupRouterSsrQueryIntegration } from "@tanstack/react-router-ssr-query";
+import { routeTree } from "./routeTree.gen";
+import { MutationCache, QueryClient } from "@tanstack/react-query";
+import { logger } from "./client/lib/logger";
+import { client } from "./client/api-client/client.gen";
+import type { BreadcrumbItemData } from "./client/components/app-breadcrumb";
+
+const baseUrl = typeof window === "undefined" ? "/" : window.location.origin;
+client.setConfig({
+	baseUrl,
+	credentials: "include",
+});
+
+export function getRouter() {
+	const queryClient = new QueryClient({
+		defaultOptions: {
+			queries: {
+				retry: false,
+			},
+		},
+		mutationCache: new MutationCache({
+			onError: (error) => {
+				logger.error("Mutation error:", error);
+			},
+			onSettled: (_data, _error, _variables, _onMutateResult, _mutation, context) => {
+				void context.client.invalidateQueries(undefined, { cancelRefetch: false });
+			},
+		}),
+	});
+
+	const router = createRouter({
+		routeTree,
+		context: { queryClient },
+		defaultPreload: "intent",
+		scrollRestoration: false,
+	});
+	setupRouterSsrQueryIntegration({
+		router,
+		queryClient,
+	});
+
+	return router;
+}
+
+declare module "@tanstack/react-router" {
+	interface Register {
+		router: ReturnType<typeof getRouter>;
+	}
+	interface StaticDataRouteOption {
+		breadcrumb?: (match: any) => BreadcrumbItemData[] | null;
+	}
+}

@@ -1,7 +1,7 @@
 import { password, select } from "@inquirer/prompts";
 import { hashPassword } from "better-auth/crypto";
 import { Command } from "commander";
-import { and, eq } from "drizzle-orm";
+import { and, eq, ne } from "drizzle-orm";
 import { toMessage } from "~/server/utils/errors";
 import { db } from "../../db/db";
 import { account, sessionsTable, usersTable } from "../../db/schema";
@@ -10,7 +10,7 @@ const listUsers = () => {
 	return db.select({ id: usersTable.id, username: usersTable.username }).from(usersTable);
 };
 
-const resetPassword = async (username: string, newPassword: string) => {
+export const resetPassword = async (username: string, newPassword: string) => {
 	const [user] = await db.select().from(usersTable).where(eq(usersTable.username, username));
 
 	if (!user) {
@@ -18,19 +18,51 @@ const resetPassword = async (username: string, newPassword: string) => {
 	}
 
 	const newPasswordHash = await hashPassword(newPassword);
+	const legacyHash = user.passwordHash ? await Bun.password.hash(newPassword) : null;
 
-	await db.transaction(async (tx) => {
-		await tx
-			.update(account)
-			.set({ password: newPasswordHash })
-			.where(and(eq(account.userId, user.id), eq(account.providerId, "credential")));
+	db.transaction((tx) => {
+		const existingAccount = tx
+			.select()
+			.from(account)
+			.where(and(eq(account.userId, user.id), eq(account.providerId, "credential")))
+			.orderBy(account.createdAt, account.id)
+			.get();
 
-		if (user.passwordHash) {
-			const legacyHash = await Bun.password.hash(newPassword);
-			await tx.update(usersTable).set({ passwordHash: legacyHash }).where(eq(usersTable.id, user.id));
+		if (existingAccount) {
+			// An explicit reset replaces all old passwords, so retain one credential row.
+			tx.delete(account)
+				.where(
+					and(
+						eq(account.userId, user.id),
+						eq(account.providerId, "credential"),
+						ne(account.id, existingAccount.id),
+					),
+				)
+				.run();
+
+			tx.update(account)
+				.set({ accountId: user.id, password: newPasswordHash })
+				.where(eq(account.id, existingAccount.id))
+				.run();
+		} else {
+			tx.insert(account)
+				.values({
+					id: crypto.randomUUID(),
+					providerId: "credential",
+					accountId: user.id,
+					userId: user.id,
+					password: newPasswordHash,
+					createdAt: new Date(),
+					updatedAt: new Date(),
+				})
+				.run();
 		}
 
-		await tx.delete(sessionsTable).where(eq(sessionsTable.userId, user.id));
+		if (legacyHash) {
+			tx.update(usersTable).set({ passwordHash: legacyHash }).where(eq(usersTable.id, user.id)).run();
+		}
+
+		tx.delete(sessionsTable).where(eq(sessionsTable.userId, user.id)).run();
 	});
 };
 

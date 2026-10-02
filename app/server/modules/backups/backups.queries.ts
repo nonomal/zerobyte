@@ -1,9 +1,8 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db/db";
-import { backupSchedulesTable, backupScheduleMirrorsTable } from "../../db/schema";
+import { backupSchedulesTable } from "../../db/schema";
 
-export type BackupStatusType = "in_progress" | "success" | "warning" | "error";
-export type MirrorStatusType = "success" | "error";
+type BackupStatusType = "in_progress" | "success" | "warning" | "error";
 
 export const scheduleQueries = {
 	findById: async (scheduleId: number, organizationId: string) => {
@@ -35,13 +34,16 @@ export const scheduleQueries = {
 			lastBackupStatus?: BackupStatusType;
 			lastBackupAt?: number;
 			lastBackupError?: string | null;
-			nextBackupAt?: number;
+			nextBackupAt?: number | null;
+			failureRetryCount?: number;
 		},
 	) => {
 		return db
 			.update(backupSchedulesTable)
 			.set({ ...status, updatedAt: Date.now() })
-			.where(and(eq(backupSchedulesTable.id, scheduleId), eq(backupSchedulesTable.organizationId, organizationId)));
+			.where(
+				and(eq(backupSchedulesTable.id, scheduleId), eq(backupSchedulesTable.organizationId, organizationId)),
+			);
 	},
 };
 
@@ -53,15 +55,11 @@ export const mirrorQueries = {
 		});
 	},
 
-	updateStatus: async (
-		mirrorId: number,
-		status: {
-			lastCopyAt: number;
-			lastCopyStatus: MirrorStatusType;
-			lastCopyError: string | null;
-		},
-	) => {
-		return db.update(backupScheduleMirrorsTable).set(status).where(eq(backupScheduleMirrorsTable.id, mirrorId));
+	findByScheduleAndRepository: async (scheduleId: number, repositoryId: string) => {
+		return db.query.backupScheduleMirrorsTable.findFirst({
+			where: { scheduleId, repositoryId },
+			with: { repository: true },
+		});
 	},
 };
 

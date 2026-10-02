@@ -1,33 +1,135 @@
-import crypto from "node:crypto";
+import * as os from "node:os";
+import nodePath from "node:path";
 import { and, eq } from "drizzle-orm";
-import { ConflictError, InternalServerError, NotFoundError } from "http-errors-enhanced";
-import { db } from "../../db/db";
-import { repositoriesTable } from "../../db/schema";
-import { toMessage } from "../../utils/errors";
-import { generateShortId } from "../../utils/id";
-import { restic } from "../../utils/restic";
-import { cryptoUtils } from "../../utils/crypto";
-import { cache } from "../../utils/cache";
-import { repoMutex } from "../../core/repository-mutex";
-import { type } from "arktype";
+import { BadRequestError, ConflictError, InternalServerError, NotFoundError } from "http-errors-enhanced";
 import {
-	repositoryConfigSchema,
 	type CompressionMode,
 	type OverwriteMode,
 	type RepositoryConfig,
-} from "~/schemas/restic";
-import { getOrganizationId } from "~/server/core/request-context";
+	type ResticDumpStream,
+	repositoryConfigSchema,
+} from "@zerobyte/core/restic";
+import { isPathWithin } from "@zerobyte/core/utils";
+import { config as appConfig } from "~/server/core/config";
+import { DATABASE_URL, RESTORE_BLOCKED_ROOTS, RESTIC_PASS_FILE } from "~/server/core/constants";
 import { serverEvents } from "~/server/core/events";
-import { executeDoctor } from "./doctor";
-import { logger } from "~/server/utils/logger";
+import { getOrganizationId } from "~/server/core/request-context";
+import { logger } from "@zerobyte/core/node";
+import { parseRetentionCategories, type RetentionCategory } from "~/server/utils/retention-categories";
+import { repoMutex } from "../../core/repository-mutex";
+import { db } from "../../db/db";
+import { repositoriesTable, type RepositoryInsert } from "../../db/schema";
+import { cache, cacheKeys } from "../../utils/cache";
+import { runEffectPromise, toMessage } from "../../utils/errors";
+import { generateShortId } from "../../utils/id";
+import { addCommonArgs, buildEnv, buildRepoUrl, cleanupTemporaryKeys } from "@zerobyte/core/restic/server";
+import { restic, resticDeps } from "../../core/restic";
+import { safeSpawn } from "@zerobyte/core/node";
+import type { DumpPathKind, UpdateRepositoryBody } from "./repositories.dto";
+import { findCommonAncestor } from "@zerobyte/core/utils";
+import { prepareSnapshotDump } from "./helpers/dump";
+import { emptyRepositoryStats, refreshStoredRepositoryStats } from "./helpers/repository-stats";
+import { asShortId, type ShortId } from "~/server/utils/branded";
+import { decryptRepositoryConfig, encryptRepositoryConfig } from "./repository-config-secrets";
+import { commands } from "./commands";
+import { getScheduleByIdOrShortId } from "../backups/helpers/backup-schedule-lookups";
+import { agentsService } from "../agents/agents.service";
+import { LOCAL_AGENT_ID } from "../agents/constants";
+import { taskStore } from "../tasks/tasks.store";
+import { Effect } from "effect";
+import { normalizeRequiredName } from "~/server/utils/names";
+import { bandwidthFields } from "./repository-bandwidth-fields";
 
-const runningDoctors = new Map<string, AbortController>();
+const lsLimiters = new Map<string, Effect.Semaphore>();
+const RESTORE_TASK_RESOURCE_TYPE = "repository";
 
-const findRepository = async (idOrShortId: string) => {
+const getBlockedRestoreTargets = () => {
+	return [
+		...RESTORE_BLOCKED_ROOTS,
+		DATABASE_URL === ":memory:" ? undefined : nodePath.dirname(nodePath.resolve(DATABASE_URL)),
+		nodePath.dirname(nodePath.resolve(RESTIC_PASS_FILE)),
+		nodePath.resolve(os.tmpdir()),
+		appConfig.provisioningPath ? nodePath.dirname(nodePath.resolve(appConfig.provisioningPath)) : undefined,
+	].filter((e) => e !== undefined);
+};
+
+const assertAllowedControllerLocalRestoreTarget = (target: string) => {
+	const resolvedTarget = nodePath.resolve(target);
+
+	for (const blockedTarget of getBlockedRestoreTargets()) {
+		if (isPathWithin(blockedTarget, resolvedTarget)) {
+			throw new BadRequestError(
+				"Restore target path is not allowed. Restoring to this path could overwrite critical system files or application data.",
+			);
+		}
+	}
+};
+
+const getLsLimiter = (repositoryId: string) => {
+	let limiter = lsLimiters.get(repositoryId);
+	if (!limiter) {
+		limiter = Effect.runSync(Effect.makeSemaphore(2));
+		lsLimiters.set(repositoryId, limiter);
+	}
+	return limiter;
+};
+
+const findActiveRestoreTask = (organizationId: string, repositoryShortId: string, snapshotId: string) => {
+	return taskStore.findActiveByResource({
+		organizationId,
+		kind: "restore",
+		resourceType: RESTORE_TASK_RESOURCE_TYPE,
+		resourceId: repositoryShortId,
+		operationKey: snapshotId,
+	});
+};
+
+const findActiveDoctorTask = (organizationId: string, repositoryShortId: string) => {
+	return taskStore.findActiveByResource({
+		organizationId,
+		kind: "doctor",
+		resourceType: "repository",
+		resourceId: repositoryShortId,
+	});
+};
+
+const assertAllowedRestoreAgent = async (agentId: string, organizationId: string) => {
+	if (agentId === LOCAL_AGENT_ID) {
+		return;
+	}
+
+	const agent = await agentsService.getAgent(agentId);
+	if (!agent || agent.organizationId !== organizationId) {
+		throw new NotFoundError("Restore target agent not found");
+	}
+};
+
+const assertOriginalLocationRestoreAllowed = async (organizationId: string, snapshotTags?: string[] | null) => {
+	if (!snapshotTags?.length) {
+		return;
+	}
+
+	const scheduleShortIds = snapshotTags.map(asShortId);
+	const schedules = await db.query.backupSchedulesTable.findMany({
+		where: {
+			AND: [{ shortId: { in: scheduleShortIds } }, { organizationId }],
+		},
+		with: { volume: true },
+	});
+	const hasReadOnlySourceVolume = schedules.some((schedule) => schedule.volume.config.readOnly === true);
+
+	if (hasReadOnlySourceVolume) {
+		throw new BadRequestError(
+			"Original location restore is unavailable because the source volume is read-only. Restore to a custom location instead.",
+		);
+	}
+};
+
+const findRepository = async (shortId: ShortId) => {
 	const organizationId = getOrganizationId();
 	return await db.query.repositoriesTable.findFirst({
 		where: {
-			AND: [{ OR: [{ id: idOrShortId }, { shortId: idOrShortId }] }, { organizationId }],
+			AND: [{ shortId: { eq: shortId } }, { organizationId }],
 		},
 	});
 };
@@ -38,67 +140,42 @@ const listRepositories = async () => {
 	return repositories;
 };
 
-const encryptConfig = async (config: RepositoryConfig): Promise<RepositoryConfig> => {
-	const encryptedConfig: Record<string, unknown> = { ...config };
-
-	if (config.customPassword) {
-		encryptedConfig.customPassword = await cryptoUtils.sealSecret(config.customPassword);
-	}
-
-	if (config.cacert) {
-		encryptedConfig.cacert = await cryptoUtils.sealSecret(config.cacert);
-	}
-
-	switch (config.backend) {
-		case "s3":
-		case "r2":
-			encryptedConfig.accessKeyId = await cryptoUtils.sealSecret(config.accessKeyId);
-			encryptedConfig.secretAccessKey = await cryptoUtils.sealSecret(config.secretAccessKey);
-			break;
-		case "gcs":
-			encryptedConfig.credentialsJson = await cryptoUtils.sealSecret(config.credentialsJson);
-			break;
-		case "azure":
-			encryptedConfig.accountKey = await cryptoUtils.sealSecret(config.accountKey);
-			break;
-		case "rest":
-			if (config.username) {
-				encryptedConfig.username = await cryptoUtils.sealSecret(config.username);
-			}
-			if (config.password) {
-				encryptedConfig.password = await cryptoUtils.sealSecret(config.password);
-			}
-			break;
-		case "sftp":
-			encryptedConfig.privateKey = await cryptoUtils.sealSecret(config.privateKey);
-			break;
-	}
-
-	return encryptedConfig as RepositoryConfig;
-};
-
-const createRepository = async (name: string, config: RepositoryConfig, compressionMode?: CompressionMode) => {
+const createRepository = async (
+	name: string,
+	config: RepositoryConfig,
+	compressionMode?: CompressionMode,
+	autoCheckEnabled?: boolean,
+) => {
 	const organizationId = getOrganizationId();
-	const id = crypto.randomUUID();
-	const shortId = generateShortId();
+	const normalizedName = normalizeRequiredName(name);
 
-	let processedConfig = config;
-	if (config.backend === "local" && !config.isExistingRepository) {
-		processedConfig = { ...config, name: shortId };
+	if (normalizedName === null) {
+		throw new BadRequestError("Repository name cannot be empty");
 	}
 
-	const encryptedConfig = await encryptConfig(processedConfig);
+	const id = Bun.randomUUIDv7();
+	const shortId = generateShortId();
+	const resolvedCompressionMode = compressionMode ?? "auto";
+	const resolvedAutoCheckEnabled = autoCheckEnabled ?? true;
+	const bandwidth = bandwidthFields(config);
+	if (config.backend === "local" && !config.isExistingRepository) {
+		config.path = `${config.path}/${shortId}`;
+	}
+
+	const encryptedConfig = await encryptRepositoryConfig(config);
 
 	const [created] = await db
 		.insert(repositoriesTable)
 		.values({
 			id,
 			shortId,
-			name: name.trim(),
+			name: normalizedName,
 			type: config.backend,
 			config: encryptedConfig,
-			compressionMode: compressionMode ?? "auto",
+			compressionMode: resolvedCompressionMode,
+			autoCheckEnabled: resolvedAutoCheckEnabled,
 			status: "unknown",
+			...bandwidth,
 			organizationId,
 		})
 		.returning();
@@ -110,14 +187,17 @@ const createRepository = async (name: string, config: RepositoryConfig, compress
 	let error: string | null = null;
 
 	if (config.isExistingRepository) {
-		const result = await restic
-			.snapshots(encryptedConfig, { organizationId })
+		const result = await runEffectPromise(restic.snapshots(encryptedConfig, { organizationId }))
 			.then(() => ({ error: null }))
 			.catch((error) => ({ error }));
 
 		error = result.error;
 	} else {
-		const initResult = await restic.init(encryptedConfig, organizationId, { timeoutMs: 20000 });
+		const initResult = await runEffectPromise(
+			restic.init(encryptedConfig, {
+				organizationId,
+			}),
+		);
 		error = initResult.error;
 	}
 
@@ -138,8 +218,8 @@ const createRepository = async (name: string, config: RepositoryConfig, compress
 	throw new InternalServerError(`Failed to initialize repository: ${errorMessage}`);
 };
 
-const getRepository = async (id: string) => {
-	const repository = await findRepository(id);
+const getRepository = async (shortId: ShortId) => {
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
@@ -148,8 +228,28 @@ const getRepository = async (id: string) => {
 	return { repository };
 };
 
-const deleteRepository = async (id: string) => {
-	const repository = await findRepository(id);
+const refreshRepositoryStats = async (shortId: ShortId) => {
+	const repository = await findRepository(shortId);
+
+	if (!repository) {
+		throw new NotFoundError("Repository not found");
+	}
+
+	return refreshStoredRepositoryStats(repository);
+};
+
+const getRepositoryStats = async (shortId: ShortId) => {
+	const repository = await findRepository(shortId);
+
+	if (!repository) {
+		throw new NotFoundError("Repository not found");
+	}
+
+	return repository.stats ?? { ...emptyRepositoryStats };
+};
+
+const deleteRepository = async (shortId: ShortId) => {
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
@@ -160,31 +260,33 @@ const deleteRepository = async (id: string) => {
 	await db
 		.delete(repositoriesTable)
 		.where(
-			and(eq(repositoriesTable.id, repository.id), eq(repositoriesTable.organizationId, repository.organizationId)),
+			and(
+				eq(repositoriesTable.id, repository.id),
+				eq(repositoriesTable.organizationId, repository.organizationId),
+			),
 		);
 
-	cache.delByPrefix(`snapshots:${repository.id}:`);
-	cache.delByPrefix(`ls:${repository.id}:`);
+	cache.delByPrefix(cacheKeys.repository.all(repository.id));
 };
 
 /**
  * List snapshots for a given repository
  * If backupId is provided, filter snapshots by that backup ID (tag)
- * @param id Repository ID
+ * @param shortId Repository short ID
  * @param backupId Optional backup ID to filter snapshots for a specific backup schedule
  *
  * @returns List of snapshots
  */
-const listSnapshots = async (id: string, backupId?: string) => {
+const listSnapshots = async (shortId: ShortId, backupId?: ShortId) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const cacheKey = `snapshots:${repository.id}:${backupId || "all"}`;
-	const cached = cache.get<Awaited<ReturnType<typeof restic.snapshots>>>(cacheKey);
+	const cacheKey = cacheKeys.repository.snapshots(repository.id, backupId);
+	const cached = cache.get<Effect.Effect.Success<ReturnType<typeof restic.snapshots>>>(cacheKey);
 	if (cached) {
 		return cached;
 	}
@@ -194,9 +296,11 @@ const listSnapshots = async (id: string, backupId?: string) => {
 		let snapshots = [];
 
 		if (backupId) {
-			snapshots = await restic.snapshots(repository.config, { tags: [backupId], organizationId });
+			snapshots = await runEffectPromise(
+				restic.snapshots(repository.config, { tags: [backupId], organizationId }),
+			);
 		} else {
-			snapshots = await restic.snapshots(repository.config, { organizationId });
+			snapshots = await runEffectPromise(restic.snapshots(repository.config, { organizationId }));
 		}
 
 		cache.set(cacheKey, snapshots);
@@ -208,13 +312,13 @@ const listSnapshots = async (id: string, backupId?: string) => {
 };
 
 const listSnapshotFiles = async (
-	id: string,
+	shortId: ShortId,
 	snapshotId: string,
 	path?: string,
 	options?: { offset?: number; limit?: number },
 ) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
@@ -223,12 +327,8 @@ const listSnapshotFiles = async (
 	const offset = options?.offset ?? 0;
 	const limit = options?.limit ?? 500;
 
-	const cacheKey = `ls:${repository.id}:${snapshotId}:${path || "root"}:${offset}:${limit}`;
-	type LsResult = {
-		snapshot: { id: string; short_id: string; time: string; hostname: string; paths: string[] } | null;
-		nodes: { name: string; type: string; path: string; size?: number; mode?: number }[];
-		pagination: { offset: number; limit: number; total: number; hasMore: boolean };
-	};
+	const cacheKey = cacheKeys.repository.ls(repository.id, snapshotId, path, offset, limit);
+	type LsResult = Effect.Effect.Success<ReturnType<typeof restic.ls>>;
 	const cached = cache.get<LsResult>(cacheKey);
 	if (cached?.snapshot) {
 		return {
@@ -241,88 +341,203 @@ const listSnapshotFiles = async (
 		};
 	}
 
-	const releaseLock = await repoMutex.acquireShared(repository.id, `ls:${snapshotId}`);
+	const limiter = getLsLimiter(repository.id);
+	await runEffectPromise(limiter.take(1));
+
 	try {
-		const result = await restic.ls(repository.config, snapshotId, organizationId, path, { offset, limit });
+		const releaseLock = await repoMutex.acquireShared(repository.id, `ls:${snapshotId}`);
+		try {
+			const result = await runEffectPromise(
+				restic.ls(repository.config, snapshotId, path, { organizationId, offset, limit }),
+			);
 
-		if (!result.snapshot) {
-			throw new NotFoundError("Snapshot not found or empty");
+			if (!result.snapshot) {
+				throw new NotFoundError("Snapshot not found or empty");
+			}
+
+			const response = {
+				snapshot: {
+					id: result.snapshot.id,
+					short_id: result.snapshot.short_id,
+					time: result.snapshot.time,
+					hostname: result.snapshot.hostname,
+					paths: result.snapshot.paths,
+				},
+				files: result.nodes,
+				offset: result.pagination.offset,
+				limit: result.pagination.limit,
+				total: result.pagination.total,
+				hasMore: result.pagination.hasMore,
+			};
+
+			cache.set(cacheKey, result);
+
+			return response;
+		} finally {
+			releaseLock();
 		}
-
-		const response = {
-			snapshot: {
-				id: result.snapshot.id,
-				short_id: result.snapshot.short_id,
-				time: result.snapshot.time,
-				hostname: result.snapshot.hostname,
-				paths: result.snapshot.paths,
-			},
-			files: result.nodes,
-			offset: result.pagination.offset,
-			limit: result.pagination.limit,
-			total: result.pagination.total,
-			hasMore: result.pagination.hasMore,
-		};
-
-		cache.set(cacheKey, result);
-
-		return response;
 	} finally {
-		releaseLock();
+		await runEffectPromise(limiter.release(1));
 	}
 };
 
 const restoreSnapshot = async (
-	id: string,
+	shortId: ShortId,
 	snapshotId: string,
 	options?: {
 		include?: string[];
+		selectedItemKind?: "file" | "dir";
 		exclude?: string[];
 		excludeXattr?: string[];
 		delete?: boolean;
 		targetPath?: string;
+		targetAgentId?: string;
 		overwrite?: OverwriteMode;
 	},
 ) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const target = options?.targetPath || "/";
+	const { targetAgentId, targetPath, ...restoreExecutionOptions } = options ?? {};
+	const target = targetPath || "/";
+	const restoresToOriginalLocation = nodePath.resolve(target) === "/";
 
-	const releaseLock = await repoMutex.acquireShared(repository.id, `restore:${snapshotId}`);
+	const snapshot = await getSnapshotDetails(repository.shortId, snapshotId);
+	const hasNonPosixSnapshotPaths = snapshot.paths.some((path) => !path.startsWith("/"));
+
+	if (restoresToOriginalLocation) {
+		await assertOriginalLocationRestoreAllowed(organizationId, snapshot.tags);
+	}
+
+	if (hasNonPosixSnapshotPaths && restoresToOriginalLocation) {
+		throw new BadRequestError(
+			"Original location restore is unavailable for this snapshot. Restore it to a custom location instead.",
+		);
+	}
+
+	const basePath = hasNonPosixSnapshotPaths ? "/" : findCommonAncestor(snapshot.paths);
+	const executionAgentId = targetAgentId ?? LOCAL_AGENT_ID;
+	const useControllerLocalRestoreFallback = executionAgentId === LOCAL_AGENT_ID && !appConfig.flags.enableLocalAgent;
+	await assertAllowedRestoreAgent(executionAgentId, organizationId);
+
+	if (!useControllerLocalRestoreFallback && repository.type === "local" && executionAgentId !== LOCAL_AGENT_ID) {
+		throw new BadRequestError(
+			"Local repository restores must run on the agent that can access the repository path.",
+		);
+	}
+
+	if (executionAgentId === LOCAL_AGENT_ID) {
+		assertAllowedControllerLocalRestoreTarget(target);
+	}
+
+	const activeRestore = findActiveRestoreTask(organizationId, repository.shortId, snapshotId);
+	if (activeRestore) {
+		throw new ConflictError("A restore is already running for this snapshot");
+	}
+
+	const repositoryConfig = await decryptRepositoryConfig(repository.config);
+	const command = commands.createRestore({
+		organizationId,
+		repositoryId: repository.id,
+		repositoryShortId: repository.shortId,
+		repositoryName: repository.name,
+		repositoryConfig,
+		snapshotId,
+		target,
+		executionTarget: useControllerLocalRestoreFallback
+			? { kind: "controller" }
+			: { kind: "agent", agentId: executionAgentId },
+		options: {
+			basePath,
+			...restoreExecutionOptions,
+		},
+	});
+
+	return command.start();
+};
+const dumpSnapshot = async (shortId: ShortId, snapshotId: string, path?: string, kind?: DumpPathKind) => {
+	const organizationId = getOrganizationId();
+	const repository = await findRepository(shortId);
+
+	if (!repository) {
+		throw new NotFoundError("Repository not found");
+	}
+
+	const releaseLock = await repoMutex.acquireShared(repository.id, `dump:${snapshotId}`);
+	let dumpStream: ResticDumpStream | null = null;
+
 	try {
-		const result = await restic.restore(repository.config, snapshotId, target, { ...options, organizationId });
-
-		return {
-			success: true,
-			message: "Snapshot restored successfully",
-			filesRestored: result.files_restored,
-			filesSkipped: result.files_skipped,
+		const snapshot = await getSnapshotDetails(repository.shortId, snapshotId);
+		const preparedDump = prepareSnapshotDump({
+			snapshotId,
+			snapshotPaths: snapshot.paths,
+			requestedPath: path,
+		});
+		const dumpOptions: Parameters<typeof restic.dump>[2] = {
+			organizationId,
+			path: preparedDump.path,
 		};
-	} finally {
+
+		let filename = preparedDump.filename;
+		let contentType = "application/x-tar";
+
+		if (path && preparedDump.path !== "/") {
+			if (!kind) {
+				throw new BadRequestError("Path kind is required when downloading a specific snapshot path");
+			}
+
+			if (kind === "file") {
+				dumpOptions.archive = false;
+				contentType = "application/octet-stream";
+				const fileName = nodePath.posix.basename(preparedDump.path);
+				if (fileName) {
+					filename = fileName;
+				}
+			}
+		}
+
+		dumpStream = await runEffectPromise(restic.dump(repository.config, preparedDump.snapshotRef, dumpOptions));
+
+		serverEvents.emit("dump:started", {
+			organizationId,
+			repositoryId: repository.shortId,
+			snapshotId,
+			path: preparedDump.path,
+			filename,
+		});
+
+		const completion = dumpStream.completion.finally(releaseLock);
+		void completion.catch(() => {});
+
+		return { ...dumpStream, completion, filename, contentType };
+	} catch (error) {
+		if (dumpStream) {
+			dumpStream.abort();
+		}
 		releaseLock();
+		throw error;
 	}
 };
 
-const getSnapshotDetails = async (id: string, snapshotId: string) => {
+const getSnapshotDetails = async (shortId: ShortId, snapshotId: string) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const cacheKey = `snapshots:${repository.id}:all`;
-	let snapshots = cache.get<Awaited<ReturnType<typeof restic.snapshots>>>(cacheKey);
+	const cacheKey = cacheKeys.repository.snapshots(repository.id);
+	let snapshots = cache.get<Effect.Effect.Success<ReturnType<typeof restic.snapshots>>>(cacheKey);
 
 	if (!snapshots) {
 		const releaseLock = await repoMutex.acquireShared(repository.id, `snapshot_details:${snapshotId}`);
 		try {
-			snapshots = await restic.snapshots(repository.config, { organizationId });
+			snapshots = await runEffectPromise(restic.snapshots(repository.config, { organizationId }));
 			cache.set(cacheKey, snapshots);
 		} finally {
 			releaseLock();
@@ -332,7 +547,7 @@ const getSnapshotDetails = async (id: string, snapshotId: string) => {
 	const snapshot = snapshots.find((snap) => snap.id === snapshotId || snap.short_id === snapshotId);
 
 	if (!snapshot) {
-		void refreshSnapshots(id).catch(() => {});
+		void refreshSnapshots(shortId).catch(() => {});
 
 		throw new NotFoundError("Snapshot not found");
 	}
@@ -340,9 +555,9 @@ const getSnapshotDetails = async (id: string, snapshotId: string) => {
 	return snapshot;
 };
 
-const checkHealth = async (repositoryId: string) => {
+const checkHealth = async (shortId: ShortId) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(repositoryId);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
@@ -350,7 +565,7 @@ const checkHealth = async (repositoryId: string) => {
 
 	const releaseLock = await repoMutex.acquireExclusive(repository.id, "check");
 	try {
-		const { hasErrors, error } = await restic.check(repository.config, { organizationId });
+		const { hasErrors, error } = await runEffectPromise(restic.check(repository.config, { organizationId }));
 
 		await db
 			.update(repositoriesTable)
@@ -360,7 +575,10 @@ const checkHealth = async (repositoryId: string) => {
 				lastError: error,
 			})
 			.where(
-				and(eq(repositoriesTable.id, repository.id), eq(repositoriesTable.organizationId, repository.organizationId)),
+				and(
+					eq(repositoriesTable.id, repository.id),
+					eq(repositoriesTable.organizationId, repository.organizationId),
+				),
 			);
 
 		return { lastError: error };
@@ -369,149 +587,76 @@ const checkHealth = async (repositoryId: string) => {
 	}
 };
 
-const startDoctor = async (id: string) => {
-	const repository = await findRepository(id);
+const startDoctor = async (shortId: ShortId) => {
+	const organizationId = getOrganizationId();
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	if (runningDoctors.has(repository.id)) {
+	const activeDoctorTask = findActiveDoctorTask(organizationId, repository.shortId);
+	if (activeDoctorTask) {
 		throw new ConflictError("Doctor operation already in progress");
 	}
 
-	const abortController = new AbortController();
-
-	try {
-		await db.update(repositoriesTable).set({ status: "doctor" }).where(eq(repositoriesTable.id, repository.id));
-
-		serverEvents.emit("doctor:started", {
-			organizationId: repository.organizationId,
-			repositoryId: repository.id,
-			repositoryName: repository.name,
-		});
-
-		runningDoctors.set(repository.id, abortController);
-	} catch (error) {
-		runningDoctors.delete(repository.id);
-		throw error;
-	}
-
-	executeDoctor(repository.id, repository.config, repository.name, abortController.signal)
-		.catch((error) => {
-			logger.error(`Doctor background task failed: ${toMessage(error)}`);
-		})
-		.finally(() => {
-			runningDoctors.delete(repository.id);
-		});
-
-	return { message: "Doctor operation started", repositoryId: repository.id };
+	const command = commands.createDoctor({ repository });
+	return command.start();
 };
 
-const cancelDoctor = async (id: string) => {
-	const repository = await findRepository(id);
+const deleteSnapshot = async (shortId: ShortId, snapshotId: string) => {
+	return deleteSnapshots(shortId, [snapshotId]);
+};
+
+const deleteSnapshots = async (shortId: ShortId, snapshotIds: string[]) => {
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const abortController = runningDoctors.get(repository.id);
-	if (!abortController) {
-		await db.update(repositoriesTable).set({ status: "unknown" }).where(eq(repositoriesTable.id, repository.id));
-		throw new ConflictError("No doctor operation is currently running");
-	}
-
-	abortController.abort();
-	runningDoctors.delete(repository.id);
-
-	await db.update(repositoriesTable).set({ status: "unknown" }).where(eq(repositoriesTable.id, repository.id));
-
-	serverEvents.emit("doctor:cancelled", {
-		organizationId: repository.organizationId,
-		repositoryId: repository.id,
-		repositoryName: repository.name,
+	const command = commands.createDeleteSnapshots({
+		repository,
+		snapshotIds,
 	});
 
-	return { message: "Doctor operation cancelled" };
-};
-
-const deleteSnapshot = async (id: string, snapshotId: string) => {
-	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
-
-	if (!repository) {
-		throw new NotFoundError("Repository not found");
-	}
-
-	const releaseLock = await repoMutex.acquireExclusive(repository.id, `delete:${snapshotId}`);
-	try {
-		await restic.deleteSnapshot(repository.config, snapshotId, organizationId);
-		cache.delByPrefix(`snapshots:${repository.id}:`);
-		cache.delByPrefix(`ls:${repository.id}:${snapshotId}:`);
-	} finally {
-		releaseLock();
-	}
-};
-
-const deleteSnapshots = async (id: string, snapshotIds: string[]) => {
-	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
-
-	if (!repository) {
-		throw new NotFoundError("Repository not found");
-	}
-
-	const releaseLock = await repoMutex.acquireExclusive(repository.id, `delete:bulk`);
-	try {
-		await restic.deleteSnapshots(repository.config, snapshotIds, organizationId);
-		cache.delByPrefix(`snapshots:${repository.id}:`);
-		for (const snapshotId of snapshotIds) {
-			cache.delByPrefix(`ls:${repository.id}:${snapshotId}:`);
-		}
-	} finally {
-		releaseLock();
-	}
+	return command.start();
 };
 
 const tagSnapshots = async (
-	id: string,
+	shortId: ShortId,
 	snapshotIds: string[],
 	tags: { add?: string[]; remove?: string[]; set?: string[] },
 ) => {
-	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const releaseLock = await repoMutex.acquireExclusive(repository.id, `tag:bulk`);
-	try {
-		await restic.tagSnapshots(repository.config, snapshotIds, tags, organizationId);
-		cache.delByPrefix(`snapshots:${repository.id}:`);
-		for (const snapshotId of snapshotIds) {
-			cache.delByPrefix(`ls:${repository.id}:${snapshotId}:`);
-		}
-	} finally {
-		releaseLock();
-	}
+	const command = commands.createTagSnapshots({
+		repository,
+		snapshotIds,
+		tags,
+	});
+
+	return command.start();
 };
 
-const refreshSnapshots = async (id: string) => {
+const refreshSnapshots = async (shortId: ShortId) => {
 	const organizationId = getOrganizationId();
-	const repository = await findRepository(id);
+	const repository = await findRepository(shortId);
 
 	if (!repository) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	cache.delByPrefix(`snapshots:${repository.id}:`);
-	cache.delByPrefix(`ls:${repository.id}:`);
+	cache.delByPrefix(cacheKeys.repository.all(repository.id));
 
 	const releaseLock = await repoMutex.acquireShared(repository.id, "refresh");
 	try {
-		const snapshots = await restic.snapshots(repository.config, { organizationId });
-		const cacheKey = `snapshots:${repository.id}:all`;
+		const snapshots = await runEffectPromise(restic.snapshots(repository.config, { organizationId }));
+		const cacheKey = cacheKeys.repository.snapshots(repository.id);
 		cache.set(cacheKey, snapshots);
 
 		return {
@@ -523,58 +668,211 @@ const refreshSnapshots = async (id: string) => {
 	}
 };
 
-const updateRepository = async (id: string, updates: { name?: string; compressionMode?: CompressionMode }) => {
-	const existing = await findRepository(id);
+const updateRepository = async (shortId: ShortId, updates: UpdateRepositoryBody) => {
+	const existing = await findRepository(shortId);
 
 	if (!existing) {
 		throw new NotFoundError("Repository not found");
 	}
 
-	const newConfig = repositoryConfigSchema(existing.config);
-	if (newConfig instanceof type.errors) {
+	const existingConfigResult = repositoryConfigSchema.safeParse(existing.config);
+	if (!existingConfigResult.success) {
 		throw new InternalServerError("Invalid repository configuration");
 	}
-
-	const encryptedConfig = await encryptConfig(newConfig);
+	const existingConfig = existingConfigResult.data;
 
 	let newName = existing.name;
-	if (updates.name !== undefined && updates.name !== existing.name) {
-		newName = updates.name.trim();
+	if (updates.name !== undefined) {
+		const normalizedName = normalizeRequiredName(updates.name);
+
+		if (normalizedName === null) {
+			throw new BadRequestError("Repository name cannot be empty");
+		}
+
+		newName = normalizedName;
+	}
+
+	let parsedConfig = existingConfig;
+	if (updates.config) {
+		const nextConfigResult = repositoryConfigSchema.safeParse(updates.config);
+		if (!nextConfigResult.success) {
+			throw new BadRequestError("Invalid repository configuration");
+		}
+		const nextConfig = nextConfigResult.data;
+
+		if (nextConfig.backend !== existing.type) {
+			throw new BadRequestError("Repository backend cannot be changed");
+		}
+
+		parsedConfig = nextConfig;
+	}
+
+	const decryptedExisting = await decryptRepositoryConfig(existingConfig);
+	const configChanged = updates.config && JSON.stringify(decryptedExisting) !== JSON.stringify(parsedConfig);
+	const encryptedConfig = updates.config ? await encryptRepositoryConfig(parsedConfig) : existingConfig;
+	const resolvedCompressionMode = updates.compressionMode ?? existing.compressionMode;
+	const resolvedAutoCheckEnabled = updates.autoCheckEnabled ?? existing.autoCheckEnabled;
+	const bandwidth = bandwidthFields(parsedConfig);
+	const updatedAt = Date.now();
+	const updatePayload: Partial<RepositoryInsert> = {
+		name: newName,
+		compressionMode: resolvedCompressionMode,
+		autoCheckEnabled: resolvedAutoCheckEnabled,
+		updatedAt,
+		config: encryptedConfig,
+		...bandwidth,
+	};
+
+	if (configChanged) {
+		updatePayload.status = "unknown";
+		updatePayload.lastChecked = null;
+		updatePayload.lastError = null;
+		updatePayload.doctorResult = null;
+		updatePayload.stats = null;
+		updatePayload.statsUpdatedAt = null;
 	}
 
 	const [updated] = await db
 		.update(repositoriesTable)
-		.set({
-			name: newName,
-			compressionMode: updates.compressionMode ?? existing.compressionMode,
-			updatedAt: Date.now(),
-			config: encryptedConfig,
-		})
-		.where(eq(repositoriesTable.id, existing.id))
+		.set(updatePayload)
+		.where(
+			and(eq(repositoriesTable.id, existing.id), eq(repositoriesTable.organizationId, existing.organizationId)),
+		)
 		.returning();
 
 	if (!updated) {
 		throw new InternalServerError("Failed to update repository");
 	}
 
+	if (configChanged) {
+		cache.delByPrefix(cacheKeys.repository.all(existing.id));
+	}
+
 	return { repository: updated };
+};
+
+const unlockRepository = async (shortId: ShortId) => {
+	const organizationId = getOrganizationId();
+	const repository = await findRepository(shortId);
+
+	if (!repository) {
+		throw new NotFoundError("Repository not found");
+	}
+
+	const releaseLock = await repoMutex.acquireExclusive(repository.id, "unlock");
+	try {
+		const result = await runEffectPromise(restic.unlock(repository.config, { organizationId }));
+		return result;
+	} finally {
+		releaseLock();
+	}
+};
+
+const execResticCommand = async (
+	shortId: ShortId,
+	command: string,
+	args: string[] | undefined,
+	onStdout: (line: string) => void,
+	onStderr: (line: string) => void,
+	signal?: AbortSignal,
+) => {
+	const organizationId = getOrganizationId();
+	const repository = await findRepository(shortId);
+
+	if (!repository) {
+		throw new NotFoundError("Repository not found");
+	}
+
+	const repoUrl = buildRepoUrl(repository.config);
+	const env = await buildEnv(repository.config, organizationId, resticDeps);
+
+	const resticArgs: string[] = ["--repo", repoUrl, command];
+	if (args && args.length > 0) {
+		resticArgs.push(...args);
+	}
+	addCommonArgs(resticArgs, env, repository.config);
+
+	try {
+		const result = await safeSpawn({
+			command: "restic",
+			args: resticArgs,
+			env,
+			signal,
+			onStdout,
+			onStderr,
+		});
+		return { exitCode: result.exitCode };
+	} finally {
+		await cleanupTemporaryKeys(env, resticDeps);
+	}
+};
+
+const getRetentionCategories = async (repositoryId: ShortId, scheduleId?: ShortId) => {
+	if (!scheduleId) {
+		return new Map<string, RetentionCategory[]>();
+	}
+
+	try {
+		const repository = await findRepository(repositoryId);
+		if (!repository) {
+			return new Map<string, RetentionCategory[]>();
+		}
+
+		const cacheKey = cacheKeys.repository.retention(repository.id, scheduleId);
+		const cached = cache.get<Record<string, RetentionCategory[]>>(cacheKey);
+
+		if (cached) {
+			return new Map(Object.entries(cached));
+		}
+
+		const schedule = await getScheduleByIdOrShortId(scheduleId);
+
+		if (!schedule?.retentionPolicy) {
+			return new Map<string, RetentionCategory[]>();
+		}
+
+		const dryRunResults = await runEffectPromise(
+			restic.forget(repository.config, schedule.retentionPolicy, {
+				tag: scheduleId,
+				organizationId: getOrganizationId(),
+				dryRun: true,
+			}),
+		);
+
+		if (!dryRunResults.data) {
+			return new Map<string, RetentionCategory[]>();
+		}
+
+		const categories = parseRetentionCategories(dryRunResults.data);
+		cache.set(cacheKey, Object.fromEntries(categories));
+
+		return categories;
+	} catch (error) {
+		logger.error(`Failed to get retention categories: ${toMessage(error)}`);
+		return new Map<string, RetentionCategory[]>();
+	}
 };
 
 export const repositoriesService = {
 	listRepositories,
 	createRepository,
 	getRepository,
+	getRepositoryStats,
+	refreshRepositoryStats,
 	deleteRepository,
 	updateRepository,
 	listSnapshots,
 	listSnapshotFiles,
 	restoreSnapshot,
+	dumpSnapshot,
 	getSnapshotDetails,
 	checkHealth,
 	startDoctor,
-	cancelDoctor,
 	deleteSnapshot,
 	deleteSnapshots,
 	tagSnapshots,
 	refreshSnapshots,
+	execResticCommand,
+	getRetentionCategories,
+	unlockRepository,
 };

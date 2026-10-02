@@ -1,7 +1,9 @@
 import { db } from "~/server/db/db";
 import { faker } from "@faker-js/faker";
 import { volumesTable, type VolumeInsert } from "~/server/db/schema";
+import { LOCAL_AGENT_ID } from "~/server/modules/agents/constants";
 import { ensureTestOrganization, TEST_ORG_ID } from "./organization";
+import { generateShortId } from "~/server/utils/id";
 
 export const createTestVolume = async (overrides: Partial<VolumeInsert> = {}) => {
 	await ensureTestOrganization();
@@ -14,8 +16,9 @@ export const createTestVolume = async (overrides: Partial<VolumeInsert> = {}) =>
 		},
 		status: "mounted",
 		autoRemount: true,
-		shortId: faker.string.alphanumeric(6),
+		shortId: generateShortId(),
 		type: "directory",
+		agentId: LOCAL_AGENT_ID,
 		organizationId: TEST_ORG_ID,
 		...overrides,
 	};

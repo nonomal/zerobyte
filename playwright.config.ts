@@ -6,25 +6,41 @@ export default defineConfig({
 	fullyParallel: true,
 	forbidOnly: !!process.env.CI,
 	retries: 0,
-	workers: process.env.CI ? 1 : undefined,
+	timeout: 60000,
 	reporter: "html",
 	use: {
 		baseURL: `http://${process.env.SERVER_IP}:4096`,
 		video: "retain-on-failure",
-		trace: "on-first-retry",
+		trace: "retain-on-failure",
+		ignoreHTTPSErrors: true,
 	},
 	projects: [
 		{
 			name: "setup",
 			testMatch: /.*\.setup\.ts/,
+			workers: 1,
 		},
 		{
 			name: "chromium",
+			testIgnore: /.*\.proxy\.spec\.ts/,
 			use: {
 				...devices["Desktop Chrome"],
-				storageState: "playwright/.auth/user.json",
+				launchOptions: {
+					args: ["--host-rules=MAP tinyauth.example.com 127.0.0.1"],
+				},
 			},
 			dependencies: ["setup"],
+		},
+		{
+			name: "reverse-proxy",
+			testMatch: /.*\.proxy\.spec\.ts/,
+			use: {
+				...devices["Desktop Chrome"],
+				baseURL: "https://zerobyte.example.com:5558",
+				launchOptions: {
+					args: ["--host-rules=MAP zerobyte.example.com 127.0.0.1, MAP tinyauth.example.com 127.0.0.1"],
+				},
+			},
 		},
 
 		// {

@@ -5,176 +5,218 @@ import {
 	type MiddlewareContext,
 	type MiddlewareOptions,
 } from "better-auth";
+import { APIError } from "better-auth/api";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
-import { admin, createAuthMiddleware, twoFactor, username, organization } from "better-auth/plugins";
-import { UnauthorizedError } from "http-errors-enhanced";
-import { convertLegacyUserOnFirstLogin } from "./auth-middlewares/convert-legacy-user";
-import { eq } from "drizzle-orm";
+import { admin, twoFactor, username, organization, testUtils } from "better-auth/plugins";
+import { apiKey } from "@better-auth/api-key";
+import { passkey } from "@better-auth/passkey";
+import { createAuthMiddleware } from "better-auth/api";
 import { config } from "../core/config";
 import { db } from "../db/db";
+import * as schema from "../db/schema";
 import { cryptoUtils } from "../utils/crypto";
-import { organization as organizationTable, member, usersTable } from "../db/schema";
-import { ensureOnlyOneUser } from "./auth-middlewares/only-one-user";
 import { authService } from "../modules/auth/auth.service";
+import { tanstackStartCookies } from "better-auth/tanstack-start";
+import { isValidUsername, normalizeUsername } from "~/lib/username";
+import { ensureOnlyOneUser } from "./auth/middlewares/only-one-user";
+import { convertLegacyUserOnFirstLogin } from "./auth/middlewares/convert-legacy-user";
+import { enforcePasswordLoginPolicy } from "./auth/middlewares/password-login-policy";
+import { ensureDefaultOrg } from "./auth/helpers/create-default-org";
+import { ssoIntegration } from "../modules/sso/sso.integration";
+import { ACCOUNT_LINK_REQUIRED_DESCRIPTION } from "~/lib/sso-errors";
 
 export type AuthMiddlewareContext = MiddlewareContext<MiddlewareOptions, AuthContext<BetterAuthOptions>>;
 
-const createBetterAuth = (secret: string) => {
-	return betterAuth({
-		secret,
-		baseURL: config.baseUrl,
-		trustedOrigins: config.trustedOrigins,
-		advanced: {
-			cookiePrefix: "zerobyte",
-			useSecureCookies: config.isSecure,
+export const auth = betterAuth({
+	secret: await cryptoUtils.deriveSecret("better-auth"),
+	baseURL: {
+		allowedHosts: config.allowedHosts,
+		protocol: "auto",
+		fallback: config.baseUrl,
+	},
+	trustedOrigins: config.trustedOrigins,
+	rateLimit: {
+		enabled: !config.flags.disableRateLimiting,
+	},
+	advanced: {
+		cookiePrefix: "zerobyte",
+		useSecureCookies: config.isSecure,
+		trustedProxyHeaders: config.trustProxy,
+		ipAddress: {
+			disableIpTracking: config.flags.disableRateLimiting,
 		},
-		onAPIError: {
-			throw: true,
-		},
-		hooks: {
-			before: createAuthMiddleware(async (ctx) => {
-				await ensureOnlyOneUser(ctx);
-				await convertLegacyUserOnFirstLogin(ctx);
-			}),
-		},
-		database: drizzleAdapter(db, {
-			provider: "sqlite",
+	},
+	onAPIError: {
+		throw: true,
+		errorURL: `${config.baseUrl}/api/v1/auth/login-error`,
+	},
+	hooks: {
+		before: createAuthMiddleware(async (ctx) => {
+			for (const mw of ssoIntegration.beforeMiddlewares) {
+				await mw(ctx);
+			}
+
+			await ensureOnlyOneUser(ctx);
+			await enforcePasswordLoginPolicy(ctx);
+			await convertLegacyUserOnFirstLogin(ctx);
 		}),
-		databaseHooks: {
-			user: {
-				delete: {
-					before: async (user) => {
-						await authService.cleanupUserOrganizations(user.id);
-					},
-				},
-				create: {
-					before: async (user) => {
-						const anyUser = await db.query.usersTable.findFirst();
-						const isFirstUser = !anyUser;
-
-						if (isFirstUser) {
-							user.role = "admin";
-						}
-
-						return { data: user };
-					},
-					after: async (user) => {
-						const slug = user.email.split("@")[0] + "-" + Math.random().toString(36).slice(-4);
-
-						const resticPassword = cryptoUtils.generateResticPassword();
-						const metadata = {
-							resticPassword: await cryptoUtils.sealSecret(resticPassword),
-						};
-
-						try {
-							await db.transaction(async (tx) => {
-								const orgId = Bun.randomUUIDv7();
-
-								await tx.insert(organizationTable).values({
-									name: `${user.name}'s Workspace`,
-									slug: slug,
-									id: orgId,
-									createdAt: new Date(),
-									metadata,
-								});
-
-								await tx.insert(member).values({
-									id: Bun.randomUUIDv7(),
-									userId: user.id,
-									role: "owner",
-									organizationId: orgId,
-									createdAt: new Date(),
-								});
+	},
+	database: drizzleAdapter(db, {
+		provider: "sqlite",
+		schema,
+	}),
+	databaseHooks: {
+		account: {
+			create: {
+				before: async (account, ctx) => {
+					if (ssoIntegration.isSsoCallback(ctx)) {
+						const allowed = await ssoIntegration.canLinkSsoAccount(account.userId, account.providerId, ctx);
+						if (!allowed) {
+							throw new APIError("FORBIDDEN", {
+								code: "ACCOUNT_LINK_REQUIRED",
+								message: ACCOUNT_LINK_REQUIRED_DESCRIPTION,
 							});
-						} catch {
-							await db.delete(usersTable).where(eq(usersTable.id, user.id));
-
-							throw new Error(`Failed to create organization for user ${user.id}`);
 						}
-					},
+					}
 				},
 			},
-			session: {
-				create: {
-					before: async (session) => {
-						const orgMembership = await db.query.member.findFirst({
-							where: { userId: session.userId },
-						});
-
-						if (!orgMembership) {
-							throw new UnauthorizedError("User does not belong to any organization");
-						}
-
-						return {
-							data: {
-								...session,
-								activeOrganizationId: orgMembership?.organizationId,
-							},
-						};
-					},
-				},
-			},
-		},
-		emailAndPassword: {
-			enabled: true,
 		},
 		user: {
-			modelName: "usersTable",
-			additionalFields: {
-				username: {
-					type: "string",
-					returned: true,
-					required: true,
+			delete: {
+				before: async (user) => {
+					await authService.cleanupUserOrganizations(user.id);
 				},
-				hasDownloadedResticPassword: {
-					type: "boolean",
-					returned: true,
+			},
+			create: {
+				before: async (user, ctx) => {
+					if (ssoIntegration.isSsoCallback(ctx)) {
+						await ssoIntegration.onUserCreate(user, ctx);
+					}
+
+					const anyUser = await db.query.usersTable.findFirst();
+					const isFirstUser = !anyUser;
+
+					if (isFirstUser) {
+						user.role = "admin";
+					}
+
+					if (!user.username) {
+						user.username = Bun.randomUUIDv7();
+					}
+
+					return { data: user };
+				},
+				after: async (user, ctx) => {
+					if (ssoIntegration.isSsoCallback(ctx)) {
+						await ssoIntegration.onUserCreated(user, ctx);
+					}
 				},
 			},
 		},
 		session: {
-			modelName: "sessionsTable",
-		},
-		plugins: [
-			username(),
-			admin({
-				defaultRole: "user",
-			}),
-			organization({
-				allowUserToCreateOrganization: false,
-			}),
-			twoFactor({
-				backupCodeOptions: {
-					storeBackupCodes: "encrypted",
-					amount: 5,
+			create: {
+				before: async (session, ctx) => {
+					if (ssoIntegration.isSsoCallback(ctx)) {
+						const membership = await ssoIntegration.resolveOrgMembershipOrThrow(session.userId, ctx);
+						return { data: { ...session, activeOrganizationId: membership.organizationId } };
+					}
+
+					const membership = await ensureDefaultOrg(session.userId);
+
+					return { data: { ...session, activeOrganizationId: membership.organizationId } };
 				},
-			}),
-		],
-	});
-};
-
-type Auth = ReturnType<typeof createBetterAuth>;
-
-let _auth: Auth | null = null;
-
-const createAuth = async (): Promise<Auth> => {
-	if (_auth) return _auth;
-
-	_auth = createBetterAuth(await cryptoUtils.deriveSecret("better-auth"));
-
-	return _auth;
-};
-
-export const auth = new Proxy(
-	{},
-	{
-		get(_, prop, receiver) {
-			if (!_auth) {
-				throw new Error("Auth not initialized. Call initAuth() first.");
-			}
-			return Reflect.get(_auth, prop, receiver);
+			},
 		},
 	},
-) as Auth;
+	emailAndPassword: {
+		enabled: true,
+	},
+	account: {
+		accountLinking: {
+			enabled: true,
+			requireLocalEmailVerified: false,
+			trustedProviders: ssoIntegration.resolveTrustedProviders,
+		},
+	},
+	user: {
+		modelName: "usersTable",
+		additionalFields: {
+			username: {
+				type: "string",
+				returned: true,
+				required: true,
+			},
+			hasDownloadedResticPassword: {
+				type: "boolean",
+				returned: true,
+			},
+			dateFormat: {
+				type: "string",
+				returned: true,
+			},
+			timeFormat: {
+				type: "string",
+				returned: true,
+			},
+		},
+	},
+	session: {
+		modelName: "sessionsTable",
+		additionalFields: {
+			authSource: {
+				type: "string",
+				returned: true,
+				input: false,
+				defaultValue: "browser-session",
+			},
+		},
+	},
+	plugins: [
+		username({
+			usernameValidator: isValidUsername,
+			usernameNormalization: normalizeUsername,
+		}),
+		admin({
+			defaultRole: "user",
+		}),
+		organization({
+			allowUserToCreateOrganization: false,
+			organizationHooks: {
+				beforeAcceptInvitation: ssoIntegration.beforeAcceptInvitation,
+			},
+		}),
+		ssoIntegration.plugin,
+		twoFactor({
+			backupCodeOptions: {
+				storeBackupCodes: "encrypted",
+				amount: 5,
+			},
+		}),
+		passkey({
+			rpID: new URL(config.baseUrl).hostname,
+			rpName: "Zerobyte",
+			authenticatorSelection: {
+				userVerification: "required",
+				residentKey: "required",
+			},
+			authentication: {
+				afterVerification: async ({ verification }) => {
+					if (verification.authenticationInfo.userVerified) {
+						return;
+					}
 
-export const initAuth = createAuth;
+					throw new APIError("UNAUTHORIZED", {
+						message:
+							"Your passkey was accepted, but it did not confirm your identity with a PIN, biometrics, or screen lock. Please use a verified passkey or sign in with your password.",
+					});
+				},
+			},
+		}),
+		apiKey({
+			defaultPrefix: "zb_",
+			enableMetadata: true,
+		}),
+		tanstackStartCookies(),
+		...(process.env.NODE_ENV === "test" ? [testUtils()] : []),
+	],
+});

@@ -9,7 +9,7 @@ const listUsers = () => {
 	return db.select({ id: usersTable.id, username: usersTable.username }).from(usersTable);
 };
 
-const changeUsername = async (oldUsername: string, newUsername: string) => {
+export const changeUsername = async (oldUsername: string, newUsername: string) => {
 	const [user] = await db.select().from(usersTable).where(eq(usersTable.username, oldUsername));
 
 	if (!user) {
@@ -30,9 +30,15 @@ const changeUsername = async (oldUsername: string, newUsername: string) => {
 		);
 	}
 
-	await db.transaction(async (tx) => {
-		await tx.update(usersTable).set({ username: normalizedUsername }).where(eq(usersTable.id, user.id));
-		await tx.delete(sessionsTable).where(eq(sessionsTable.userId, user.id));
+	db.transaction((tx) => {
+		const updatedIdentity = {
+			username: normalizedUsername,
+			name: normalizedUsername,
+			displayUsername: normalizedUsername,
+		};
+
+		tx.update(usersTable).set(updatedIdentity).where(eq(usersTable.id, user.id)).run();
+		tx.delete(sessionsTable).where(eq(sessionsTable.userId, user.id)).run();
 	});
 };
 

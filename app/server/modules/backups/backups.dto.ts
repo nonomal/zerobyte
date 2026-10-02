@@ -1,65 +1,61 @@
-import { type } from "arktype";
+import { z } from "zod";
 import { describeRoute, resolver } from "hono-openapi";
-import { volumeSchema } from "../volumes/volume.dto";
+import { backupWebhooksSchema } from "@zerobyte/core/backup-hooks";
+import { COMPRESSION_MODES } from "@zerobyte/core/restic";
+import { publicVolumeSchema } from "@zerobyte/contracts/volumes";
+import { finishedTaskStatusSchema } from "~/schemas/tasks";
+import { retentionPolicySchema } from "~/schemas/retention";
 import { repositorySchema } from "../repositories/repositories.dto";
+import { BACKUP_SCHEDULE_NAME_MAX_LENGTH } from "./backup-schedule-name";
 
-const retentionPolicySchema = type({
-	keepLast: "number?",
-	keepHourly: "number?",
-	keepDaily: "number?",
-	keepWeekly: "number?",
-	keepMonthly: "number?",
-	keepYearly: "number?",
-	keepWithinDuration: "string?",
-});
-
-export type RetentionPolicy = typeof retentionPolicySchema.infer;
-
-const backupScheduleSchema = type({
-	id: "number",
-	shortId: "string",
-	name: "string",
-	volumeId: "number",
-	repositoryId: "string",
-	enabled: "boolean",
-	cronExpression: "string",
-	retentionPolicy: retentionPolicySchema.or("null"),
-	excludePatterns: "string[] | null",
-	excludeIfPresent: "string[] | null",
-	includePatterns: "string[] | null",
-	oneFileSystem: "boolean",
-	lastBackupAt: "number | null",
-	lastBackupStatus: "'success' | 'error' | 'in_progress' | 'warning' | null",
-	lastBackupError: "string | null",
-	nextBackupAt: "number | null",
-	createdAt: "number",
-	updatedAt: "number",
-}).and(
-	type({
-		volume: volumeSchema,
-		repository: repositorySchema,
-	}),
-);
-
-const scheduleMirrorSchema = type({
-	scheduleId: "number",
-	repositoryId: "string",
-	enabled: "boolean",
-	lastCopyAt: "number | null",
-	lastCopyStatus: "'success' | 'error' | null",
-	lastCopyError: "string | null",
-	createdAt: "number",
+const backupScheduleSchema = z.object({
+	id: z.number(),
+	shortId: z.string(),
+	name: z.string(),
+	volumeId: z.number(),
+	repositoryId: z.string(),
+	enabled: z.boolean(),
+	cronExpression: z.string(),
+	retentionPolicy: retentionPolicySchema.nullable(),
+	excludePatterns: z.array(z.string()).nullable(),
+	excludeIfPresent: z.array(z.string()).nullable(),
+	includePaths: z.array(z.string()).nullable(),
+	includePatterns: z.array(z.string()).nullable(),
+	oneFileSystem: z.boolean(),
+	customResticParams: z.array(z.string()).nullable(),
+	compressionMode: z.enum(COMPRESSION_MODES).nullable(),
+	backupWebhooks: backupWebhooksSchema.nullable(),
+	maxRetries: z.number(),
+	retryDelay: z.number().transform((ms) => Math.round(ms / 60000)),
+	lastBackupAt: z.number().nullable(),
+	lastBackupStatus: z.enum(["success", "error", "in_progress", "warning"]).nullable(),
+	lastBackupError: z.string().nullable(),
+	nextBackupAt: z.number().nullable(),
+	createdAt: z.number(),
+	updatedAt: z.number(),
+	volume: publicVolumeSchema,
 	repository: repositorySchema,
 });
 
-export type ScheduleMirrorDto = typeof scheduleMirrorSchema.infer;
+const mirrorSyncTaskSummarySchema = z.object({
+	id: z.string(),
+	status: finishedTaskStatusSchema,
+	error: z.string().nullable(),
+	finishedAt: z.number(),
+});
 
-/**
- * List all backup schedules
- */
+const scheduleMirrorSchema = z.object({
+	scheduleId: z.string(),
+	repositoryId: z.string(),
+	enabled: z.boolean(),
+	lastSyncTask: mirrorSyncTaskSummarySchema.nullable(),
+	createdAt: z.number(),
+	repository: repositorySchema,
+});
+
 export const listBackupSchedulesResponse = backupScheduleSchema.array();
 
-export type ListBackupSchedulesResponseDto = typeof listBackupSchedulesResponse.infer;
+export type ListBackupSchedulesResponseDto = z.infer<typeof listBackupSchedulesResponse>;
 
 export const listBackupSchedulesDto = describeRoute({
 	description: "List all backup schedules",
@@ -77,12 +73,9 @@ export const listBackupSchedulesDto = describeRoute({
 	},
 });
 
-/**
- * Get a single backup schedule
- */
 export const getBackupScheduleResponse = backupScheduleSchema;
 
-export type GetBackupScheduleDto = typeof getBackupScheduleResponse.infer;
+export type GetBackupScheduleDto = z.infer<typeof getBackupScheduleResponse>;
 
 export const getBackupScheduleDto = describeRoute({
 	description: "Get a backup schedule by ID",
@@ -100,9 +93,9 @@ export const getBackupScheduleDto = describeRoute({
 	},
 });
 
-export const getBackupScheduleForVolumeResponse = backupScheduleSchema.or("null");
+export const getBackupScheduleForVolumeResponse = backupScheduleSchema.nullable();
 
-export type GetBackupScheduleForVolumeResponseDto = typeof getBackupScheduleForVolumeResponse.infer;
+export type GetBackupScheduleForVolumeResponseDto = z.infer<typeof getBackupScheduleForVolumeResponse>;
 
 export const getBackupScheduleForVolumeDto = describeRoute({
 	description: "Get a backup schedule for a specific volume",
@@ -120,28 +113,37 @@ export const getBackupScheduleForVolumeDto = describeRoute({
 	},
 });
 
-/**
- * Create a new backup schedule
- */
-export const createBackupScheduleBody = type({
-	name: "1 <= string <= 128",
-	volumeId: "number",
-	repositoryId: "string",
-	enabled: "boolean",
-	cronExpression: "string",
+export const createBackupScheduleBody = z.object({
+	name: z.string().min(1).max(BACKUP_SCHEDULE_NAME_MAX_LENGTH),
+	volumeId: z.union([z.string(), z.number()]),
+	repositoryId: z.string(),
+	enabled: z.boolean(),
+	cronExpression: z.string(),
 	retentionPolicy: retentionPolicySchema.optional(),
-	excludePatterns: "string[]?",
-	excludeIfPresent: "string[]?",
-	includePatterns: "string[]?",
-	oneFileSystem: "boolean?",
-	tags: "string[]?",
+	excludePatterns: z.array(z.string()).optional(),
+	excludeIfPresent: z.array(z.string()).optional(),
+	includePaths: z.array(z.string()).optional(),
+	includePatterns: z.array(z.string()).optional(),
+	oneFileSystem: z.boolean().optional(),
+	tags: z.array(z.string()).optional(),
+	customResticParams: z.array(z.string()).optional(),
+	compressionMode: z.enum(COMPRESSION_MODES).nullable().optional(),
+	backupWebhooks: backupWebhooksSchema.nullable().optional(),
+	maxRetries: z.number().min(0).max(32).optional().default(2),
+	retryDelay: z
+		.number()
+		.min(1)
+		.max(1440)
+		.optional()
+		.default(15)
+		.transform((minutes) => minutes * 60000),
 });
 
-export type CreateBackupScheduleBody = typeof createBackupScheduleBody.infer;
+export type CreateBackupScheduleBody = z.infer<typeof createBackupScheduleBody>;
 
-export const createBackupScheduleResponse = backupScheduleSchema.omit("volume", "repository");
+export const createBackupScheduleResponse = backupScheduleSchema.omit({ volume: true, repository: true });
 
-export type CreateBackupScheduleDto = typeof createBackupScheduleResponse.infer;
+export type CreateBackupScheduleDto = z.infer<typeof createBackupScheduleResponse>;
 
 export const createBackupScheduleDto = describeRoute({
 	description: "Create a new backup schedule for a volume",
@@ -159,27 +161,36 @@ export const createBackupScheduleDto = describeRoute({
 	},
 });
 
-/**
- * Update a backup schedule
- */
-export const updateBackupScheduleBody = type({
-	name: "(1 <= string <= 128)?",
-	repositoryId: "string",
-	enabled: "boolean?",
-	cronExpression: "string",
+export const updateBackupScheduleBody = z.object({
+	name: z.string().min(1).max(BACKUP_SCHEDULE_NAME_MAX_LENGTH).optional(),
+	repositoryId: z.string(),
+	enabled: z.boolean().optional(),
+	cronExpression: z.string(),
 	retentionPolicy: retentionPolicySchema.optional(),
-	excludePatterns: "string[]?",
-	excludeIfPresent: "string[]?",
-	includePatterns: "string[]?",
-	oneFileSystem: "boolean?",
-	tags: "string[]?",
+	excludePatterns: z.array(z.string()).optional(),
+	excludeIfPresent: z.array(z.string()).optional(),
+	includePaths: z.array(z.string()).optional(),
+	includePatterns: z.array(z.string()).optional(),
+	oneFileSystem: z.boolean().optional(),
+	tags: z.array(z.string()).optional(),
+	customResticParams: z.array(z.string()).optional(),
+	compressionMode: z.enum(COMPRESSION_MODES).nullable().optional(),
+	backupWebhooks: backupWebhooksSchema.nullable().optional(),
+	maxRetries: z.number().min(0).max(32).optional().default(2),
+	retryDelay: z
+		.number()
+		.min(1)
+		.max(1440)
+		.optional()
+		.default(15)
+		.transform((minutes) => minutes * 60000),
 });
 
-export type UpdateBackupScheduleBody = typeof updateBackupScheduleBody.infer;
+export type UpdateBackupScheduleBody = z.infer<typeof updateBackupScheduleBody>;
 
-export const updateBackupScheduleResponse = backupScheduleSchema.omit("volume", "repository");
+export const updateBackupScheduleResponse = backupScheduleSchema.omit({ volume: true, repository: true });
 
-export type UpdateBackupScheduleDto = typeof updateBackupScheduleResponse.infer;
+export type UpdateBackupScheduleDto = z.infer<typeof updateBackupScheduleResponse>;
 
 export const updateBackupScheduleDto = describeRoute({
 	description: "Update a backup schedule",
@@ -197,14 +208,11 @@ export const updateBackupScheduleDto = describeRoute({
 	},
 });
 
-/**
- * Delete a backup schedule
- */
-export const deleteBackupScheduleResponse = type({
-	success: "boolean",
+const deleteBackupScheduleResponse = z.object({
+	success: z.boolean(),
 });
 
-export type DeleteBackupScheduleDto = typeof deleteBackupScheduleResponse.infer;
+export type DeleteBackupScheduleDto = z.infer<typeof deleteBackupScheduleResponse>;
 
 export const deleteBackupScheduleDto = describeRoute({
 	description: "Delete a backup schedule",
@@ -222,21 +230,19 @@ export const deleteBackupScheduleDto = describeRoute({
 	},
 });
 
-/**
- * Run a backup immediately
- */
-export const runBackupNowResponse = type({
-	success: "boolean",
+const runBackupNowResponse = z.object({
+	taskId: z.string(),
+	status: z.literal("started"),
 });
 
-export type RunBackupNowDto = typeof runBackupNowResponse.infer;
+export type RunBackupNowDto = z.infer<typeof runBackupNowResponse>;
 
 export const runBackupNowDto = describeRoute({
 	description: "Trigger a backup immediately for a schedule",
 	operationId: "runBackupNow",
 	tags: ["Backups"],
 	responses: {
-		200: {
+		202: {
 			description: "Backup started successfully",
 			content: {
 				"application/json": {
@@ -244,64 +250,40 @@ export const runBackupNowDto = describeRoute({
 				},
 			},
 		},
-	},
-});
-
-/**
- * Stop a running backup
- */
-export const stopBackupResponse = type({
-	success: "boolean",
-});
-
-export type StopBackupDto = typeof stopBackupResponse.infer;
-
-export const stopBackupDto = describeRoute({
-	description: "Stop a backup that is currently in progress",
-	operationId: "stopBackup",
-	tags: ["Backups"],
-	responses: {
-		200: {
-			description: "Backup stopped successfully",
-			content: {
-				"application/json": {
-					schema: resolver(stopBackupResponse),
-				},
-			},
-		},
 		409: {
-			description: "No backup is currently running for this schedule",
+			description: "Backup is already running for this schedule",
 		},
 	},
 });
 
-/**
- * Run retention policy (forget) manually
- */
-export const runForgetResponse = type({
-	success: "boolean",
+const runForgetResponse = z.object({
+	taskId: z.string(),
+	status: z.literal("started"),
 });
 
-export type RunForgetDto = typeof runForgetResponse.infer;
+export type RunForgetDto = z.infer<typeof runForgetResponse>;
 
 export const runForgetDto = describeRoute({
 	description: "Manually apply retention policy to clean up old snapshots",
 	operationId: "runForget",
 	tags: ["Backups"],
 	responses: {
-		200: {
-			description: "Retention policy applied successfully",
+		202: {
+			description: "Retention task started successfully",
 			content: {
 				"application/json": {
 					schema: resolver(runForgetResponse),
 				},
 			},
 		},
+		409: {
+			description: "Retention policy is already being applied",
+		},
 	},
 });
 
-export const getScheduleMirrorsResponse = scheduleMirrorSchema.array();
-export type GetScheduleMirrorsDto = typeof getScheduleMirrorsResponse.infer;
+const getScheduleMirrorsResponse = scheduleMirrorSchema.array();
+export type GetScheduleMirrorsDto = z.infer<typeof getScheduleMirrorsResponse>;
 
 export const getScheduleMirrorsDto = describeRoute({
 	description: "Get mirror repository assignments for a backup schedule",
@@ -319,17 +301,19 @@ export const getScheduleMirrorsDto = describeRoute({
 	},
 });
 
-export const updateScheduleMirrorsBody = type({
-	mirrors: type({
-		repositoryId: "string",
-		enabled: "boolean",
-	}).array(),
+export const updateScheduleMirrorsBody = z.object({
+	mirrors: z
+		.object({
+			repositoryId: z.string(),
+			enabled: z.boolean(),
+		})
+		.array(),
 });
 
-export type UpdateScheduleMirrorsBody = typeof updateScheduleMirrorsBody.infer;
+export type UpdateScheduleMirrorsBody = z.infer<typeof updateScheduleMirrorsBody>;
 
-export const updateScheduleMirrorsResponse = scheduleMirrorSchema.array();
-export type UpdateScheduleMirrorsDto = typeof updateScheduleMirrorsResponse.infer;
+const updateScheduleMirrorsResponse = scheduleMirrorSchema.array();
+export type UpdateScheduleMirrorsDto = z.infer<typeof updateScheduleMirrorsResponse>;
 
 export const updateScheduleMirrorsDto = describeRoute({
 	description: "Update mirror repository assignments for a backup schedule",
@@ -347,17 +331,18 @@ export const updateScheduleMirrorsDto = describeRoute({
 	},
 });
 
-const mirrorCompatibilitySchema = type({
-	repositoryId: "string",
-	compatible: "boolean",
-	reason: "string | null",
+const mirrorCompatibilitySchema = z.object({
+	repositoryId: z.string(),
+	compatible: z.boolean(),
+	reason: z.string().nullable(),
 });
 
-export const getMirrorCompatibilityResponse = mirrorCompatibilitySchema.array();
-export type GetMirrorCompatibilityDto = typeof getMirrorCompatibilityResponse.infer;
+const getMirrorCompatibilityResponse = mirrorCompatibilitySchema.array();
+export type GetMirrorCompatibilityDto = z.infer<typeof getMirrorCompatibilityResponse>;
 
 export const getMirrorCompatibilityDto = describeRoute({
-	description: "Get mirror compatibility info for all repositories relative to a backup schedule's primary repository",
+	description:
+		"Get mirror compatibility info for all repositories relative to a backup schedule's primary repository",
 	operationId: "getMirrorCompatibility",
 	tags: ["Backups"],
 	responses: {
@@ -372,23 +357,18 @@ export const getMirrorCompatibilityDto = describeRoute({
 	},
 });
 
-/**
- * Reorder backup schedules
- */
-export const reorderBackupSchedulesBody = type({
-	scheduleIds: "number[]",
+export const reorderBackupSchedulesBody = z.object({
+	scheduleShortIds: z.array(z.string()),
 });
 
-export type ReorderBackupSchedulesBody = typeof reorderBackupSchedulesBody.infer;
-
-export const reorderBackupSchedulesResponse = type({
-	success: "boolean",
+const reorderBackupSchedulesResponse = z.object({
+	success: z.boolean(),
 });
 
-export type ReorderBackupSchedulesDto = typeof reorderBackupSchedulesResponse.infer;
+export type ReorderBackupSchedulesDto = z.infer<typeof reorderBackupSchedulesResponse>;
 
 export const reorderBackupSchedulesDto = describeRoute({
-	description: "Reorder backup schedules by providing an array of schedule IDs in the desired order",
+	description: "Reorder backup schedules by providing an array of schedule short IDs in the desired order",
 	operationId: "reorderBackupSchedules",
 	tags: ["Backups"],
 	responses: {
@@ -397,6 +377,52 @@ export const reorderBackupSchedulesDto = describeRoute({
 			content: {
 				"application/json": {
 					schema: resolver(reorderBackupSchedulesResponse),
+				},
+			},
+		},
+	},
+});
+
+export const syncMirrorBody = z.object({
+	snapshotIds: z.array(z.string()).optional(),
+});
+
+const startedTaskResponse = z.object({
+	taskId: z.string(),
+	status: z.literal("started"),
+});
+export type SyncMirrorDto = z.infer<typeof startedTaskResponse>;
+export type StartMirrorStatusDto = z.infer<typeof startedTaskResponse>;
+
+export const syncMirrorDto = describeRoute({
+	description: "Sync selected snapshots to a specific mirror repository",
+	operationId: "syncMirror",
+	tags: ["Backups"],
+	responses: {
+		202: {
+			description: "Mirror sync started successfully",
+			content: {
+				"application/json": {
+					schema: resolver(startedTaskResponse),
+				},
+			},
+		},
+		409: {
+			description: "Mirror is already syncing",
+		},
+	},
+});
+
+export const startMirrorStatusDto = describeRoute({
+	description: "Start a background lookup of snapshots missing from a mirror repository",
+	operationId: "startMirrorStatus",
+	tags: ["Backups"],
+	responses: {
+		202: {
+			description: "Mirror snapshot lookup started successfully",
+			content: {
+				"application/json": {
+					schema: resolver(startedTaskResponse),
 				},
 			},
 		},

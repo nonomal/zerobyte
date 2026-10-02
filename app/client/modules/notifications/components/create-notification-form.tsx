@@ -1,9 +1,7 @@
-import { arktypeResolver } from "@hookform/resolvers/arktype";
-import { type } from "arktype";
-import { useEffect } from "react";
-import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useForm, useWatch } from "react-hook-form";
+import { z } from "zod";
 import { cn } from "~/client/lib/utils";
-import { deepClean } from "~/utils/object";
 import {
 	Form,
 	FormControl,
@@ -15,7 +13,18 @@ import {
 } from "~/client/components/ui/form";
 import { Input } from "~/client/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
-import { notificationConfigSchemaBase } from "~/schemas/notifications";
+import {
+	customNotificationConfigSchema,
+	discordNotificationConfigSchema,
+	emailNotificationConfigSchema,
+	genericNotificationConfigSchema,
+	gotifyNotificationConfigSchema,
+	ntfyNotificationConfigSchema,
+	pushoverNotificationConfigSchema,
+	slackNotificationConfigSchema,
+	telegramNotificationConfigSchema,
+} from "~/schemas/notifications";
+import { useScrollToFormError } from "~/client/hooks/use-scroll-to-form-error";
 import {
 	CustomForm,
 	DiscordForm,
@@ -28,12 +37,21 @@ import {
 	TelegramForm,
 } from "./notification-forms";
 
-export const formSchema = type({
-	name: "2<=string<=32",
-}).and(notificationConfigSchemaBase);
-const cleanSchema = type.pipe((d) => formSchema(deepClean(d)));
+const baseFields = { name: z.string().min(2).max(32) };
 
-export type NotificationFormValues = typeof formSchema.inferIn;
+const formSchema = z.discriminatedUnion("type", [
+	emailNotificationConfigSchema.extend(baseFields),
+	slackNotificationConfigSchema.extend(baseFields),
+	discordNotificationConfigSchema.extend(baseFields),
+	gotifyNotificationConfigSchema.extend(baseFields),
+	ntfyNotificationConfigSchema.extend(baseFields),
+	pushoverNotificationConfigSchema.extend(baseFields),
+	telegramNotificationConfigSchema.extend(baseFields),
+	genericNotificationConfigSchema.extend(baseFields),
+	customNotificationConfigSchema.extend(baseFields),
+]);
+
+export type NotificationFormValues = z.input<typeof formSchema>;
 
 type Props = {
 	onSubmit: (values: NotificationFormValues) => void;
@@ -57,7 +75,6 @@ const defaultValuesForType = {
 	slack: {
 		type: "slack" as const,
 		webhookUrl: "",
-		channel: "",
 		username: "",
 		iconEmoji: "",
 	},
@@ -106,94 +123,94 @@ const defaultValuesForType = {
 
 export const CreateNotificationForm = ({ onSubmit, mode = "create", initialValues, formId, className }: Props) => {
 	const form = useForm<NotificationFormValues>({
-		resolver: arktypeResolver(cleanSchema as unknown as typeof formSchema),
+		resolver: zodResolver(formSchema, undefined, { raw: true }),
 		defaultValues: initialValues || {
 			name: "",
 		},
 		resetOptions: {
-			keepDefaultValues: true,
+			keepDefaultValues: false,
 			keepDirtyValues: false,
 		},
 	});
 
-	const { watch } = form;
-	const watchedType = watch("type");
-
-	useEffect(() => {
-		if (!initialValues) {
-			form.reset({
-				name: form.getValues().name || "",
-				...defaultValuesForType[watchedType as keyof typeof defaultValuesForType],
-			});
-		}
-	}, [watchedType, form, initialValues]);
+	const scrollToFirstError = useScrollToFormError();
+	const watchedType = useWatch({ control: form.control, name: "type" });
 
 	return (
 		<Form {...form}>
-			<form id={formId} onSubmit={form.handleSubmit(onSubmit)} className={cn("space-y-4", className)}>
-				<FormField
-					control={form.control}
-					name="name"
-					render={({ field }) => (
-						<FormItem>
-							<FormLabel>Name</FormLabel>
-							<FormControl>
-								<Input
-									{...field}
-									placeholder="My notification"
-									max={32}
-									min={2}
-								/>
-							</FormControl>
-							<FormDescription>Unique identifier for this notification destination.</FormDescription>
-							<FormMessage />
-						</FormItem>
-					)}
-				/>
-
-				<FormField
-					control={form.control}
-					name="type"
-					render={({ field }) => (
-						<FormItem>
-							<FormLabel>Type</FormLabel>
-							<Select
-								onValueChange={field.onChange}
-								value={field.value}
-								disabled={mode === "update"}
-							>
+			<form
+				id={formId}
+				onSubmit={form.handleSubmit(onSubmit, scrollToFirstError)}
+				className={cn("space-y-4", className)}
+			>
+				<fieldset className="space-y-4">
+					<FormField
+						control={form.control}
+						name="name"
+						render={({ field }) => (
+							<FormItem>
+								<FormLabel>Name</FormLabel>
 								<FormControl>
-									<SelectTrigger className={mode === "update" ? "bg-gray-50" : ""}>
-										<SelectValue placeholder="Select notification type" />
-									</SelectTrigger>
+									<Input {...field} placeholder="My notification" max={32} min={2} />
 								</FormControl>
-								<SelectContent>
-									<SelectItem value="email">Email (SMTP)</SelectItem>
-									<SelectItem value="slack">Slack</SelectItem>
-									<SelectItem value="discord">Discord</SelectItem>
-									<SelectItem value="gotify">Gotify</SelectItem>
-									<SelectItem value="ntfy">Ntfy</SelectItem>
-									<SelectItem value="pushover">Pushover</SelectItem>
-									<SelectItem value="telegram">Telegram</SelectItem>
-									<SelectItem value="generic">Generic Webhook</SelectItem>
-									<SelectItem value="custom">Custom (Shoutrrr URL)</SelectItem>
-								</SelectContent>
-							</Select>
-							<FormDescription>Choose the notification delivery method.</FormDescription>
-							<FormMessage />
-						</FormItem>
-					)}
-				/>
+								<FormDescription>Unique identifier for this notification destination.</FormDescription>
+								<FormMessage />
+							</FormItem>
+						)}
+					/>
 
-				{watchedType === "email" && <EmailForm form={form} />}
-				{watchedType === "slack" && <SlackForm form={form} />}
-				{watchedType === "discord" && <DiscordForm form={form} />}
-				{watchedType === "gotify" && <GotifyForm form={form} />}
-				{watchedType === "ntfy" && <NtfyForm form={form} />}
-				{watchedType === "pushover" && <PushoverForm form={form} />}
-				{watchedType === "telegram" && <TelegramForm form={form} />}
-				{watchedType === "generic" && <GenericForm form={form} />}
-				{watchedType === "custom" && <CustomForm form={form} />}
+					<FormField
+						control={form.control}
+						name="type"
+						render={({ field }) => (
+							<FormItem>
+								<FormLabel>Type</FormLabel>
+								<Select
+									onValueChange={(value) => {
+										field.onChange(value);
+										if (!initialValues) {
+											form.reset({
+												name: form.getValues().name || "",
+												...defaultValuesForType[value as keyof typeof defaultValuesForType],
+											});
+										}
+									}}
+									value={field.value ?? ""}
+									disabled={mode === "update"}
+								>
+									<FormControl>
+										<SelectTrigger className={mode === "update" ? "bg-gray-50" : ""}>
+											<SelectValue placeholder="Select notification type" />
+										</SelectTrigger>
+									</FormControl>
+									<SelectContent>
+										<SelectItem value="email">Email (SMTP)</SelectItem>
+										<SelectItem value="slack">Slack</SelectItem>
+										<SelectItem value="discord">Discord</SelectItem>
+										<SelectItem value="gotify">Gotify</SelectItem>
+										<SelectItem value="ntfy">Ntfy</SelectItem>
+										<SelectItem value="pushover">Pushover</SelectItem>
+										<SelectItem value="telegram">Telegram</SelectItem>
+										<SelectItem value="generic">Generic Webhook</SelectItem>
+										<SelectItem value="custom">Custom (Shoutrrr URL)</SelectItem>
+									</SelectContent>
+								</Select>
+								<FormDescription>Choose the notification delivery method.</FormDescription>
+								<FormMessage />
+							</FormItem>
+						)}
+					/>
+
+					{watchedType === "email" && <EmailForm form={form} />}
+					{watchedType === "slack" && <SlackForm form={form} />}
+					{watchedType === "discord" && <DiscordForm form={form} />}
+					{watchedType === "gotify" && <GotifyForm form={form} />}
+					{watchedType === "ntfy" && <NtfyForm form={form} />}
+					{watchedType === "pushover" && <PushoverForm form={form} />}
+					{watchedType === "telegram" && <TelegramForm form={form} />}
+					{watchedType === "generic" && <GenericForm form={form} />}
+					{watchedType === "custom" && <CustomForm form={form} />}
+				</fieldset>
 			</form>
 		</Form>
 	);

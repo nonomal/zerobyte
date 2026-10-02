@@ -1,8 +1,14 @@
-import { test, describe, expect } from "bun:test";
+import { beforeAll, describe, expect, test } from "vitest";
 import { createApp } from "~/server/app";
 import { createTestSession, getAuthHeaders } from "~/test/helpers/auth";
 
 const app = createApp();
+
+let session: Awaited<ReturnType<typeof createTestSession>>;
+
+beforeAll(async () => {
+	session = await createTestSession();
+});
 
 describe("notifications security", () => {
 	test("should return 401 if no session cookie is provided", async () => {
@@ -22,10 +28,8 @@ describe("notifications security", () => {
 	});
 
 	test("should return 200 if session is valid", async () => {
-		const { token } = await createTestSession();
-
 		const res = await app.request("/api/v1/notifications/destinations", {
-			headers: getAuthHeaders(token),
+			headers: session.headers,
 		});
 
 		expect(res.status).toBe(200);
@@ -62,18 +66,16 @@ describe("notifications security", () => {
 
 	describe("input validation", () => {
 		test("should return 404 for malformed destination ID", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/notifications/destinations/not-a-number", {
-				headers: getAuthHeaders(token),
+				headers: session.headers,
 			});
 
 			expect(res.status).toBe(404);
 		});
 
 		test("should return 404 for non-existent destination ID", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/notifications/destinations/999999", {
-				headers: getAuthHeaders(token),
+				headers: session.headers,
 			});
 
 			expect(res.status).toBe(404);
@@ -82,12 +84,10 @@ describe("notifications security", () => {
 		});
 
 		test("should return 400 for invalid payload on create", async () => {
-			const { token } = await createTestSession();
-
 			const res = await app.request("/api/v1/notifications/destinations", {
 				method: "POST",
 				headers: {
-					...getAuthHeaders(token),
+					...session.headers,
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({
@@ -96,6 +96,53 @@ describe("notifications security", () => {
 			});
 
 			expect(res.status).toBe(400);
+		});
+
+		test("should return 400 for notification webhook origins outside the allowlist", async () => {
+			const res = await app.request("/api/v1/notifications/destinations", {
+				method: "POST",
+				headers: {
+					...session.headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					name: "Blocked webhook",
+					config: {
+						type: "generic",
+						url: "https://hooks.example.com/backup",
+						method: "POST",
+					},
+				}),
+			});
+
+			expect(res.status).toBe(400);
+			const body = await res.json();
+			expect(body.message).toBe(
+				"Notification webhook URL origin is not allowed. Add https://hooks.example.com to WEBHOOK_ALLOWED_ORIGINS.",
+			);
+		});
+
+		test("should return 400 for custom shoutrrr network targets outside the allowlist", async () => {
+			const res = await app.request("/api/v1/notifications/destinations", {
+				method: "POST",
+				headers: {
+					...session.headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					name: "Blocked custom SMTP",
+					config: {
+						type: "custom",
+						shoutrrrUrl: "smtp://127.0.0.1:2525/?from=test@example.com&to=admin@example.com",
+					},
+				}),
+			});
+
+			expect(res.status).toBe(400);
+			const body = await res.json();
+			expect(body.message).toBe(
+				"Notification webhook URL origin is not allowed. Add smtp://127.0.0.1:2525 to WEBHOOK_ALLOWED_ORIGINS.",
+			);
 		});
 	});
 });

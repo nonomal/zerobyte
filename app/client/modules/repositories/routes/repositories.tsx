@@ -1,67 +1,123 @@
-import { useQuery } from "@tanstack/react-query";
+import { useSuspenseQuery } from "@tanstack/react-query";
+import {
+	createColumnHelper,
+	flexRender,
+	type ColumnFiltersState,
+	type SortingState,
+	useTable,
+} from "@tanstack/react-table";
 import { Database, Plus, RotateCcw } from "lucide-react";
 import { useState } from "react";
-import { useNavigate } from "react-router";
-import { listRepositories } from "~/client/api-client/sdk.gen";
 import { listRepositoriesOptions } from "~/client/api-client/@tanstack/react-query.gen";
+import { DataTableSortHeader } from "~/client/components/data-table-sort-header";
 import { RepositoryIcon } from "~/client/components/repository-icon";
 import { Button } from "~/client/components/ui/button";
 import { Card } from "~/client/components/ui/card";
 import { Input } from "~/client/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/client/components/ui/table";
-import type { Route } from "./+types/repositories";
 import { cn } from "~/client/lib/utils";
+import { StatusDot } from "~/client/components/status-dot";
 import { EmptyState } from "~/client/components/empty-state";
+import { useNavigate } from "@tanstack/react-router";
+import type { RepositoryBackend } from "@zerobyte/core/restic";
+import { useCookieState } from "~/client/hooks/use-cookie-state";
+import { dataTableFeatures } from "~/client/lib/data-table";
 
-export const handle = {
-	breadcrumb: () => [{ label: "Repositories" }],
+type RepositoryRow = {
+	id: string;
+	shortId: string;
+	name: string;
+	type: RepositoryBackend;
+	status: string | null;
+	compressionMode?: string | null;
 };
 
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Repositories" },
-		{
-			name: "description",
-			content: "Manage your backup repositories with encryption and compression.",
-		},
-	];
-}
+const repositoryColumnHelper = createColumnHelper<typeof dataTableFeatures, RepositoryRow>();
+const repositoryColumns = repositoryColumnHelper.columns([
+	repositoryColumnHelper.accessor("name", {
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Name" sortDirection={column.getIsSorted()} />
+		),
+		cell: ({ row }) => (
+			<div className="flex items-center gap-2">
+				<span>{row.original.name}</span>
+			</div>
+		),
+	}),
+	repositoryColumnHelper.accessor("type", {
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Backend" sortDirection={column.getIsSorted()} />
+		),
+		cell: ({ row }) => (
+			<span className="flex items-center gap-2 text-muted-foreground">
+				<RepositoryIcon backend={row.original.type} />
+				{row.original.type}
+			</span>
+		),
+		filterFn: (row, id, value) => row.getValue(id) === value,
+	}),
+	repositoryColumnHelper.accessor((row) => row.compressionMode || "off", {
+		id: "compressionMode",
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Compression" sortDirection={column.getIsSorted()} />
+		),
+		cell: ({ row }) => (
+			<span className="text-muted-foreground text-xs bg-primary/10 rounded-md px-2 py-1">
+				{row.original.compressionMode || "off"}
+			</span>
+		),
+		sortFn: "alphanumeric",
+	}),
+	repositoryColumnHelper.accessor((row) => row.status || "unknown", {
+		id: "status",
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Status" sortDirection={column.getIsSorted()} center />
+		),
+		cell: ({ row }) => (
+			<StatusDot
+				variant={
+					row.original.status === "healthy"
+						? "success"
+						: row.original.status === "error"
+							? "error"
+							: "warning"
+				}
+				label={row.original.status || "unknown"}
+			/>
+		),
+		sortFn: "alphanumeric",
+		filterFn: (row, id, value) => row.getValue(id) === value,
+	}),
+]);
 
-export const clientLoader = async () => {
-	const repositories = await listRepositories();
-	if (repositories.data) return repositories.data;
-	return [];
-};
+const defaultRepositorySorting: SortingState = [{ id: "name", desc: false }];
 
-export default function Repositories({ loaderData }: Route.ComponentProps) {
-	const [searchQuery, setSearchQuery] = useState("");
-	const [statusFilter, setStatusFilter] = useState("");
-	const [backendFilter, setBackendFilter] = useState("");
-
-	const clearFilters = () => {
-		setSearchQuery("");
-		setStatusFilter("");
-		setBackendFilter("");
-	};
+export function RepositoriesPage() {
+	const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
+	const [sorting, setSorting] = useCookieState("sorting_repositories", defaultRepositorySorting);
 
 	const navigate = useNavigate();
 
-	const { data } = useQuery({
+	const { data } = useSuspenseQuery({
 		...listRepositoriesOptions(),
-		initialData: loaderData,
 	});
 
-	const filteredRepositories =
-		data?.filter((repository) => {
-			const matchesSearch = repository.name.toLowerCase().includes(searchQuery.toLowerCase());
-			const matchesStatus = !statusFilter || repository.status === statusFilter;
-			const matchesBackend = !backendFilter || repository.type === backendFilter;
-			return matchesSearch && matchesStatus && matchesBackend;
-		}) || [];
+	const table = useTable({
+		features: dataTableFeatures,
+		data,
+		columns: repositoryColumns,
+		state: { columnFilters, sorting },
+		onColumnFiltersChange: setColumnFilters,
+		onSortingChange: setSorting,
+	});
+	const rows = table.getRowModel().rows;
+	const hasFilters = columnFilters.length > 0;
 
-	const hasNoRepositories = data?.length === 0;
-	const hasNoFilteredRepositories = filteredRepositories.length === 0 && !hasNoRepositories;
+	const clearFilters = () => table.resetColumnFilters();
+
+	const hasNoRepositories = data.length === 0;
+	const hasNoFilteredRepositories = rows.length === 0 && !hasNoRepositories;
 
 	if (hasNoRepositories) {
 		return (
@@ -70,7 +126,7 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 				title="No repository"
 				description="Repositories are remote storage locations where you can backup your volumes securely. Encrypted and optimized for storage efficiency."
 				button={
-					<Button onClick={() => navigate("/repositories/create")}>
+					<Button onClick={() => navigate({ to: "/repositories/create" })}>
 						<Plus size={16} className="mr-2" />
 						Create repository
 					</Button>
@@ -79,18 +135,22 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 		);
 	}
 
+	const search = (table.getColumn("name")?.getFilterValue() as string) ?? "";
+	const type = (table.getColumn("type")?.getFilterValue() as string) ?? "";
+	const status = (table.getColumn("status")?.getFilterValue() as string) ?? "";
+
 	return (
 		<Card className="p-0 gap-0">
 			<div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-2 md:justify-between p-4 bg-card-header py-4">
-				<span className="flex flex-col sm:flex-row items-stretch md:items-center gap-0 flex-wrap ">
+				<span className="flex flex-col sm:flex-row items-stretch md:items-center gap-2 flex-wrap">
 					<Input
-						className="w-full lg:w-[180px] min-w-[180px] -mr-px -mt-px"
-						placeholder="Search repositories…"
-						value={searchQuery}
-						onChange={(e) => setSearchQuery(e.target.value)}
+						className="w-full lg:w-45 min-w-45"
+						placeholder="Search…"
+						value={search}
+						onChange={(e) => table.getColumn("name")?.setFilterValue(e.target.value)}
 					/>
-					<Select value={statusFilter} onValueChange={setStatusFilter}>
-						<SelectTrigger className="w-full lg:w-[180px] min-w-[180px] -mr-px -mt-px">
+					<Select value={status} onValueChange={(value) => table.getColumn("status")?.setFilterValue(value)}>
+						<SelectTrigger className="w-full lg:w-45 min-w-45">
 							<SelectValue placeholder="All status" />
 						</SelectTrigger>
 						<SelectContent>
@@ -99,8 +159,8 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 							<SelectItem value="unknown">Unknown</SelectItem>
 						</SelectContent>
 					</Select>
-					<Select value={backendFilter} onValueChange={setBackendFilter}>
-						<SelectTrigger className="w-full lg:w-[180px] min-w-[180px] -mt-px">
+					<Select value={type} onValueChange={(value) => table.getColumn("type")?.setFilterValue(value)}>
+						<SelectTrigger className="w-full lg:w-45 min-w-45">
 							<SelectValue placeholder="All backends" />
 						</SelectTrigger>
 						<SelectContent>
@@ -110,14 +170,14 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 							<SelectItem value="gcs">Google Cloud Storage</SelectItem>
 						</SelectContent>
 					</Select>
-					{(searchQuery || statusFilter || backendFilter) && (
+					{hasFilters && (
 						<Button onClick={clearFilters} className="w-full lg:w-auto mt-2 lg:mt-0 lg:ml-2">
 							<RotateCcw className="h-4 w-4 mr-2" />
 							Clear filters
 						</Button>
 					)}
 				</span>
-				<Button onClick={() => navigate("/repositories/create")}>
+				<Button onClick={() => navigate({ to: "/repositories/create" })}>
 					<Plus size={16} className="mr-2" />
 					Create Repository
 				</Button>
@@ -125,61 +185,58 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 			<div className="overflow-x-auto">
 				<Table className="border-t">
 					<TableHeader className="bg-card-header">
-						<TableRow>
-							<TableHead className="w-[100px] uppercase">Name</TableHead>
-							<TableHead className="uppercase text-left">Backend</TableHead>
-							<TableHead className="uppercase hidden sm:table-cell">Compression</TableHead>
-							<TableHead className="uppercase text-center">Status</TableHead>
-						</TableRow>
+						{table.getHeaderGroups().map((headerGroup) => (
+							<TableRow key={headerGroup.id}>
+								{headerGroup.headers.map((header) => (
+									<TableHead
+										key={header.id}
+										className={cn("uppercase", {
+											"w-25": header.column.id === "name",
+											"text-left": header.column.id === "type",
+											"hidden sm:table-cell": header.column.id === "compressionMode",
+											"text-center": header.column.id === "status",
+										})}
+									>
+										{header.isPlaceholder
+											? null
+											: flexRender(header.column.columnDef.header, header.getContext())}
+									</TableHead>
+								))}
+							</TableRow>
+						))}
 					</TableHeader>
 					<TableBody>
-						{hasNoFilteredRepositories ? (
-							<TableRow>
-								<TableCell colSpan={4} className="text-center py-12">
-									<div className="flex flex-col items-center gap-3">
-										<p className="text-muted-foreground">No repositories match your filters.</p>
-										<Button onClick={clearFilters} variant="outline" size="sm">
-											<RotateCcw className="h-4 w-4 mr-2" />
-											Clear filters
-										</Button>
-									</div>
-								</TableCell>
+						<TableRow className={cn({ hidden: !hasNoFilteredRepositories })}>
+							<TableCell colSpan={4} className="text-center py-12">
+								<div className="flex flex-col items-center gap-3">
+									<p className="text-muted-foreground">No repositories match your filters.</p>
+									<Button onClick={clearFilters} variant="outline" size="sm">
+										<RotateCcw className="h-4 w-4 mr-2" />
+										Clear filters
+									</Button>
+								</div>
+							</TableCell>
+						</TableRow>
+						{rows.map((row) => (
+							<TableRow
+								key={row.original.id}
+								className="hover:bg-accent/50 hover:cursor-pointer h-12"
+								onClick={() => navigate({ to: `/repositories/${row.original.shortId}` })}
+							>
+								{row.getVisibleCells().map((cell) => (
+									<TableCell
+										key={cell.id}
+										className={cn({
+											"font-medium text-strong-accent": cell.column.id === "name",
+											"hidden sm:table-cell": cell.column.id === "compressionMode",
+											"text-center": cell.column.id === "status",
+										})}
+									>
+										{flexRender(cell.column.columnDef.cell, cell.getContext())}
+									</TableCell>
+								))}
 							</TableRow>
-						) : (
-							filteredRepositories.map((repository) => (
-								<TableRow
-									key={repository.id}
-									className="hover:bg-accent/50 hover:cursor-pointer"
-									onClick={() => navigate(`/repositories/${repository.shortId}`)}
-								>
-									<TableCell className="font-medium text-strong-accent">{repository.name}</TableCell>
-									<TableCell>
-										<span className="flex items-center gap-2">
-											<RepositoryIcon backend={repository.type} />
-											{repository.type}
-										</span>
-									</TableCell>
-									<TableCell className="hidden sm:table-cell">
-										<span className="text-muted-foreground text-xs bg-primary/10 rounded-md px-2 py-1">
-											{repository.compressionMode || "off"}
-										</span>
-									</TableCell>
-									<TableCell className="text-center">
-										<span
-											className={cn(
-												"inline-flex items-center gap-2 px-2 py-1 rounded-md text-xs bg-gray-500/10 text-gray-500",
-												{
-													"bg-green-500/10 text-green-500": repository.status === "healthy",
-													"bg-red-500/10 text-red-500": repository.status === "error",
-												},
-											)}
-										>
-											{repository.status || "unknown"}
-										</span>
-									</TableCell>
-								</TableRow>
-							))
-						)}
+						))}
 					</TableBody>
 				</Table>
 			</div>
@@ -188,8 +245,8 @@ export default function Repositories({ loaderData }: Route.ComponentProps) {
 					"No repositories match filters."
 				) : (
 					<span>
-						<span className="text-strong-accent">{filteredRepositories.length}</span> repositor
-						{filteredRepositories.length === 1 ? "y" : "ies"}
+						<span className="text-strong-accent">{rows.length}</span> repositor
+						{rows.length === 1 ? "y" : "ies"}
 					</span>
 				)}
 			</div>

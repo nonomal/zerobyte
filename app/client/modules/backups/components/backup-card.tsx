@@ -1,14 +1,22 @@
 import { CalendarClock, Database, HardDrive } from "lucide-react";
-import { Link } from "react-router";
+import { Link } from "@tanstack/react-router";
+import { TimeAgo } from "~/client/components/time-ago";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
+import { useTimeFormat } from "~/client/lib/datetime";
 import type { BackupSchedule } from "~/client/lib/types";
 import { BackupStatusDot } from "./backup-status-dot";
-import { formatShortDateTime, formatTimeAgo } from "~/client/lib/datetime";
 
-export const BackupCard = ({ schedule }: { schedule: BackupSchedule }) => {
+export const BackupCard = ({ schedule, isRunning }: { schedule: BackupSchedule; isRunning: boolean }) => {
+	const { formatShortDateTime } = useTimeFormat();
+
 	return (
-		<Link key={schedule.id} to={`/backups/${schedule.id}`}>
-			<Card key={schedule.id} className="flex flex-col h-full">
+		<Link
+			key={schedule.shortId}
+			to="/backups/$backupId"
+			params={{ backupId: schedule.shortId }}
+			className="block min-w-0 h-full"
+		>
+			<Card interactive key={schedule.shortId} className="flex flex-col h-full min-w-0 overflow-hidden">
 				<CardHeader className="pb-3 overflow-hidden">
 					<div className="flex items-center justify-between gap-2 w-full">
 						<div className="flex items-center gap-2 flex-1 min-w-0 w-0">
@@ -17,31 +25,45 @@ export const BackupCard = ({ schedule }: { schedule: BackupSchedule }) => {
 						</div>
 						<BackupStatusDot
 							enabled={schedule.enabled}
-							hasError={!!schedule.lastBackupError}
-							isInProgress={schedule.lastBackupStatus === "in_progress"}
+							hasError={schedule.lastBackupStatus === "error"}
+							hasWarning={schedule.lastBackupStatus === "warning"}
+							isInProgress={isRunning}
 						/>
 					</div>
 					<CardDescription className="ml-0.5 flex items-center gap-2 text-xs min-w-0">
 						<HardDrive className="h-3.5 w-3.5 shrink-0" />
-						<span className="truncate">{schedule.volume.name}</span>
+						<span className="truncate font-mono">{schedule.volume.name}</span>
 						<span className="text-muted-foreground shrink-0">→</span>
 						<Database className="h-3.5 w-3.5 text-strong-accent shrink-0" />
-						<span className="truncate text-strong-accent">{schedule.repository.name}</span>
+						<span className="truncate text-strong-accent font-mono">{schedule.repository.name}</span>
 					</CardDescription>
 				</CardHeader>
-				<CardContent className="flex-1 space-y-4">
-					<div className="space-y-2">
-						<div className="flex items-center justify-between text-sm">
-							<span className="text-muted-foreground">Schedule</span>
-							<code className="text-xs bg-muted px-2 py-1 rounded">{schedule.cronExpression}</code>
+				<CardContent className="flex-1 min-w-0 space-y-4">
+					<div className="space-y-3">
+						<div className="flex min-w-0 items-center text-sm gap-2">
+							<span className="text-muted-foreground shrink-0">Schedule</span>
+							<div className="min-w-0 flex-1 border-b border-dashed border-border/80 dark:border-border/50" />
+							<code
+								className="max-w-[60%] truncate text-xs text-foreground font-mono bg-muted px-2 py-1 rounded"
+								title={schedule.cronExpression || undefined}
+							>
+								{schedule.cronExpression || "Manual only"}
+							</code>
 						</div>
-						<div className="flex items-center justify-between text-sm">
-							<span className="text-muted-foreground">Last backup</span>
-							<span className="font-medium">{formatTimeAgo(schedule.lastBackupAt)}</span>
+						<div className="flex items-center text-sm gap-2">
+							<span className="text-muted-foreground shrink-0">Last backup</span>
+							<div className="flex-1 border-b border-dashed border-border/80 dark:border-border/50" />
+							<TimeAgo
+								date={schedule.lastBackupAt}
+								className="text-foreground font-mono text-sm shrink-0"
+							/>
 						</div>
-						<div className="flex items-center justify-between text-sm">
-							<span className="text-muted-foreground">Next backup</span>
-							<span className="font-medium">{formatShortDateTime(schedule.nextBackupAt)}</span>
+						<div className="flex items-center text-sm gap-2">
+							<span className="text-muted-foreground shrink-0">Next backup</span>
+							<div className="flex-1 border-b border-dashed border-border/80 dark:border-border/50" />
+							<span className="text-foreground font-mono text-sm shrink-0">
+								{formatShortDateTime(schedule.nextBackupAt)}
+							</span>
 						</div>
 					</div>
 				</CardContent>

@@ -1,8 +1,9 @@
-import { arktypeResolver } from "@hookform/resolvers/arktype";
-import { type } from "arktype";
-import { useState } from "react";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { useSuspenseQuery } from "@tanstack/react-query";
+import { useNavigate } from "@tanstack/react-router";
+import { useServerFn } from "@tanstack/react-start";
+import { useCallback, useEffect, useState } from "react";
 import { useForm } from "react-hook-form";
-import { useNavigate } from "react-router";
 import { toast } from "sonner";
 import { AuthLayout } from "~/client/components/auth-layout";
 import { Button } from "~/client/components/ui/button";
@@ -11,40 +12,112 @@ import { Input } from "~/client/components/ui/input";
 import { InputOTP, InputOTPGroup, InputOTPSeparator, InputOTPSlot } from "~/client/components/ui/input-otp";
 import { Label } from "~/client/components/ui/label";
 import { authClient } from "~/client/lib/auth-client";
-import { authMiddleware } from "~/middleware/auth";
+import { logger } from "~/client/lib/logger";
+import { cn } from "~/client/lib/utils";
+import { decodeLoginError, getLoginErrorDescription } from "~/client/lib/sso-errors";
+import { getLoginOptions } from "~/server/lib/functions/login-options";
+import { RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME } from "~/lib/recovery-key-skip";
+import { PASSKEY_LOGIN_FAILED_ERROR } from "~/lib/sso-errors";
+import { normalizeUsername } from "~/lib/username";
 import { ResetPasswordDialog } from "../components/reset-password-dialog";
-import type { Route } from "./+types/login";
+import { AlternativeSignInSection } from "../components/alternative-sign-in-section";
+import { z } from "zod";
 
-export const clientMiddleware = [authMiddleware];
-
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Login" },
-		{
-			name: "description",
-			content: "Sign in to your Zerobyte account.",
-		},
-	];
-}
-
-const loginSchema = type({
-	username: "2<=string<=50",
-	password: "string>=1",
+const loginSchema = z.object({
+	username: z
+		.string()
+		.min(2, "Username must be at least 2 characters")
+		.max(50, "Username must be at most 50 characters"),
+	password: z.string().min(1, "Password is required"),
 });
 
-type LoginFormValues = typeof loginSchema.inferIn;
+type LoginFormValues = z.input<typeof loginSchema>;
 
-export default function LoginPage() {
+type LoginPageProps = {
+	error?: string;
+};
+
+type PasskeySignInError = {
+	code?: string;
+	message?: string;
+	status?: number;
+	statusText?: string;
+};
+
+function isPasskeyVerificationFailure(error: PasskeySignInError | null) {
+	return error?.code === "AUTHENTICATION_FAILED" || error?.code === "UNAUTHORIZED";
+}
+
+function hasSkippedRecoveryKeyDownload(userId: string) {
+	return document.cookie
+		.split(";")
+		.some((cookie) => cookie.trim() === `${RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME}=${userId}`);
+}
+
+export function LoginPage({ error }: LoginPageProps = {}) {
 	const navigate = useNavigate();
+	const getOptions = useServerFn(getLoginOptions);
+	const { data: loginOptions } = useSuspenseQuery({
+		queryKey: ["login-options"],
+		queryFn: getOptions,
+	});
 	const [showResetDialog, setShowResetDialog] = useState(false);
 	const [isLoggingIn, setIsLoggingIn] = useState(false);
 	const [requires2FA, setRequires2FA] = useState(false);
 	const [totpCode, setTotpCode] = useState("");
 	const [isVerifying2FA, setIsVerifying2FA] = useState(false);
 	const [trustDevice, setTrustDevice] = useState(false);
+	const errorCode = decodeLoginError(error);
+	const errorDescription = errorCode ? getLoginErrorDescription(errorCode) : null;
+
+	const navigateAfterLogin = useCallback(async () => {
+		const session = await authClient.getSession();
+
+		if (
+			session.data?.user &&
+			!session.data.user.hasDownloadedResticPassword &&
+			!hasSkippedRecoveryKeyDownload(session.data.user.id)
+		) {
+			void navigate({ to: "/download-recovery-key" });
+		} else {
+			void navigate({ to: "/volumes" });
+		}
+	}, [navigate]);
+
+	useEffect(() => {
+		const autoSignIn = async () => {
+			if (
+				typeof PublicKeyCredential === "undefined" ||
+				!PublicKeyCredential.isConditionalMediationAvailable ||
+				!(await PublicKeyCredential.isConditionalMediationAvailable())
+			) {
+				return;
+			}
+
+			const { data, error } = await authClient.signIn.passkey({
+				autoFill: true,
+			});
+
+			if (isPasskeyVerificationFailure(error)) {
+				void navigate({
+					to: "/login",
+					search: {
+						error: PASSKEY_LOGIN_FAILED_ERROR,
+					},
+				});
+				return;
+			}
+
+			if (data) {
+				await navigateAfterLogin();
+			}
+		};
+
+		void autoSignIn();
+	}, [navigate, navigateAfterLogin]);
 
 	const form = useForm<LoginFormValues>({
-		resolver: arktypeResolver(loginSchema),
+		resolver: zodResolver(loginSchema),
 		defaultValues: {
 			username: "",
 			password: "",
@@ -53,7 +126,7 @@ export default function LoginPage() {
 
 	const onSubmit = async (values: LoginFormValues) => {
 		const { data, error } = await authClient.signIn.username({
-			username: values.username.toLowerCase().trim(),
+			username: normalizeUsername(values.username),
 			password: values.password,
 			fetchOptions: {
 				onRequest: () => {
@@ -66,7 +139,7 @@ export default function LoginPage() {
 		});
 
 		if (error) {
-			console.error(error);
+			logger.error(error);
 			toast.error("Login failed", { description: error.message });
 			return;
 		}
@@ -76,12 +149,7 @@ export default function LoginPage() {
 			return;
 		}
 
-		const d = await authClient.getSession();
-		if (data.user && !d.data?.user.hasDownloadedResticPassword) {
-			void navigate("/download-recovery-key");
-		} else {
-			void navigate("/volumes");
-		}
+		await navigateAfterLogin();
 	};
 
 	const handleVerify2FA = async () => {
@@ -104,7 +172,7 @@ export default function LoginPage() {
 		});
 
 		if (error) {
-			console.error(error);
+			logger.error(error);
 			toast.error("Verification failed", { description: error.message });
 			setTotpCode("");
 			return;
@@ -113,10 +181,14 @@ export default function LoginPage() {
 		if (data) {
 			toast.success("Login successful");
 			const session = await authClient.getSession();
-			if (session.data?.user && !session.data.user.hasDownloadedResticPassword) {
-				void navigate("/download-recovery-key");
+			if (
+				session.data?.user &&
+				!session.data.user.hasDownloadedResticPassword &&
+				!hasSkippedRecoveryKeyDownload(session.data.user.id)
+			) {
+				void navigate({ to: "/download-recovery-key" });
 			} else {
-				void navigate("/volumes");
+				void navigate({ to: "/volumes" });
 			}
 		}
 	};
@@ -130,7 +202,10 @@ export default function LoginPage() {
 
 	if (requires2FA) {
 		return (
-			<AuthLayout title="Two-Factor Authentication" description="Enter the 6-digit code from your authenticator app">
+			<AuthLayout
+				title="Two-Factor Authentication"
+				description="Enter the 6-digit code from your authenticator app"
+			>
 				<div className="space-y-6">
 					<div className="space-y-4 flex flex-col items-center">
 						<Label htmlFor="totp-code">Authentication code</Label>
@@ -161,6 +236,7 @@ export default function LoginPage() {
 						<input
 							type="checkbox"
 							id="trust-device"
+							aria-label="Trust this device for 30 days"
 							checked={trustDevice}
 							onChange={(e) => setTrustDevice(e.target.checked)}
 							className="h-4 w-4"
@@ -197,48 +273,74 @@ export default function LoginPage() {
 
 	return (
 		<AuthLayout title="Login to your account" description="Enter your credentials below to login to your account">
-			<Form {...form}>
-				<form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
-					<FormField
-						control={form.control}
-						name="username"
-						render={({ field }) => (
-							<FormItem>
-								<FormLabel>Username</FormLabel>
-								<FormControl>
-									<Input {...field} type="text" placeholder="admin" disabled={isLoggingIn} />
-								</FormControl>
-								<FormMessage />
-							</FormItem>
-						)}
-					/>
-					<FormField
-						control={form.control}
-						name="password"
-						render={({ field }) => (
-							<FormItem>
-								<div className="flex items-center justify-between">
-									<FormLabel>Password</FormLabel>
-									<button
-										type="button"
-										className="text-xs text-muted-foreground hover:underline"
-										onClick={() => setShowResetDialog(true)}
-									>
-										Forgot your password?
-									</button>
-								</div>
-								<FormControl>
-									<Input {...field} type="password" disabled={isLoggingIn} />
-								</FormControl>
-								<FormMessage />
-							</FormItem>
-						)}
-					/>
-					<Button type="submit" className="w-full" loading={isLoggingIn}>
-						Login
-					</Button>
-				</form>
-			</Form>
+			<div
+				className={cn("rounded-md border border-destructive/50 p-3 text-sm", {
+					hidden: !errorDescription,
+				})}
+			>
+				{errorDescription}
+			</div>
+
+			{loginOptions.passwordLoginEnabled && (
+				<Form {...form}>
+					<form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+						<FormField
+							control={form.control}
+							name="username"
+							render={({ field }) => (
+								<FormItem>
+									<FormLabel>Username</FormLabel>
+									<FormControl>
+										<Input
+											{...field}
+											type="text"
+											placeholder="admin"
+											disabled={isLoggingIn}
+											autoComplete="username webauthn"
+										/>
+									</FormControl>
+									<FormMessage />
+								</FormItem>
+							)}
+						/>
+						<FormField
+							control={form.control}
+							name="password"
+							render={({ field }) => (
+								<FormItem>
+									<div className="flex items-center justify-between">
+										<FormLabel>Password</FormLabel>
+										<button
+											type="button"
+											className="text-xs text-muted-foreground hover:underline"
+											onClick={() => setShowResetDialog(true)}
+										>
+											Forgot your password?
+										</button>
+									</div>
+									<FormControl>
+										<Input
+											{...field}
+											type="password"
+											disabled={isLoggingIn}
+											autoComplete="current-password webauthn"
+										/>
+									</FormControl>
+									<FormMessage />
+								</FormItem>
+							)}
+						/>
+						<Button type="submit" className="w-full" loading={isLoggingIn}>
+							Login
+						</Button>
+					</form>
+				</Form>
+			)}
+
+			<AlternativeSignInSection
+				hasPasskeySignIn={loginOptions.hasPasskeySignIn}
+				onPasskeySignIn={navigateAfterLogin}
+			/>
 
 			<ResetPasswordDialog open={showResetDialog} onOpenChange={setShowResetDialog} />
 		</AuthLayout>

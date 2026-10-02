@@ -1,7 +1,6 @@
 import { useId, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useSuspenseQuery } from "@tanstack/react-query";
 import { Database, HardDrive, Plus } from "lucide-react";
-import { Link, useNavigate } from "react-router";
 import { toast } from "sonner";
 import {
 	createBackupScheduleMutation,
@@ -15,50 +14,26 @@ import { parseError } from "~/client/lib/errors";
 import { EmptyState } from "~/client/components/empty-state";
 import { getCronExpression } from "~/utils/utils";
 import { CreateScheduleForm, type BackupScheduleFormValues } from "../components/create-schedule-form";
-import type { Route } from "./+types/create-backup";
-import { listRepositories, listVolumes } from "~/client/api-client";
+import { Link, useNavigate } from "@tanstack/react-router";
 
-export const handle = {
-	breadcrumb: () => [{ label: "Backups", href: "/backups" }, { label: "Create" }],
-};
-
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Create Backup Job" },
-		{
-			name: "description",
-			content: "Create a new automated backup job for your volumes.",
-		},
-	];
-}
-
-export const clientLoader = async () => {
-	const [volumes, repositories] = await Promise.all([listVolumes(), listRepositories()]);
-
-	if (volumes.data && repositories.data) return { volumes: volumes.data, repositories: repositories.data };
-	return { volumes: [], repositories: [] };
-};
-
-export default function CreateBackup({ loaderData }: Route.ComponentProps) {
+export function CreateBackupPage() {
 	const navigate = useNavigate();
 	const formId = useId();
-	const [selectedVolumeId, setSelectedVolumeId] = useState<number | undefined>();
+	const [selectedVolumeShortId, setSelectedVolumeShortId] = useState("");
 
-	const { data: volumesData, isLoading: loadingVolumes } = useQuery({
+	const { data: volumesData } = useSuspenseQuery({
 		...listVolumesOptions(),
-		initialData: loaderData.volumes,
 	});
 
-	const { data: repositoriesData } = useQuery({
+	const { data: repositoriesData } = useSuspenseQuery({
 		...listRepositoriesOptions(),
-		initialData: loaderData.repositories,
 	});
 
 	const createSchedule = useMutation({
 		...createBackupScheduleMutation(),
 		onSuccess: (data) => {
 			toast.success("Backup job created successfully");
-			void navigate(`/backups/${data.id}`);
+			void navigate({ to: `/backups/${data.shortId}` });
 		},
 		onError: (error) => {
 			toast.error("Failed to create backup job", {
@@ -68,7 +43,7 @@ export default function CreateBackup({ loaderData }: Route.ComponentProps) {
 	});
 
 	const handleSubmit = (formValues: BackupScheduleFormValues) => {
-		if (!selectedVolumeId) return;
+		if (!selectedVolumeShortId) return;
 
 		const cronExpression = getCronExpression(
 			formValues.frequency,
@@ -89,28 +64,26 @@ export default function CreateBackup({ loaderData }: Route.ComponentProps) {
 		createSchedule.mutate({
 			body: {
 				name: formValues.name,
-				volumeId: selectedVolumeId,
+				volumeId: selectedVolumeShortId,
 				repositoryId: formValues.repositoryId,
-				enabled: true,
+				enabled: formValues.frequency !== "manual",
 				cronExpression,
 				retentionPolicy: Object.keys(retentionPolicy).length > 0 ? retentionPolicy : undefined,
+				includePaths: formValues.includePaths,
 				includePatterns: formValues.includePatterns,
 				excludePatterns: formValues.excludePatterns,
 				excludeIfPresent: formValues.excludeIfPresent,
 				oneFileSystem: formValues.oneFileSystem,
+				customResticParams: formValues.customResticParams,
+				compressionMode: formValues.compressionMode,
+				backupWebhooks: formValues.backupWebhooks,
+				maxRetries: formValues.maxRetries,
+				retryDelay: formValues.retryDelay,
 			},
 		});
 	};
 
-	const selectedVolume = volumesData.find((v) => v.id === selectedVolumeId);
-
-	if (loadingVolumes) {
-		return (
-			<div className="flex items-center justify-center h-full">
-				<p className="text-muted-foreground">Loading...</p>
-			</div>
-		);
-	}
+	const selectedVolume = volumesData.find((v) => v.shortId === selectedVolumeShortId);
 
 	if (!volumesData.length) {
 		return (
@@ -143,16 +116,16 @@ export default function CreateBackup({ loaderData }: Route.ComponentProps) {
 	}
 
 	return (
-		<div className="container mx-auto space-y-6">
+		<div className="container mx-auto space-y-4">
 			<Card>
 				<CardContent>
-					<Select value={selectedVolumeId?.toString()} onValueChange={(v) => setSelectedVolumeId(Number(v))}>
+					<Select value={selectedVolumeShortId} onValueChange={setSelectedVolumeShortId}>
 						<SelectTrigger id="volume-select">
 							<SelectValue placeholder="Choose a volume to backup" />
 						</SelectTrigger>
 						<SelectContent>
 							{volumesData.map((volume) => (
-								<SelectItem key={volume.id} value={volume.id.toString()}>
+								<SelectItem key={volume.shortId} value={volume.shortId}>
 									<span className="flex items-center gap-2">
 										<HardDrive className="h-4 w-4" />
 										{volume.name}

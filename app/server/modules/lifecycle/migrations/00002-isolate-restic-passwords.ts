@@ -9,11 +9,11 @@ import {
 	notificationDestinationsTable,
 	twoFactor,
 } from "../../../db/schema";
-import { logger } from "../../../utils/logger";
+import { logger } from "@zerobyte/core/node";
 import { toMessage } from "~/server/utils/errors";
 import { cryptoUtils } from "~/server/utils/crypto";
-import type { RepositoryConfig } from "~/schemas/restic";
-import type { BackendConfig } from "~/schemas/volumes";
+import type { RepositoryConfig } from "@zerobyte/core/restic";
+import type { BackendConfig } from "@zerobyte/contracts/volumes";
 import type { NotificationConfig } from "~/schemas/notifications";
 import { RESTIC_PASS_FILE } from "~/server/core/constants";
 import { symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";

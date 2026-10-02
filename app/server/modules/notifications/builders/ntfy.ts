@@ -1,41 +1,35 @@
 import type { NotificationConfig } from "~/schemas/notifications";
 
 export const buildNtfyShoutrrrUrl = (config: Extract<NotificationConfig, { type: "ntfy" }>) => {
-	let shoutrrrUrl: string;
-
-	const params = new URLSearchParams();
 	const { username, password, accessToken } = config;
-
-	let auth = "";
+	const shoutrrrUrl = new URL("ntfy://placeholder");
 
 	if (username && password) {
-		auth = `${encodeURIComponent(username)}:${encodeURIComponent(password)}@`;
+		shoutrrrUrl.username = username;
+		shoutrrrUrl.password = password;
 	}
 
 	if (accessToken) {
-		auth = `:${encodeURIComponent(accessToken)}@`;
+		shoutrrrUrl.username = "";
+		shoutrrrUrl.password = accessToken;
 	}
 
 	if (config.serverUrl) {
 		const url = new URL(config.serverUrl);
-		const hostname = url.hostname;
-		const port = url.port ? `:${url.port}` : "";
 		const scheme = url.protocol === "https:" ? "https" : "http";
 
-		params.append("scheme", scheme);
-
-		shoutrrrUrl = `ntfy://${auth}${hostname}${port}/${config.topic}`;
+		shoutrrrUrl.hostname = url.hostname;
+		shoutrrrUrl.port = url.port;
+		shoutrrrUrl.pathname = `/${config.topic}`;
+		shoutrrrUrl.searchParams.append("scheme", scheme);
 	} else {
-		shoutrrrUrl = `ntfy://${auth}ntfy.sh/${config.topic}`;
+		shoutrrrUrl.hostname = "ntfy.sh";
+		shoutrrrUrl.pathname = `/${config.topic}`;
 	}
 
 	if (config.priority) {
-		params.append("priority", config.priority);
+		shoutrrrUrl.searchParams.append("priority", config.priority);
 	}
 
-	if (params.toString()) {
-		shoutrrrUrl += `?${params.toString()}`;
-	}
-
-	return shoutrrrUrl;
+	return shoutrrrUrl.toString();
 };

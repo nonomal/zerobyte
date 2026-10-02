@@ -9,23 +9,17 @@ export const buildSlackShoutrrrUrl = (config: Extract<NotificationConfig, { type
 	}
 
 	const [, tokenA, tokenB, tokenC] = pathParts;
+	const shoutrrrUrl = new URL("slack://placeholder");
+	shoutrrrUrl.username = "hook";
+	shoutrrrUrl.password = `${tokenA}-${tokenB}-${tokenC}`;
+	shoutrrrUrl.hostname = "webhook";
 
-	let shoutrrrUrl = `slack://hook:${tokenA}-${tokenB}-${tokenC}@webhook`;
-
-	const params = new URLSearchParams();
-	if (config.channel) {
-		params.append("channel", config.channel);
-	}
 	if (config.username) {
-		params.append("username", config.username);
+		shoutrrrUrl.searchParams.append("username", config.username);
 	}
 	if (config.iconEmoji) {
-		params.append("icon_emoji", config.iconEmoji);
+		shoutrrrUrl.searchParams.append("icon_emoji", config.iconEmoji);
 	}
 
-	if (params.toString()) {
-		shoutrrrUrl += `?${params.toString()}`;
-	}
-
-	return shoutrrrUrl;
+	return shoutrrrUrl.toString().replace("/?", "?");
 };

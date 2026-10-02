@@ -2,17 +2,20 @@ import { useQuery } from "@tanstack/react-query";
 import { getUpdatesOptions } from "../api-client/@tanstack/react-query.gen";
 
 export function useUpdates() {
-	const { data, isLoading, error } = useQuery({
+	const { data, isLoading, isFetching, error, refetch } = useQuery({
 		...getUpdatesOptions(),
 		staleTime: 60 * 60 * 1000,
 		gcTime: 24 * 60 * 60 * 1000,
-		refetchOnWindowFocus: false,
+		refetchOnMount: "always",
+		refetchOnWindowFocus: "always",
 	});
 
 	return {
 		updates: data,
 		hasUpdate: data?.hasUpdate ?? false,
 		isLoading,
+		isFetching,
 		error,
+		checkForUpdates: refetch,
 	};
 }

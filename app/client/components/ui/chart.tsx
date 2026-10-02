@@ -1,13 +1,16 @@
+// fallow-ignore-file unused-export
 // @ts-nocheck
 // biome-ignore-all lint: reason
 import * as React from "react";
 import * as RechartsPrimitive from "recharts";
 
+import { useRootLoaderData } from "~/client/hooks/use-root-loader-data";
 import { cn } from "~/client/lib/utils";
 
 // Format: { THEME_NAME: CSS_SELECTOR }
 const THEMES = { light: "", dark: ".dark" } as const;
 
+// fallow-ignore-next-line unused-type
 export type ChartConfig = {
 	[k in string]: {
 		label?: React.ReactNode;
@@ -116,6 +119,7 @@ function ChartTooltipContent({
 		labelKey?: string;
 	}) {
 	const { config } = useChart();
+	const { locale } = useRootLoaderData();
 
 	const tooltipLabel = React.useMemo(() => {
 		if (hideLabel || !payload?.length) {
@@ -205,7 +209,7 @@ function ChartTooltipContent({
 											</div>
 											{item.value && (
 												<span className="text-foreground font-mono font-medium tabular-nums">
-													{item.value.toLocaleString()}
+													{item.value.toLocaleString(locale)}
 												</span>
 											)}
 										</div>

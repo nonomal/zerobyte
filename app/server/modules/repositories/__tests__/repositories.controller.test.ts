@@ -1,8 +1,90 @@
-import { test, describe, expect } from "bun:test";
+import { afterEach, beforeAll, beforeEach, describe, expect, test, vi } from "vitest";
+import waitForExpect from "wait-for-expect";
+import crypto from "node:crypto";
+import { PassThrough } from "node:stream";
 import { createApp } from "~/server/app";
+import { db } from "~/server/db/db";
+import { member, repositoriesTable, sessionsTable } from "~/server/db/schema";
+import { generateShortId } from "~/server/utils/id";
 import { createTestSession, getAuthHeaders } from "~/test/helpers/auth";
+import type { RepositoryConfig } from "@zerobyte/core/restic";
+import { restic } from "~/server/core/restic";
+import { Effect } from "effect";
+import { systemService } from "~/server/modules/system/system.service";
+import { repositoriesService } from "../repositories.service";
+import { eq } from "drizzle-orm";
+import { config } from "~/server/core/config";
+import { ResticError } from "@zerobyte/core/restic/server";
 
 const app = createApp();
+
+let session: Awaited<ReturnType<typeof createTestSession>>;
+
+beforeAll(async () => {
+	session = await createTestSession();
+});
+
+beforeEach(() => {
+	vi.spyOn(restic, "init").mockReturnValue(Effect.succeed({ success: true, error: null }));
+});
+
+afterEach(() => {
+	config.runtime = "server";
+	vi.restoreAllMocks();
+});
+
+const createRepositoryRecord = async (organizationId: string) => {
+	const [repository] = await db
+		.insert(repositoriesTable)
+		.values({
+			id: crypto.randomUUID(),
+			shortId: generateShortId(),
+			name: `Repository-${crypto.randomUUID()}`,
+			type: "local",
+			config: {
+				backend: "local",
+				name: generateShortId(),
+				path: `/tmp/repository-${crypto.randomUUID()}`,
+				isExistingRepository: true,
+			},
+			compressionMode: "off",
+			status: "error",
+			lastChecked: Date.now(),
+			lastError: "old error",
+			doctorResult: {
+				success: false,
+				steps: [],
+				completedAt: Date.now(),
+			},
+			organizationId,
+		})
+		.returning();
+
+	return repository;
+};
+
+const createManagedRepositoryRecord = async (organizationId: string) => {
+	const [repository] = await db
+		.insert(repositoriesTable)
+		.values({
+			id: Bun.randomUUIDv7(),
+			provisioningId: `provisioned:${crypto.randomUUID()}`,
+			shortId: generateShortId(),
+			name: `Managed-${crypto.randomUUID()}`,
+			type: "local",
+			config: {
+				backend: "local",
+				path: `/tmp/repository-${crypto.randomUUID()}`,
+				isExistingRepository: true,
+			},
+			compressionMode: "off",
+			status: "healthy",
+			organizationId,
+		})
+		.returning();
+
+	return repository;
+};
 
 describe("repositories security", () => {
 	test("should return 401 if no session cookie is provided", async () => {
@@ -22,10 +104,8 @@ describe("repositories security", () => {
 	});
 
 	test("should return 200 if session is valid", async () => {
-		const { token } = await createTestSession();
-
 		const res = await app.request("/api/v1/repositories", {
-			headers: getAuthHeaders(token),
+			headers: session.headers,
 		});
 
 		expect(res.status).toBe(200);
@@ -37,14 +117,21 @@ describe("repositories security", () => {
 			{ method: "POST", path: "/api/v1/repositories" },
 			{ method: "GET", path: "/api/v1/repositories/rclone-remotes" },
 			{ method: "GET", path: "/api/v1/repositories/test-repo" },
+			{ method: "GET", path: "/api/v1/repositories/test-repo/stats" },
+			{ method: "POST", path: "/api/v1/repositories/test-repo/stats/refresh" },
 			{ method: "DELETE", path: "/api/v1/repositories/test-repo" },
 			{ method: "GET", path: "/api/v1/repositories/test-repo/snapshots" },
+			{ method: "POST", path: "/api/v1/repositories/test-repo/snapshots/refresh" },
 			{ method: "GET", path: "/api/v1/repositories/test-repo/snapshots/test-snapshot" },
 			{ method: "GET", path: "/api/v1/repositories/test-repo/snapshots/test-snapshot/files" },
+			{ method: "GET", path: "/api/v1/repositories/test-repo/snapshots/test-snapshot/dump" },
 			{ method: "POST", path: "/api/v1/repositories/test-repo/restore" },
 			{ method: "POST", path: "/api/v1/repositories/test-repo/doctor" },
+			{ method: "DELETE", path: "/api/v1/repositories/test-repo/doctor" },
+			{ method: "POST", path: "/api/v1/repositories/test-repo/unlock" },
 			{ method: "DELETE", path: "/api/v1/repositories/test-repo/snapshots/test-snapshot" },
 			{ method: "DELETE", path: "/api/v1/repositories/test-repo/snapshots" },
+			{ method: "POST", path: "/api/v1/repositories/test-repo/snapshots/tag" },
 			{ method: "PATCH", path: "/api/v1/repositories/test-repo" },
 		];
 
@@ -58,6 +145,46 @@ describe("repositories security", () => {
 		}
 	});
 
+	describe("dev panel endpoint - requires dev panel access", () => {
+		test("POST /api/v1/repositories/:shortId/exec should return 401 when unauthenticated", async () => {
+			const res = await app.request("/api/v1/repositories/test-repo/exec", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ command: "version" }),
+			});
+			expect(res.status).toBe(401);
+			const body = await res.json();
+			expect(body.message).toBe("Invalid or expired session");
+		});
+
+		test("POST /api/v1/repositories/:shortId/exec should allow desktop sessions", async () => {
+			config.runtime = "desktop";
+			const desktopSession = await createTestSession();
+			await db.update(member).set({ role: "admin" }).where(eq(member.userId, desktopSession.user.id));
+			await db
+				.update(sessionsTable)
+				.set({ authSource: "desktop-session" })
+				.where(eq(sessionsTable.token, desktopSession.session.token));
+			vi.spyOn(systemService, "isDevPanelEnabled").mockReturnValue(true);
+			const execSpy = vi.spyOn(repositoriesService, "execResticCommand").mockResolvedValue({ exitCode: 0 });
+
+			const res = await app.request("/api/v1/repositories/test-repo/exec", {
+				method: "POST",
+				headers: {
+					...desktopSession.headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({ command: "version" }),
+			});
+
+			expect(res.status).toBe(200);
+			await res.text();
+			expect(execSpy).toHaveBeenCalled();
+		});
+	});
+
 	describe("information disclosure", () => {
 		test("should not disclose if a repository exists when unauthenticated", async () => {
 			const res = await app.request("/api/v1/repositories/non-existent-repo");
@@ -69,9 +196,29 @@ describe("repositories security", () => {
 
 	describe("input validation", () => {
 		test("should return 404 for non-existent repository", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/repositories/non-existent-repo", {
-				headers: getAuthHeaders(token),
+				headers: session.headers,
+			});
+
+			expect(res.status).toBe(404);
+			const body = await res.json();
+			expect(body.message).toBe("Repository not found");
+		});
+
+		test("should return 404 for stats of non-existent repository", async () => {
+			const res = await app.request("/api/v1/repositories/non-existent-repo/stats", {
+				headers: session.headers,
+			});
+
+			expect(res.status).toBe(404);
+			const body = await res.json();
+			expect(body.message).toBe("Repository not found");
+		});
+
+		test("should return 404 for stats refresh of non-existent repository", async () => {
+			const res = await app.request("/api/v1/repositories/non-existent-repo/stats/refresh", {
+				method: "POST",
+				headers: session.headers,
 			});
 
 			expect(res.status).toBe(404);
@@ -80,11 +227,10 @@ describe("repositories security", () => {
 		});
 
 		test("should return 400 for invalid payload on create", async () => {
-			const { token } = await createTestSession();
 			const res = await app.request("/api/v1/repositories", {
 				method: "POST",
 				headers: {
-					...getAuthHeaders(token),
+					...session.headers,
 					"Content-Type": "application/json",
 				},
 				body: JSON.stringify({
@@ -94,5 +240,385 @@ describe("repositories security", () => {
 
 			expect(res.status).toBe(400);
 		});
+
+		test("should accept env:// values as plain secrets on create", async () => {
+			const res = await app.request("/api/v1/repositories", {
+				method: "POST",
+				headers: {
+					...session.headers,
+					"Content-Type": "application/json",
+				},
+				body: JSON.stringify({
+					name: "S3 repo",
+					compressionMode: "auto",
+					config: {
+						backend: "s3",
+						endpoint: "https://s3.amazonaws.com",
+						bucket: "bucket-name",
+						accessKeyId: "access-key",
+						secretAccessKey: "env://ZEROBYTE_REPOSITORY_SECRET",
+					},
+				}),
+			});
+
+			expect(res.status).not.toBe(400);
+		});
+	});
+});
+
+describe("list snapshots", () => {
+	test("includes each snapshot hostname", async () => {
+		vi.spyOn(repositoriesService, "listSnapshots").mockResolvedValue([
+			{
+				id: "snapshot-id",
+				short_id: "snapshot",
+				time: "2026-09-09T13:30:00Z",
+				paths: ["/var/lib/zerobyte/volumes/data"],
+				hostname: "zerobyte",
+			},
+		]);
+		vi.spyOn(repositoriesService, "getRetentionCategories").mockResolvedValue(new Map());
+
+		const response = await app.request("/api/v1/repositories/test-repo/snapshots", {
+			headers: session.headers,
+		});
+
+		expect(response.status).toBe(200);
+		await expect(response.json()).resolves.toEqual([
+			expect.objectContaining({ short_id: "snapshot", hostname: "zerobyte" }),
+		]);
+	});
+});
+
+describe("repositories updates", () => {
+	test("PATCH updates full config and metadata using shortId", async () => {
+		const repository = await createRepositoryRecord(session.organizationId);
+		const nextPath = `/tmp/updated-${crypto.randomUUID()}`;
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "PATCH",
+			headers: {
+				...session.headers,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				name: "Updated repository",
+				compressionMode: "max",
+				config: {
+					backend: "local",
+					path: nextPath,
+					isExistingRepository: true,
+				},
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.name).toBe("Updated repository");
+		expect(body.compressionMode).toBe("max");
+		expect(body.config.backend).toBe("local");
+		expect(body.config.path).toBe(nextPath);
+		expect(body.status).toBe("unknown");
+		expect(body.lastChecked).toBeNull();
+		expect(body.lastError).toBeNull();
+		expect(body.doctorResult).toBeNull();
+		expect(body.autoCheckEnabled).toBe(true);
+
+		const updated = await db.query.repositoriesTable.findFirst({
+			where: { id: repository.id },
+		});
+
+		const config = updated?.config as Extract<RepositoryConfig, { backend: "local" }>;
+
+		expect(updated).toBeTruthy();
+		expect(updated?.name).toBe("Updated repository");
+		expect(updated?.compressionMode).toBe("max");
+		expect(config.path).toBe(nextPath);
+		expect(updated?.status).toBe("unknown");
+		expect(updated?.lastChecked).toBeNull();
+		expect(updated?.lastError).toBeNull();
+		expect(updated?.doctorResult).toBeNull();
+		expect(updated?.autoCheckEnabled).toBe(true);
+	});
+
+	test("PATCH updates automatic health check scheduling", async () => {
+		const repository = await createRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "PATCH",
+			headers: {
+				...session.headers,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({ autoCheckEnabled: false }),
+		});
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.autoCheckEnabled).toBe(false);
+
+		const updated = await db.query.repositoriesTable.findFirst({ where: { id: repository.id } });
+		expect(updated?.autoCheckEnabled).toBe(false);
+	});
+
+	test("PATCH rejects backend changes", async () => {
+		const repository = await createRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "PATCH",
+			headers: {
+				...session.headers,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				config: {
+					backend: "s3",
+					endpoint: "s3.amazonaws.com",
+					bucket: "bucket-name",
+					accessKeyId: "access-key",
+					secretAccessKey: "secret-key",
+				},
+			}),
+		});
+
+		expect(res.status).toBe(400);
+		const body = await res.json();
+		expect(body.message).toBe("Repository backend cannot be changed");
+	});
+
+	test("PATCH rejects invalid config payload", async () => {
+		const repository = await createRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "PATCH",
+			headers: {
+				...session.headers,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				config: {
+					backend: "local",
+				},
+			}),
+		});
+
+		expect(res.status).toBe(400);
+	});
+
+	describe("delete snapshot", () => {
+		test("should start snapshot deletion as a background task", async () => {
+			const repository = await createRepositoryRecord(session.organizationId);
+
+			const { restic } = await import("~/server/core/restic");
+
+			const deleteSnapshotSpy = vi
+				.spyOn(restic, "deleteSnapshots")
+				.mockImplementation(() => Effect.succeed({ success: true }));
+			const statsSpy = vi.spyOn(restic, "stats").mockImplementation(() =>
+				Effect.succeed({
+					total_size: 0,
+					total_uncompressed_size: 0,
+					compression_ratio: 0,
+					compression_progress: 0,
+					compression_space_saving: 0,
+					snapshots_count: 0,
+				}),
+			);
+
+			try {
+				const res = await app.request(`/api/v1/repositories/${repository.shortId}/snapshots/snap123`, {
+					method: "DELETE",
+					headers: session.headers,
+				});
+
+				expect(res.status).toBe(202);
+				const body = await res.json();
+				expect(body).toMatchObject({ taskId: expect.any(String), status: "started" });
+
+				await waitForExpect(() => {
+					expect(deleteSnapshotSpy).toHaveBeenCalledTimes(1);
+					expect(statsSpy).toHaveBeenCalledTimes(1);
+				});
+			} finally {
+				deleteSnapshotSpy.mockRestore();
+				statsSpy.mockRestore();
+			}
+		});
+
+		test("should mark the task failed and emit an error event when snapshot deletion fails", async () => {
+			const repository = await createRepositoryRecord(session.organizationId);
+			const failureMessage = "Fatal: unexpected HTTP response (403): 403 Forbidden";
+
+			const { restic } = await import("~/server/core/restic");
+
+			const deleteSnapshotSpy = vi
+				.spyOn(restic, "deleteSnapshots")
+				.mockImplementation(() => Effect.fail(new ResticError(1, failureMessage)));
+			const statsSpy = vi.spyOn(restic, "stats").mockImplementation(() =>
+				Effect.succeed({
+					total_size: 0,
+					total_uncompressed_size: 0,
+					compression_ratio: 0,
+					compression_progress: 0,
+					compression_space_saving: 0,
+					snapshots_count: 0,
+				}),
+			);
+
+			try {
+				const res = await app.request(`/api/v1/repositories/${repository.shortId}/snapshots/snap123`, {
+					method: "DELETE",
+					headers: session.headers,
+				});
+
+				expect(res.status).toBe(202);
+				const body = await res.json();
+				expect(body).toMatchObject({ taskId: expect.any(String), status: "started" });
+
+				await waitForExpect(async () => {
+					const task = await db.query.tasksTable.findFirst({ where: { id: body.taskId } });
+					expect(task?.status).toBe("failed");
+					expect(task?.error).toContain(failureMessage);
+				});
+
+				expect(deleteSnapshotSpy).toHaveBeenCalledTimes(1);
+				expect(statsSpy).not.toHaveBeenCalled();
+			} finally {
+				deleteSnapshotSpy.mockRestore();
+				statsSpy.mockRestore();
+			}
+		});
+	});
+
+	describe("dump snapshot", () => {
+		test("continues streaming a download after the request signal aborts", async () => {
+			const repository = await createRepositoryRecord(session.organizationId);
+			const stream = new PassThrough();
+			const expectedContent = "downloaded snapshot contents";
+
+			const snapshotsSpy = vi.spyOn(restic, "snapshots").mockReturnValue(
+				Effect.succeed([
+					{
+						id: "test-snapshot",
+						short_id: "test-snapshot",
+						time: new Date().toISOString(),
+						paths: ["/mnt/project"],
+						hostname: "host",
+					},
+				]),
+			);
+			const dumpSpy = vi.spyOn(restic, "dump").mockReturnValue(
+				Effect.succeed({
+					stream: stream as never,
+					completion: Promise.resolve(),
+					abort: vi.fn(),
+				}),
+			);
+
+			try {
+				const controller = new AbortController();
+				const response = await app.request(
+					`/api/v1/repositories/${repository.shortId}/snapshots/test-snapshot/dump`,
+					{
+						headers: session.headers,
+						signal: controller.signal,
+					},
+				);
+
+				queueMicrotask(() => {
+					controller.abort();
+					stream.end(expectedContent);
+				});
+
+				await expect(response.text()).resolves.toBe(expectedContent);
+			} finally {
+				snapshotsSpy.mockRestore();
+				dumpSpy.mockRestore();
+			}
+		});
+
+		test("returns a valid content-disposition header for non-ascii filenames", async () => {
+			const repository = await createRepositoryRecord(session.organizationId);
+
+			const stream = new PassThrough();
+			const snapshotsSpy = vi.spyOn(restic, "snapshots").mockReturnValue(
+				Effect.succeed([
+					{
+						id: "test-snapshot",
+						short_id: "test-snapshot",
+						time: new Date().toISOString(),
+						paths: ["/mnt/project"],
+						hostname: "host",
+					},
+				]),
+			);
+			const dumpSpy = vi.spyOn(restic, "dump").mockReturnValue(
+				Effect.succeed({
+					stream: stream as never,
+					completion: Promise.resolve(),
+					abort: vi.fn(),
+				}),
+			);
+
+			try {
+				stream.end("downloaded snapshot contents");
+
+				const encodedPath = encodeURIComponent("/mnt/project/möte.txt");
+				const response = await app.request(
+					`/api/v1/repositories/${repository.shortId}/snapshots/test-snapshot/dump?path=${encodedPath}&kind=file`,
+					{
+						headers: session.headers,
+					},
+				);
+
+				expect(response.status).toBe(200);
+				expect(response.headers.get("Content-Disposition")).toBe(
+					`attachment; filename="m?te.txt"; filename*=UTF-8''m%C3%B6te.txt`,
+				);
+			} finally {
+				snapshotsSpy.mockRestore();
+				dumpSpy.mockRestore();
+			}
+		});
+	});
+
+	test("GET marks provisioned repositories as managed", async () => {
+		const repository = await createManagedRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, { headers: session.headers });
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.provisioningId).toBeDefined();
+	});
+
+	test("PATCH allows updates for managed repositories", async () => {
+		const repository = await createManagedRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "PATCH",
+			headers: {
+				...session.headers,
+				"Content-Type": "application/json",
+			},
+			body: JSON.stringify({
+				name: "Updated repository",
+			}),
+		});
+
+		expect(res.status).toBe(200);
+		const body = await res.json();
+		expect(body.name).toBe("Updated repository");
+	});
+
+	test("DELETE allows managed repositories", async () => {
+		const repository = await createManagedRepositoryRecord(session.organizationId);
+
+		const res = await app.request(`/api/v1/repositories/${repository.shortId}`, {
+			method: "DELETE",
+			headers: session.headers,
+		});
+
+		expect(res.status).toBe(200);
 	});
 });

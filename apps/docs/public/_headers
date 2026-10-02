@@ -1,0 +1,8 @@
+/assets/*
+  Cache-Control: public, max-age=31556952, immutable
+
+/robots.txt
+  Cache-Control: public, max-age=3600
+
+/sitemap.xml
+  Cache-Control: public, max-age=3600

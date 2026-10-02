@@ -3,34 +3,66 @@ import { validator } from "hono-openapi";
 import {
 	downloadResticPasswordBodySchema,
 	downloadResticPasswordDto,
+	exportConfigBodySchema,
+	exportConfigDto,
 	getUpdatesDto,
 	systemInfoDto,
 	type SystemInfoDto,
 	type UpdateInfoDto,
+	importConfigBodySchema,
+	importConfigDto,
+	type ImportConfigResponseDto,
 	setRegistrationStatusDto,
 	getRegistrationStatusDto,
 	registrationStatusBody,
 	type RegistrationStatusDto,
+	getPasswordLoginStatusDto,
+	setPasswordLoginStatusDto,
+	passwordLoginStatusBody,
+	type PasswordLoginStatusDto,
+	getDevPanelDto,
+	type DevPanelDto,
 } from "./system.dto";
 import { systemService } from "./system.service";
-import { requireAuth, requireOrgAdmin } from "../auth/auth.middleware";
+import { requireAuth, requireOrgAdmin, requirePermission } from "../auth/auth.middleware";
 import { db } from "../../db/db";
-import { usersTable } from "../../db/schema";
+import { organization, usersTable } from "../../db/schema";
 import { eq } from "drizzle-orm";
-import { verifyUserPassword } from "../auth/helpers";
+import { InternalServerError } from "http-errors-enhanced";
+import { userHasPassword, verifyUserPassword } from "../auth/helpers";
 import { cryptoUtils } from "../../utils/crypto";
-import { createMiddleware } from "hono/factory";
 import { getOrganizationId } from "~/server/core/request-context";
+import {
+	createPassphraseProtectedOrganizationConfigExport,
+	OrganizationResticPasswordNotFoundError,
+	importConfig,
+} from "./config-transfer";
 
-const requireGlobalAdmin = createMiddleware(async (c, next) => {
-	const user = c.get("user");
-
-	if (!user || user.role !== "admin") {
-		return c.json({ message: "Forbidden" }, 403);
+const verifyRecoveryKeyPassword = async (userId: string, password: string, authSource: string) => {
+	if (authSource === "desktop-session") {
+		return null;
 	}
 
-	await next();
-});
+	const hasPassword = await userHasPassword(userId);
+	if (!hasPassword) {
+		return { message: "A local password is required to download the recovery key", status: 403 as const };
+	}
+
+	const isPasswordValid = await verifyUserPassword({ password, userId });
+	if (!isPasswordValid) {
+		return { message: "Invalid password", status: 401 as const };
+	}
+
+	return null;
+};
+
+const recordRecoveryKeyExport = (organizationId: string, userId: string) => {
+	const recoveryKeyExportedAt = new Date();
+	db.transaction((tx) => {
+		tx.update(organization).set({ recoveryKeyExportedAt }).where(eq(organization.id, organizationId)).run();
+		tx.update(usersTable).set({ hasDownloadedResticPassword: true }).where(eq(usersTable.id, userId)).run();
+	});
+};
 
 export const systemController = new Hono()
 	.use(requireAuth)
@@ -41,6 +73,7 @@ export const systemController = new Hono()
 	})
 	.get("/updates", getUpdatesDto, async (c) => {
 		const updates = await systemService.getUpdates();
+		c.header("Cache-Control", "no-store");
 
 		return c.json<UpdateInfoDto>(updates, 200);
 	})
@@ -51,7 +84,7 @@ export const systemController = new Hono()
 	})
 	.put(
 		"/registration-status",
-		requireGlobalAdmin,
+		requirePermission("registration.manage"),
 		setRegistrationStatusDto,
 		validator("json", registrationStatusBody),
 		async (c) => {
@@ -64,21 +97,22 @@ export const systemController = new Hono()
 	)
 	.post(
 		"/restic-password",
-		requireOrgAdmin,
+		requirePermission("recoveryKey.download"),
 		downloadResticPasswordDto,
 		validator("json", downloadResticPasswordBodySchema),
 		async (c) => {
 			const user = c.get("user");
 			const organizationId = getOrganizationId();
 			const body = c.req.valid("json");
-
-			const isPasswordValid = await verifyUserPassword({ password: body.password, userId: user.id });
-			if (!isPasswordValid) {
-				return c.json({ message: "Invalid password" }, 401);
+			const passwordError = await verifyRecoveryKeyPassword(user.id, body.password, c.get("authSource"));
+			if (passwordError) {
+				return c.json({ message: passwordError.message }, passwordError.status);
 			}
 
 			try {
-				const org = await db.query.organization.findFirst({ where: { id: organizationId } });
+				const org = await db.query.organization.findFirst({
+					where: { id: organizationId },
+				});
 
 				if (!org?.metadata?.resticPassword) {
 					return c.json({ message: "Organization Restic password not found" }, 404);
@@ -86,7 +120,7 @@ export const systemController = new Hono()
 
 				const content = await cryptoUtils.resolveSecret(org.metadata.resticPassword);
 
-				await db.update(usersTable).set({ hasDownloadedResticPassword: true }).where(eq(usersTable.id, user.id));
+				recordRecoveryKeyExport(organizationId, user.id);
 
 				c.header("Content-Type", "text/plain");
 				c.header("Content-Disposition", 'attachment; filename="restic.pass"');
@@ -96,4 +130,78 @@ export const systemController = new Hono()
 				return c.json({ message: "Failed to retrieve Restic password" }, 500);
 			}
 		},
-	);
+	)
+	.get("/password-login-status", getPasswordLoginStatusDto, async (c) => {
+		const disabled = await systemService.isPasswordLoginDisabled();
+
+		return c.json<PasswordLoginStatusDto>({ disabled }, 200);
+	})
+	.put(
+		"/password-login-status",
+		requirePermission("passwordLogin.manage"),
+		setPasswordLoginStatusDto,
+		validator("json", passwordLoginStatusBody),
+		async (c) => {
+			const body = c.req.valid("json");
+
+			await systemService.setPasswordLoginDisabled(body.disabled);
+
+			return c.json<PasswordLoginStatusDto>({ disabled: body.disabled }, 200);
+		},
+	)
+	.post(
+		"/config-export",
+		requirePermission("recoveryKey.download"),
+		exportConfigDto,
+		validator("json", exportConfigBodySchema),
+		async (c) => {
+			const user = c.get("user");
+			const organizationId = getOrganizationId();
+			const body = c.req.valid("json");
+			const passwordError = await verifyRecoveryKeyPassword(user.id, body.password, c.get("authSource"));
+			if (passwordError) {
+				return c.json({ message: passwordError.message }, passwordError.status);
+			}
+
+			let content: string;
+			try {
+				content = await createPassphraseProtectedOrganizationConfigExport(
+					organizationId,
+					body.exportPassphrase,
+				);
+			} catch (cause) {
+				if (cause instanceof OrganizationResticPasswordNotFoundError) {
+					return c.json({ message: cause.message }, 404);
+				}
+
+				throw new InternalServerError("Failed to export configuration", { cause });
+			}
+
+			recordRecoveryKeyExport(organizationId, user.id);
+
+			c.header("Content-Type", "text/plain");
+			c.header("Content-Disposition", 'attachment; filename="zerobyte-config.zbex"');
+
+			return c.text(content);
+		},
+	)
+	.post("/config-import", requireOrgAdmin, importConfigDto, validator("json", importConfigBodySchema), async (c) => {
+		const user = c.get("user");
+		const organizationId = getOrganizationId();
+		const body = c.req.valid("json");
+
+		const result = await importConfig(organizationId, user.id, body.encryptedConfig, body.exportPassphrase);
+
+		return c.json<ImportConfigResponseDto>(
+			{
+				imported: result.imported,
+				warnings: result.warnings,
+			},
+			200,
+		);
+	})
+	.get("/dev-panel", getDevPanelDto, async (c) => {
+		const enabled = systemService.isDevPanelEnabled();
+
+		return c.json<DevPanelDto>({ enabled }, 200);
+	});

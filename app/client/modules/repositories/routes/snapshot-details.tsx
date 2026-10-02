@@ -1,96 +1,90 @@
-import { useQuery } from "@tanstack/react-query";
-import { redirect, useParams, Link, Await } from "react-router";
-import { listBackupSchedulesOptions, listSnapshotFilesOptions } from "~/client/api-client/@tanstack/react-query.gen";
+import { useQuery, useSuspenseQuery } from "@tanstack/react-query";
+import {
+	getRepositoryOptions,
+	getSnapshotDetailsOptions,
+	listBackupSchedulesOptions,
+} from "~/client/api-client/@tanstack/react-query.gen";
+import type { GetSnapshotDetailsResponse } from "~/client/api-client/types.gen";
 import { Button } from "~/client/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "~/client/components/ui/card";
 import { SnapshotFileBrowser } from "~/client/modules/backups/components/snapshot-file-browser";
-import { formatDateTime } from "~/client/lib/datetime";
-import { parseError } from "~/client/lib/errors";
-import { getRepository, getSnapshotDetails } from "~/client/api-client";
-import type { Route } from "./+types/snapshot-details";
-import { Suspense, useState } from "react";
+import { useTimeFormat } from "~/client/lib/datetime";
+import { BackupSummaryCard } from "~/client/components/backup-summary-card";
+import { useState } from "react";
 import { Database } from "lucide-react";
+import { Link, useParams } from "@tanstack/react-router";
+import { getVolumeMountPath } from "~/client/lib/volume-path";
 
-export const handle = {
-	breadcrumb: (match: Route.MetaArgs) => [
-		{ label: "Repositories", href: "/repositories" },
-		{ label: match.loaderData?.repository.name || match.params.id, href: `/repositories/${match.params.id}` },
-		{ label: match.params.snapshotId },
-	],
+const SnapshotError = () => {
+	const { repositoryId } = useParams({ from: "/(dashboard)/repositories/$repositoryId/$snapshotId/" });
+
+	return (
+		<Card>
+			<CardContent className="flex flex-col items-center justify-center text-center py-12">
+				<Database className="mb-4 h-12 w-12 text-destructive" />
+				<p className="text-destructive font-semibold">Snapshot not found</p>
+				<p className="text-sm text-muted-foreground mt-2">This snapshot does not exist in this repository</p>
+				<p className="text-sm text-muted-foreground mt-1">It may have been deleted manually outside of Zerobyte.</p>
+				<div className="mt-4">
+					<Link to={`/repositories/$repositoryId`} search={() => ({ tab: "snapshots" })} params={{ repositoryId }}>
+						<Button variant="outline">Back to repository</Button>
+					</Link>
+				</div>
+			</CardContent>
+		</Card>
+	);
 };
 
-export function meta({ params }: Route.MetaArgs) {
-	return [
-		{ title: `Zerobyte - Snapshot ${params.snapshotId}` },
-		{
-			name: "description",
-			content: "Browse and restore files from a backup snapshot.",
-		},
-	];
-}
+const SnapshotFileBrowserSkeleton = () => (
+	<div className="space-y-4">
+		<Card className="h-150 flex flex-col">
+			<CardHeader>
+				<CardTitle>File Browser</CardTitle>
+			</CardHeader>
+			<CardContent className="flex-1 overflow-hidden flex flex-col p-0">
+				<div className="overflow-auto flex-1 min-h-0 border border-border rounded-md bg-card m-4 flex flex-col items-center justify-center p-6 text-center">
+					<p className="text-muted-foreground">Loading snapshot...</p>
+				</div>
+			</CardContent>
+		</Card>
+	</div>
+);
 
-export const clientLoader = async ({ params }: Route.ClientLoaderArgs) => {
-	const [snapshot, repository] = await Promise.all([
-		getSnapshotDetails({
-			path: { id: params.id, snapshotId: params.snapshotId },
-		}),
-		getRepository({ path: { id: params.id } }),
-	]);
-
-	if (!repository.data) return redirect("/repositories");
-
-	return {
-		snapshot: snapshot,
-		repository: repository.data,
-		snapshotError: parseError(snapshot.error)?.message ?? null,
-	};
+type Props = {
+	repositoryId: string;
+	snapshotId: string;
+	initialSnapshot?: GetSnapshotDetailsResponse;
 };
 
-export default function SnapshotDetailsPage({ loaderData }: Route.ComponentProps) {
-	const { id, snapshotId } = useParams<{
-		id: string;
-		snapshotId: string;
-	}>();
-
+export function SnapshotDetailsPage({ repositoryId, snapshotId, initialSnapshot }: Props) {
 	const [showAllPaths, setShowAllPaths] = useState(false);
+	const { formatDateTime } = useTimeFormat();
 
-	const { data } = useQuery({
-		...listSnapshotFilesOptions({
-			path: { id: id ?? "", snapshotId: snapshotId ?? "" },
-			query: { path: "/" },
-		}),
-		enabled: !!id && !!snapshotId && !loaderData.snapshotError,
+	const { data: repository } = useSuspenseQuery({
+		...getRepositoryOptions({ path: { shortId: repositoryId } }),
 	});
 
-	const schedules = useQuery({
+	const { data: schedules } = useSuspenseQuery({
 		...listBackupSchedulesOptions(),
 	});
 
-	if (!id || !snapshotId) {
-		return (
-			<div className="flex items-center justify-center h-full">
-				<p className="text-destructive">Invalid snapshot reference</p>
-			</div>
-		);
-	}
+	const { data, error } = useQuery({
+		...getSnapshotDetailsOptions({ path: { shortId: repositoryId, snapshotId: snapshotId } }),
+		initialData: initialSnapshot,
+	});
+	const backupSchedule = schedules?.find((s) => data?.tags?.includes(s.shortId));
 
-	if (loaderData.snapshotError) {
+	if (error) {
 		return (
-			<Card>
-				<CardContent className="flex flex-col items-center justify-center text-center py-12">
-					<Database className="mb-4 h-12 w-12 text-destructive" />
-					<p className="text-destructive font-semibold">Snapshot not found</p>
-					<p className="text-sm text-muted-foreground mt-2">
-						This snapshot does not exist in {loaderData.repository.name}.
-					</p>
-					<p className="text-sm text-muted-foreground mt-1">It may have been deleted manually outside of Zerobyte.</p>
-					<div className="mt-4">
-						<Link to={`/repositories/${id}?tab=snapshots`}>
-							<Button variant="outline">Back to repository</Button>
-						</Link>
+			<>
+				<div className="flex items-center justify-between mb-4">
+					<div>
+						<h1 className="text-2xl font-bold">{repository.name}</h1>
+						<p className="text-sm text-muted-foreground">Snapshot: {snapshotId}</p>
 					</div>
-				</CardContent>
-			</Card>
+				</div>
+				<SnapshotError />
+			</>
 		);
 	}
 
@@ -98,29 +92,22 @@ export default function SnapshotDetailsPage({ loaderData }: Route.ComponentProps
 		<div className="space-y-4">
 			<div className="flex items-center justify-between">
 				<div>
-					<h1 className="text-2xl font-bold">{loaderData.repository.name}</h1>
+					<h1 className="text-2xl font-bold">{repository.name}</h1>
 					<p className="text-sm text-muted-foreground">Snapshot: {snapshotId}</p>
 				</div>
 			</div>
 
-			<Suspense
-				fallback={
-					<SnapshotFileBrowser
-						repositoryId={id}
-						snapshot={{ duration: 0, paths: [], short_id: "", size: 0, tags: [], time: 0, retentionCategories: [] }}
-					/>
-				}
-			>
-				<Await resolve={loaderData.snapshot}>
-					{(value) => {
-						if (!value.data) return <div className="text-destructive">Snapshot data not found.</div>;
+			{data ? (
+				<SnapshotFileBrowser
+					repositoryId={repositoryId}
+					snapshot={data}
+					displayBasePath={backupSchedule ? getVolumeMountPath(backupSchedule.volume) : undefined}
+				/>
+			) : (
+				<SnapshotFileBrowserSkeleton />
+			)}
 
-						return <SnapshotFileBrowser repositoryId={id} snapshot={value.data} />;
-					}}
-				</Await>
-			</Suspense>
-
-			{data?.snapshot && (
+			{data && (
 				<Card>
 					<CardHeader>
 						<CardTitle>Snapshot Information</CardTitle>
@@ -129,69 +116,60 @@ export default function SnapshotDetailsPage({ loaderData }: Route.ComponentProps
 						<div className="grid grid-cols-2 gap-4">
 							<div>
 								<span className="text-muted-foreground">Snapshot ID:</span>
-								<p className="font-mono break-all">{data.snapshot.id}</p>
-							</div>
-							<div>
-								<span className="text-muted-foreground">Short ID:</span>
-								<p className="font-mono break-all">{data.snapshot.short_id}</p>
+								<p className="font-mono break-all">{data.short_id}</p>
 							</div>
 							<div>
 								<span className="text-muted-foreground">Hostname:</span>
-								<p>{data.snapshot.hostname}</p>
+								<p>{data.hostname}</p>
 							</div>
 							<div>
 								<span className="text-muted-foreground">Time:</span>
-								<p>{formatDateTime(data.snapshot.time)}</p>
+								<p>{formatDateTime(data.time)}</p>
 							</div>
-							<Suspense fallback={<div>Loading...</div>}>
-								<Await resolve={loaderData.snapshot}>
-									{(value) => {
-										if (!value.data) return null;
-
-										const backupSchedule = schedules.data?.find((s) => value.data.tags.includes(s.shortId));
-
-										return (
-											<>
-												<div>
-													<span className="text-muted-foreground">Backup Schedule:</span>
-													<p>
-														<Link to={`/backups/${backupSchedule?.id}`} className="text-primary hover:underline">
-															{backupSchedule?.name}
-														</Link>
-													</p>
-												</div>
-												<div>
-													<span className="text-muted-foreground">Volume:</span>
-													<p>
-														<Link
-															to={`/volumes/${backupSchedule?.volume.shortId}`}
-															className="text-primary hover:underline"
-														>
-															{backupSchedule?.volume.name}
-														</Link>
-													</p>
-												</div>
-											</>
-										);
-									}}
-								</Await>
-							</Suspense>
+							{backupSchedule && (
+								<>
+									<div>
+										<span className="text-muted-foreground">Backup Schedule:</span>
+										<p>
+											<Link
+												to="/backups/$backupId"
+												className="text-primary hover:underline"
+												params={{ backupId: backupSchedule.shortId }}
+											>
+												{backupSchedule?.name}
+											</Link>
+										</p>
+									</div>
+									<div>
+										<span className="text-muted-foreground">Volume:</span>
+										<p>
+											<Link
+												to={`/volumes/$volumeId`}
+												className="text-primary hover:underline"
+												params={{ volumeId: backupSchedule.volume.shortId }}
+											>
+												{backupSchedule?.volume.name}
+											</Link>
+										</p>
+									</div>
+								</>
+							)}
 
 							<div className="col-span-2">
 								<span className="text-muted-foreground">Paths:</span>
 								<div className="space-y-1 mt-1">
-									{data.snapshot.paths.slice(0, showAllPaths ? undefined : 20).map((path) => (
+									{data.paths.slice(0, showAllPaths ? undefined : 20).map((path) => (
 										<p key={path} className="font-mono text-xs bg-muted px-2 py-1 rounded break-all">
 											{path}
 										</p>
 									))}
-									{data.snapshot.paths.length > 20 && (
+									{data.paths.length > 20 && (
 										<button
 											type="button"
 											onClick={() => setShowAllPaths(!showAllPaths)}
 											className="text-xs text-primary hover:underline mt-1"
 										>
-											{showAllPaths ? "Show less" : `+ ${data.snapshot.paths.length - 20} more`}
+											{showAllPaths ? "Show less" : `+ ${data.paths.length - 20} more`}
 										</button>
 									)}
 								</div>
@@ -200,6 +178,7 @@ export default function SnapshotDetailsPage({ loaderData }: Route.ComponentProps
 					</CardContent>
 				</Card>
 			)}
+			{data && <BackupSummaryCard summary={data.summary} />}
 		</div>
 	);
 }

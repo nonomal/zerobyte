@@ -1,4 +1,4 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useMutation, useSuspenseQuery } from "@tanstack/react-query";
 import {
 	DndContext,
 	closestCenter,
@@ -10,52 +10,27 @@ import {
 } from "@dnd-kit/core";
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, rectSortingStrategy } from "@dnd-kit/sortable";
 import { CalendarClock, Plus } from "lucide-react";
-import { Link } from "react-router";
-import { useState, useEffect } from "react";
+import { useState } from "react";
 import { EmptyState } from "~/client/components/empty-state";
 import { Button } from "~/client/components/ui/button";
-import { Card, CardContent } from "~/client/components/ui/card";
-import type { Route } from "./+types/backups";
-import { listBackupSchedules } from "~/client/api-client";
 import {
 	listBackupSchedulesOptions,
 	reorderBackupSchedulesMutation,
 } from "~/client/api-client/@tanstack/react-query.gen";
 import { SortableCard } from "~/client/components/sortable-card";
 import { BackupCard } from "../components/backup-card";
+import { Link } from "@tanstack/react-router";
+import { useActiveBackupTasks } from "../backup-tasks";
 
-export const handle = {
-	breadcrumb: () => [{ label: "Backups" }],
-};
-
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Backup Jobs" },
-		{
-			name: "description",
-			content: "Automate volume backups with scheduled jobs and retention policies.",
-		},
-	];
-}
-
-export const clientLoader = async () => {
-	const jobs = await listBackupSchedules();
-	if (jobs.data) return jobs.data;
-	return [];
-};
-
-export default function Backups({ loaderData }: Route.ComponentProps) {
-	const { data: schedules, isLoading } = useQuery({
+export function BackupsPage() {
+	const { data: schedules } = useSuspenseQuery({
 		...listBackupSchedulesOptions(),
-		initialData: loaderData,
 	});
+	const { data: activeBackupTasks } = useActiveBackupTasks();
+	const activeScheduleShortIds = new Set(activeBackupTasks.map((task) => task.resourceId));
 
-	const [items, setItems] = useState(schedules?.map((s) => s.id) ?? []);
-	useEffect(() => {
-		if (schedules) {
-			setItems(schedules.map((s) => s.id));
-		}
-	}, [schedules]);
+	const [localItems, setLocalItems] = useState<string[] | null>(null);
+	const items = localItems ?? schedules?.map((s) => s.shortId) ?? [];
 
 	const sensors = useSensors(
 		useSensor(PointerSensor, {
@@ -74,24 +49,34 @@ export default function Backups({ loaderData }: Route.ComponentProps) {
 		const { active, over } = event;
 
 		if (over && active.id !== over.id) {
-			setItems((items) => {
-				const oldIndex = items.indexOf(active.id as number);
-				const newIndex = items.indexOf(over.id as number);
-				const newItems = arrayMove(items, oldIndex, newIndex);
-				reorderMutation.mutate({ body: { scheduleIds: newItems } });
+			setLocalItems((currentItems) => {
+				const baseItems = currentItems ?? schedules?.map((s) => s.shortId) ?? [];
+				const activeId = String(active.id);
+				const overId = String(over.id);
+				let oldIndex = baseItems.indexOf(activeId);
+				let newIndex = baseItems.indexOf(overId);
+
+				if (oldIndex === -1 || newIndex === -1) {
+					const freshItems = schedules?.map((s) => s.shortId) ?? [];
+					oldIndex = freshItems.indexOf(activeId);
+					newIndex = freshItems.indexOf(overId);
+
+					if (oldIndex === -1 || newIndex === -1) {
+						return currentItems;
+					}
+
+					const newItems = arrayMove(freshItems, oldIndex, newIndex);
+					reorderMutation.mutate({ body: { scheduleShortIds: newItems } });
+					return newItems;
+				}
+
+				const newItems = arrayMove(baseItems, oldIndex, newIndex);
+				reorderMutation.mutate({ body: { scheduleShortIds: newItems } });
 
 				return newItems;
 			});
 		}
 	};
-
-	if (isLoading) {
-		return (
-			<div className="flex items-center justify-center h-full">
-				<p className="text-muted-foreground">Loading backup schedules...</p>
-			</div>
-		);
-	}
 
 	if (!schedules || schedules.length === 0) {
 		return (
@@ -111,29 +96,36 @@ export default function Backups({ loaderData }: Route.ComponentProps) {
 		);
 	}
 
-	const scheduleMap = new Map(schedules.map((s) => [s.id, s]));
+	const scheduleMap = new Map(schedules.map((s) => [s.shortId, s]));
 
 	return (
-		<div className="container mx-auto space-y-6">
+		<div className="container @container mx-auto space-y-6">
 			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
 				<SortableContext items={items} strategy={rectSortingStrategy}>
-					<div className="grid gap-4 @md:grid-cols-1 @lg:grid-cols-2 @2xl:grid-cols-3 auto-rows-fr">
+					<div className="grid gap-4 @narrow:grid-cols-1 @medium:grid-cols-2 @wide:grid-cols-3 auto-rows-fr">
 						{items.map((id) => {
 							const schedule = scheduleMap.get(id);
 							if (!schedule) return null;
 							return (
 								<SortableCard uniqueId={id} key={schedule.id}>
-									<BackupCard schedule={schedule} />
+									<BackupCard
+										schedule={schedule}
+										isRunning={activeScheduleShortIds.has(schedule.shortId)}
+									/>
 								</SortableCard>
 							);
 						})}
-						<Link to="/backups/create">
-							<Card className="flex flex-col items-center justify-center h-full hover:bg-muted/50 transition-colors cursor-pointer">
-								<CardContent className="flex flex-col items-center justify-center gap-2">
-									<Plus className="h-8 w-8 text-muted-foreground" />
-									<span className="text-sm font-medium text-muted-foreground">Create a backup job</span>
-								</CardContent>
-							</Card>
+						<Link to="/backups/create" className="h-full">
+							<div className="group flex flex-col items-center justify-center h-full min-h-50 border-2 border-dashed border-border/60 bg-muted/20 dark:bg-card hover:bg-muted/40 dark:hover:bg-card/50 transition-all cursor-pointer rounded-xl hover:shadow-[0_8px_30px_-15px_rgba(0,0,0,0.05)] dark:hover:shadow-sm hover:border-border hover:-translate-y-[1px] active:scale-[0.98] duration-300">
+								<div className="flex flex-col items-center justify-center gap-3">
+									<div className="p-3 rounded-full bg-background/50 dark:bg-muted/20 group-hover:bg-background dark:group-hover:bg-muted/50 transition-all group-hover:scale-110 duration-300 shadow-xs dark:shadow-none">
+										<Plus className="h-6 w-6 text-muted-foreground group-hover:text-foreground transition-colors" />
+									</div>
+									<span className="text-sm font-medium text-muted-foreground group-hover:text-foreground transition-colors">
+										Create a backup job
+									</span>
+								</div>
+							</div>
 						</Link>
 					</div>
 				</SortableContext>

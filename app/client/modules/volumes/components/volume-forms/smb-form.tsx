@@ -1,4 +1,4 @@
-import type { UseFormReturn } from "react-hook-form";
+import { useWatch, type UseFormReturn } from "react-hook-form";
 import type { FormValues } from "../create-volume-form";
 import {
 	FormControl,
@@ -17,7 +17,7 @@ type Props = {
 };
 
 export const SMBForm = ({ form }: Props) => {
-	const guest = form.watch("guest");
+	const guest = useWatch({ control: form.control, name: "guest" });
 
 	return (
 		<>
@@ -60,6 +60,7 @@ export const SMBForm = ({ form }: Props) => {
 							<div className="flex items-center space-x-2">
 								<input
 									type="checkbox"
+									aria-label="Connect as guest"
 									checked={field.value ?? false}
 									onChange={(e) => {
 										field.onChange(e.target.checked);
@@ -83,12 +84,7 @@ export const SMBForm = ({ form }: Props) => {
 					<FormItem>
 						<FormLabel>Username</FormLabel>
 						<FormControl>
-							<Input
-								placeholder="admin"
-								value={field.value}
-								onChange={field.onChange}
-								disabled={guest}
-							/>
+							<Input placeholder="admin" value={field.value} onChange={field.onChange} disabled={guest} />
 						</FormControl>
 						<FormDescription>Username for SMB authentication.</FormDescription>
 						<FormMessage />
@@ -175,6 +171,33 @@ export const SMBForm = ({ form }: Props) => {
 			/>
 			<FormField
 				control={form.control}
+				name="mapToContainerUidGid"
+				defaultValue={false}
+				render={({ field }) => (
+					<FormItem>
+						<FormLabel>Ownership Mapping</FormLabel>
+						<FormControl>
+							<div className="flex items-center space-x-2">
+								<input
+									type="checkbox"
+									aria-label="Map all files to container user/group"
+									checked={field.value ?? false}
+									onChange={(e) => field.onChange(e.target.checked)}
+									className="rounded border-gray-300"
+								/>
+								<span className="text-sm">Map all files to container user/group</span>
+							</div>
+						</FormControl>
+						<FormDescription>
+							Keep the old behavior by forcing the SMB mount to present every file and directory as owned
+							by the container user and group instead of using server reported ownership.
+						</FormDescription>
+						<FormMessage />
+					</FormItem>
+				)}
+			/>
+			<FormField
+				control={form.control}
 				name="readOnly"
 				defaultValue={false}
 				render={({ field }) => (
@@ -184,6 +207,7 @@ export const SMBForm = ({ form }: Props) => {
 							<div className="flex items-center space-x-2">
 								<input
 									type="checkbox"
+									aria-label="Mount volume as read-only"
 									checked={field.value ?? false}
 									onChange={(e) => field.onChange(e.target.checked)}
 									className="rounded border-gray-300"

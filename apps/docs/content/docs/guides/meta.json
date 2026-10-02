@@ -1,0 +1,18 @@
+{
+	"title": "Guides",
+	"pages": [
+		"3-2-1-backup-strategy",
+		"restoring",
+		"backup-webhooks",
+		"performance-tuning",
+		"mounted-shares-and-acls",
+		"notifications",
+		"recovery-key-and-repository-passwords",
+		"repository-maintenance",
+		"oidc-sso",
+		"provisioning",
+		"reverse-proxy",
+		"tailscale",
+		"rclone"
+	]
+}

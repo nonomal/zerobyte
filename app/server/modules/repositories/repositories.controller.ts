@@ -1,5 +1,8 @@
+import { Readable } from "node:stream";
 import { Hono } from "hono";
 import { validator } from "hono-openapi";
+import { streamSSE } from "hono/streaming";
+import { create } from "content-disposition";
 import {
 	createRepositoryBody,
 	createRepositoryDto,
@@ -8,8 +11,9 @@ import {
 	deleteSnapshotsBody,
 	deleteSnapshotsDto,
 	startDoctorDto,
-	cancelDoctorDto,
 	getRepositoryDto,
+	getRepositoryStatsDto,
+	refreshRepositoryStatsDto,
 	getSnapshotDetailsDto,
 	refreshSnapshotsDto,
 	listRcloneRemotesDto,
@@ -18,18 +22,24 @@ import {
 	listSnapshotFilesQuery,
 	listSnapshotsDto,
 	listSnapshotsFilters,
+	dumpSnapshotDto,
+	dumpSnapshotQuery,
 	restoreSnapshotBody,
 	restoreSnapshotDto,
 	tagSnapshotsBody,
 	tagSnapshotsDto,
 	updateRepositoryBody,
 	updateRepositoryDto,
+	devPanelExecBody,
+	devPanelExecDto,
+	unlockRepositoryDto,
 	type DeleteRepositoryDto,
 	type DeleteSnapshotDto,
 	type DeleteSnapshotsResponseDto,
 	type StartDoctorDto,
-	type CancelDoctorDto,
 	type GetRepositoryDto,
+	type GetRepositoryStatsDto,
+	type RefreshRepositoryStatsDto,
 	type GetSnapshotDetailsDto,
 	type RefreshSnapshotsDto,
 	type ListRepositoriesDto,
@@ -38,14 +48,15 @@ import {
 	type RestoreSnapshotDto,
 	type TagSnapshotsResponseDto,
 	type UpdateRepositoryDto,
+	type UnlockRepositoryDto,
 } from "./repositories.dto";
 import { repositoriesService } from "./repositories.service";
-import { backupsService } from "../backups/backups.service";
 import { getRcloneRemoteInfo, listRcloneRemotes } from "../../utils/rclone";
-import { requireAuth } from "../auth/auth.middleware";
-import { computeRetentionCategories } from "../../utils/retention-categories";
-import { logger } from "~/server/utils/logger";
+import { requireAuth, requireOrgAdmin, requireUserSession } from "../auth/auth.middleware";
 import { toMessage } from "~/server/utils/errors";
+import { requireDevPanel } from "../auth/dev-panel.middleware";
+import { getSnapshotDuration } from "../../utils/snapshots";
+import { asShortId } from "~/server/utils/branded";
 
 export const repositoriesController = new Hono()
 	.use(requireAuth)
@@ -56,7 +67,12 @@ export const repositoriesController = new Hono()
 	})
 	.post("/", createRepositoryDto, validator("json", createRepositoryBody), async (c) => {
 		const body = c.req.valid("json");
-		const res = await repositoriesService.createRepository(body.name, body.config, body.compressionMode);
+		const res = await repositoriesService.createRepository(
+			body.name,
+			body.config,
+			body.compressionMode,
+			body.autoCheckEnabled,
+		);
 
 		return c.json({ message: "Repository created", repository: res.repository }, 201);
 	})
@@ -75,81 +91,80 @@ export const repositoriesController = new Hono()
 
 		return c.json(remotes);
 	})
-	.get("/:id", getRepositoryDto, async (c) => {
-		const { id } = c.req.param();
-		const res = await repositoriesService.getRepository(id);
+	.get("/:shortId", getRepositoryDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const res = await repositoriesService.getRepository(shortId);
 
 		return c.json<GetRepositoryDto>(res.repository, 200);
 	})
-	.delete("/:id", deleteRepositoryDto, async (c) => {
-		const { id } = c.req.param();
-		await repositoriesService.deleteRepository(id);
+	.get("/:shortId/stats", getRepositoryStatsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const stats = await repositoriesService.getRepositoryStats(shortId);
+
+		return c.json<GetRepositoryStatsDto>(stats, 200);
+	})
+	.post("/:shortId/stats/refresh", refreshRepositoryStatsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const stats = await repositoriesService.refreshRepositoryStats(shortId);
+
+		return c.json<RefreshRepositoryStatsDto>(stats, 200);
+	})
+	.delete("/:shortId", deleteRepositoryDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		await repositoriesService.deleteRepository(shortId);
 
 		return c.json<DeleteRepositoryDto>({ message: "Repository deleted" }, 200);
 	})
-	.get("/:id/snapshots", listSnapshotsDto, validator("query", listSnapshotsFilters), async (c) => {
-		const { id } = c.req.param();
+	.get("/:shortId/snapshots", listSnapshotsDto, validator("query", listSnapshotsFilters), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const { backupId } = c.req.valid("query");
-		const res = await repositoriesService.listSnapshots(id, backupId);
+		const backupShortId = backupId ? asShortId(backupId) : undefined;
 
-		let retentionCategories: Map<string, string[]> = new Map();
-		if (backupId) {
-			try {
-				const schedule = await backupsService.getScheduleByShortId(backupId);
-				const snapshotsForCategories = res.map((snapshot) => ({
-					short_id: snapshot.short_id,
-					time: new Date(snapshot.time).getTime(),
-				}));
-				retentionCategories = computeRetentionCategories(snapshotsForCategories, schedule.retentionPolicy);
-			} catch (error) {
-				logger.warn(`Failed to fetch retention policy for backup ID ${backupId}`, toMessage(error));
-			}
-		}
+		const [res, retentionCategories] = await Promise.all([
+			repositoriesService.listSnapshots(shortId, backupShortId),
+			repositoriesService.getRetentionCategories(shortId, backupShortId),
+		]);
 
 		const snapshots = res.map((snapshot) => {
 			const { summary } = snapshot;
 
-			let duration = 0;
-			if (summary) {
-				const { backup_start, backup_end } = summary;
-				duration = new Date(backup_end).getTime() - new Date(backup_start).getTime();
-			}
+			const duration = getSnapshotDuration(summary);
 
 			return {
 				short_id: snapshot.short_id,
+				hostname: snapshot.hostname,
 				duration,
 				paths: snapshot.paths,
 				tags: snapshot.tags ?? [],
-				size: summary?.total_bytes_processed || 0,
+				size: summary?.total_bytes_processed ?? 0,
 				time: new Date(snapshot.time).getTime(),
 				retentionCategories: retentionCategories.get(snapshot.short_id) ?? [],
+				summary: summary,
 			};
 		});
 
 		return c.json<ListSnapshotsDto>(snapshots, 200);
 	})
-	.post("/:id/snapshots/refresh", refreshSnapshotsDto, async (c) => {
-		const { id } = c.req.param();
-		const result = await repositoriesService.refreshSnapshots(id);
+	.post("/:shortId/snapshots/refresh", refreshSnapshotsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const result = await repositoriesService.refreshSnapshots(shortId);
 
 		return c.json<RefreshSnapshotsDto>(result, 200);
 	})
-	.get("/:id/snapshots/:snapshotId", getSnapshotDetailsDto, async (c) => {
-		const { id, snapshotId } = c.req.param();
-		const snapshot = await repositoriesService.getSnapshotDetails(id, snapshotId);
+	.get("/:shortId/snapshots/:snapshotId", getSnapshotDetailsDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const snapshotId = c.req.param("snapshotId");
+		const snapshot = await repositoriesService.getSnapshotDetails(shortId, snapshotId);
 
-		let duration = 0;
-		if (snapshot.summary) {
-			const { backup_start, backup_end } = snapshot.summary;
-			duration = new Date(backup_end).getTime() - new Date(backup_start).getTime();
-		}
+		const duration = getSnapshotDuration(snapshot.summary);
 
 		const response = {
 			short_id: snapshot.short_id,
 			duration,
 			time: new Date(snapshot.time).getTime(),
 			paths: snapshot.paths,
-			size: snapshot.summary?.total_bytes_processed || 0,
+			hostname: snapshot.hostname,
+			size: snapshot.summary?.total_bytes_processed ?? 0,
 			tags: snapshot.tags ?? [],
 			retentionCategories: [],
 			summary: snapshot.summary,
@@ -158,70 +173,152 @@ export const repositoriesController = new Hono()
 		return c.json<GetSnapshotDetailsDto>(response, 200);
 	})
 	.get(
-		"/:id/snapshots/:snapshotId/files",
+		"/:shortId/snapshots/:snapshotId/files",
 		listSnapshotFilesDto,
 		validator("query", listSnapshotFilesQuery),
 		async (c) => {
-			const { id, snapshotId } = c.req.param();
+			const shortId = asShortId(c.req.param("shortId"));
+			const snapshotId = c.req.param("snapshotId");
 			const { path, ...query } = c.req.valid("query");
 
 			const decodedPath = path ? decodeURIComponent(path) : undefined;
 
-			const offset = Math.max(0, Number.parseInt(query.offset ?? "0", 10) || 0);
-			const limit = Math.min(1000, Math.max(1, Number.parseInt(query.limit ?? "500", 10) || 500));
+			const offset = Math.max(0, query.offset ?? 0);
+			const limit = Math.min(1000, Math.max(1, query.limit ?? 500));
 
-			const result = await repositoriesService.listSnapshotFiles(id, snapshotId, decodedPath, { offset, limit });
+			const result = await repositoriesService.listSnapshotFiles(shortId, snapshotId, decodedPath, {
+				offset,
+				limit,
+			});
 
 			c.header("Cache-Control", "max-age=300, stale-while-revalidate=600");
 
 			return c.json<ListSnapshotFilesDto>(result, 200);
 		},
 	)
-	.post("/:id/restore", restoreSnapshotDto, validator("json", restoreSnapshotBody), async (c) => {
-		const { id } = c.req.param();
-		const { snapshotId, ...options } = c.req.valid("json");
-		const result = await repositoriesService.restoreSnapshot(id, snapshotId, options);
+	.get("/:shortId/snapshots/:snapshotId/dump", dumpSnapshotDto, validator("query", dumpSnapshotQuery), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const snapshotId = c.req.param("snapshotId");
+		const { path, kind } = c.req.valid("query");
 
-		return c.json<RestoreSnapshotDto>(result, 200);
+		const dumpStream = await repositoriesService.dumpSnapshot(shortId, snapshotId, path, kind);
+		const sourceStream = Readable.toWeb(dumpStream.stream) as unknown as ReadableStream<Uint8Array>;
+		const reader = sourceStream.getReader();
+		const webStream = new ReadableStream<Uint8Array>({
+			async pull(controller) {
+				try {
+					const { done, value } = await reader.read();
+
+					if (done) {
+						controller.close();
+						return;
+					}
+
+					controller.enqueue(value);
+				} catch (error) {
+					controller.error(error);
+				}
+			},
+			async cancel(reason) {
+				dumpStream.abort();
+				await reader.cancel(reason).catch(() => {});
+			},
+		});
+		const filename = dumpStream.filename || "snapshot.tar";
+
+		return new Response(webStream, {
+			status: 200,
+			headers: {
+				"Content-Type": dumpStream.contentType,
+				"Content-Disposition": create(filename, {
+					fallback: filename.replace(/[^\x20-\x7E]/g, "?"),
+				}),
+				"X-Content-Type-Options": "nosniff",
+			},
+		});
 	})
-	.post("/:id/doctor", startDoctorDto, async (c) => {
-		const { id } = c.req.param();
+	.post("/:shortId/restore", restoreSnapshotDto, validator("json", restoreSnapshotBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const { snapshotId, ...options } = c.req.valid("json");
+		const result = await repositoriesService.restoreSnapshot(shortId, snapshotId, options);
 
-		const result = await repositoriesService.startDoctor(id);
+		return c.json<RestoreSnapshotDto>(result, 202);
+	})
+	.post("/:shortId/doctor", startDoctorDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+
+		const result = await repositoriesService.startDoctor(shortId);
 
 		return c.json<StartDoctorDto>(result, 202);
 	})
-	.delete("/:id/doctor", cancelDoctorDto, async (c) => {
-		const { id } = c.req.param();
+	.post("/:shortId/unlock", unlockRepositoryDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 
-		const result = await repositoriesService.cancelDoctor(id);
+		const result = await repositoriesService.unlockRepository(shortId);
 
-		return c.json<CancelDoctorDto>(result, 200);
+		return c.json<UnlockRepositoryDto>(result, 200);
 	})
-	.delete("/:id/snapshots/:snapshotId", deleteSnapshotDto, async (c) => {
-		const { id, snapshotId } = c.req.param();
-		await repositoriesService.deleteSnapshot(id, snapshotId);
+	.delete("/:shortId/snapshots/:snapshotId", deleteSnapshotDto, async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
+		const snapshotId = c.req.param("snapshotId");
+		const result = await repositoriesService.deleteSnapshot(shortId, snapshotId);
 
-		return c.json<DeleteSnapshotDto>({ message: "Snapshot deleted" }, 200);
+		return c.json<DeleteSnapshotDto>(result, 202);
 	})
-	.delete("/:id/snapshots", deleteSnapshotsDto, validator("json", deleteSnapshotsBody), async (c) => {
-		const { id } = c.req.param();
+	.delete("/:shortId/snapshots", deleteSnapshotsDto, validator("json", deleteSnapshotsBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const { snapshotIds } = c.req.valid("json");
-		await repositoriesService.deleteSnapshots(id, snapshotIds);
+		const result = await repositoriesService.deleteSnapshots(shortId, snapshotIds);
 
-		return c.json<DeleteSnapshotsResponseDto>({ message: "Snapshots deleted" }, 200);
+		return c.json<DeleteSnapshotsResponseDto>(result, 202);
 	})
-	.post("/:id/snapshots/tag", tagSnapshotsDto, validator("json", tagSnapshotsBody), async (c) => {
-		const { id } = c.req.param();
+	.post("/:shortId/snapshots/tag", tagSnapshotsDto, validator("json", tagSnapshotsBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const { snapshotIds, ...tags } = c.req.valid("json");
-		await repositoriesService.tagSnapshots(id, snapshotIds, tags);
+		const result = await repositoriesService.tagSnapshots(shortId, snapshotIds, tags);
 
-		return c.json<TagSnapshotsResponseDto>({ message: "Snapshots tagged" }, 200);
+		return c.json<TagSnapshotsResponseDto>(result, 202);
 	})
-	.patch("/:id", updateRepositoryDto, validator("json", updateRepositoryBody), async (c) => {
-		const { id } = c.req.param();
+	.patch("/:shortId", updateRepositoryDto, validator("json", updateRepositoryBody), async (c) => {
+		const shortId = asShortId(c.req.param("shortId"));
 		const body = c.req.valid("json");
-		const res = await repositoriesService.updateRepository(id, body);
+		const res = await repositoriesService.updateRepository(shortId, body);
 
 		return c.json<UpdateRepositoryDto>(res.repository, 200);
-	});
+	})
+	.post(
+		"/:shortId/exec",
+		requireUserSession,
+		requireDevPanel,
+		requireOrgAdmin,
+		devPanelExecDto,
+		validator("json", devPanelExecBody),
+		async (c) => {
+			const shortId = asShortId(c.req.param("shortId"));
+			const body = c.req.valid("json");
+
+			return streamSSE(c, async (stream) => {
+				const abortController = new AbortController();
+				stream.onAbort(() => abortController.abort());
+
+				const sendSSE = async (event: string, data: unknown) => {
+					await stream.writeSSE({ data: JSON.stringify(data), event });
+				};
+
+				try {
+					const result = await repositoriesService.execResticCommand(
+						shortId,
+						body.command,
+						body.args,
+						async (line) => sendSSE("output", { type: "stdout", line }),
+						async (line) => sendSSE("output", { type: "stderr", line }),
+						abortController.signal,
+					);
+
+					await sendSSE("done", { type: "done", exitCode: result.exitCode });
+				} catch (error) {
+					await sendSSE("error", { type: "error", message: toMessage(error) });
+				}
+			});
+		},
+	);

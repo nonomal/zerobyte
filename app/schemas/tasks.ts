@@ -1,0 +1,254 @@
+import {
+	doctorResultSchema,
+	resticBackupOutputSchema,
+	resticBackupProgressSchema,
+	resticRestoreOutputSchema,
+	restoreProgressSchema,
+} from "@zerobyte/core/restic";
+import { z } from "zod";
+import { retentionPolicySchema } from "./retention";
+
+export const taskStatuses = ["queued", "running", "cancelling", "cancelled", "succeeded", "failed", "stale"] as const;
+export const activeTaskStatuses = ["queued", "running", "cancelling"] as const;
+export const finishedTaskStatuses = ["cancelled", "succeeded", "failed", "stale"] as const;
+export const taskKinds = [
+	"backup",
+	"restore",
+	"deleteSnapshots",
+	"tagSnapshots",
+	"doctor",
+	"mirrorSync",
+	"mirrorStatus",
+	"forget",
+] as const;
+export const hiddenTaskKinds = ["mirrorStatus"] as const;
+export const taskOutcomes = ["success", "warning", "error", "cancelled", "stale"] as const;
+export const TASK_PERSISTENCE_FORMAT_VERSION = 1 as const;
+
+export const taskStatusSchema = z.enum(taskStatuses);
+export const activeTaskStatusSchema = z.enum(activeTaskStatuses);
+export const finishedTaskStatusSchema = z.enum(finishedTaskStatuses);
+export const taskKindSchema = z.enum(taskKinds);
+export const taskOutcomeSchema = z.enum(taskOutcomes);
+export const taskResourceTypeSchema = z.enum(["backup_schedule", "repository"]);
+export const mirrorSyncPhaseSchema = z.enum(["preparing", "copying", "retention"]);
+
+export type TaskKind = z.infer<typeof taskKindSchema>;
+export type ActivityTaskKind = Exclude<TaskKind, (typeof hiddenTaskKinds)[number]>;
+
+export const isActivityTaskKind = (kind: TaskKind): kind is ActivityTaskKind => {
+	return !hiddenTaskKinds.some((hiddenKind) => hiddenKind === kind);
+};
+
+export const activityTaskKinds = taskKinds.filter(isActivityTaskKind) as [ActivityTaskKind, ...ActivityTaskKind[]];
+export const activityTaskKindSchema = z.enum(activityTaskKinds);
+
+const forgetTaskInputSchema = z.object({
+	kind: z.literal("forget"),
+	scheduleId: z.number(),
+	scheduleShortId: z.string(),
+	repositoryId: z.string(),
+	retentionPolicy: retentionPolicySchema,
+	trigger: z.enum(["manual", "postBackup"]),
+});
+
+export const taskInputSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("backup"),
+		scheduleId: z.number(),
+		scheduleShortId: z.string(),
+		manual: z.boolean(),
+	}),
+	z.object({
+		kind: z.literal("restore"),
+		repositoryId: z.string(),
+		snapshotId: z.string(),
+		target: z.string(),
+	}),
+	z.object({
+		kind: z.literal("deleteSnapshots"),
+		repositoryId: z.string(),
+		snapshotIds: z.array(z.string()).min(1),
+	}),
+	z.object({
+		kind: z.literal("tagSnapshots"),
+		repositoryId: z.string(),
+		snapshotIds: z.array(z.string()).min(1),
+		add: z.array(z.string()).optional(),
+		remove: z.array(z.string()).optional(),
+		set: z.array(z.string()).optional(),
+	}),
+	z.object({
+		kind: z.literal("doctor"),
+		repositoryId: z.string(),
+	}),
+	z.object({
+		kind: z.literal("mirrorSync"),
+		scheduleId: z.number(),
+		scheduleShortId: z.string(),
+		sourceRepositoryId: z.string().optional(),
+		mirrorRepositoryId: z.string(),
+		snapshotIds: z.array(z.string()).optional(),
+	}),
+	z.object({
+		kind: z.literal("mirrorStatus"),
+		scheduleId: z.number(),
+		scheduleShortId: z.string(),
+		sourceRepositoryId: z.string(),
+		mirrorRepositoryId: z.string(),
+	}),
+	forgetTaskInputSchema,
+]);
+
+const legacyForgetTaskInputSchema = forgetTaskInputSchema.omit({ retentionPolicy: true });
+const persistedTaskInputSchema = z.union([taskInputSchema, legacyForgetTaskInputSchema]);
+
+export const taskProgressSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("backup"),
+		progress: resticBackupProgressSchema,
+	}),
+	z.object({
+		kind: z.literal("restore"),
+		progress: restoreProgressSchema,
+	}),
+	z.object({
+		kind: z.literal("mirrorSync"),
+		phase: mirrorSyncPhaseSchema,
+		message: z.string().nullable(),
+	}),
+]);
+
+export const taskResultSchema = z.discriminatedUnion("kind", [
+	z.object({
+		kind: z.literal("backup"),
+		exitCode: z.number(),
+		result: resticBackupOutputSchema.nullable(),
+		warningDetails: z.string().nullable(),
+	}),
+	z.object({
+		kind: z.literal("restore"),
+		result: resticRestoreOutputSchema,
+	}),
+	z.object({
+		kind: z.literal("deleteSnapshots"),
+		deletedSnapshotIds: z.array(z.string()),
+	}),
+	z.object({
+		kind: z.literal("tagSnapshots"),
+		taggedSnapshotIds: z.array(z.string()),
+	}),
+	z.object({
+		kind: z.literal("doctor"),
+		repositoryStatus: z.enum(["healthy", "error", "cancelled"]),
+		lastChecked: z.number(),
+		lastError: z.string().nullable(),
+		doctorResult: doctorResultSchema,
+	}),
+	z.object({
+		kind: z.literal("mirrorSync"),
+	}),
+	z.object({
+		kind: z.literal("mirrorStatus"),
+		sourceCount: z.number(),
+		mirrorCount: z.number(),
+		missingSnapshots: z.array(
+			z.object({
+				short_id: z.string(),
+				time: z.string(),
+				size: z.number(),
+			}),
+		),
+	}),
+	z.object({
+		kind: z.literal("forget"),
+	}),
+]);
+
+const taskShape = {
+	id: z.string(),
+	organizationId: z.string(),
+	kind: taskKindSchema,
+	status: taskStatusSchema,
+	outcome: taskOutcomeSchema.nullable(),
+	resourceType: taskResourceTypeSchema,
+	resourceId: z.string(),
+	operationKey: z.string().nullable(),
+	targetDisplayName: z.string().nullable(),
+	targetAgentId: z.string().nullable(),
+	input: taskInputSchema,
+	progress: taskProgressSchema.nullable(),
+	result: taskResultSchema.nullable(),
+	error: z.string().nullable(),
+	cancellationRequested: z.boolean(),
+	createdAt: z.number(),
+	startedAt: z.number().nullable(),
+	updatedAt: z.number(),
+	finishedAt: z.number().nullable(),
+};
+
+const validateTaskPayloadKinds = (
+	task: {
+		kind: string;
+		input: { kind: string };
+		progress: { kind: string } | null;
+		result: { kind: string } | null;
+	},
+	ctx: z.RefinementCtx,
+) => {
+	if (task.kind !== task.input.kind) {
+		ctx.addIssue({
+			code: "custom",
+			path: ["input", "kind"],
+			message: "Task input kind must match task kind",
+		});
+	}
+
+	if (task.progress && task.kind !== task.progress.kind) {
+		ctx.addIssue({
+			code: "custom",
+			path: ["progress", "kind"],
+			message: "Task progress kind must match task kind",
+		});
+	}
+
+	if (task.result && task.kind !== task.result.kind) {
+		ctx.addIssue({
+			code: "custom",
+			path: ["result", "kind"],
+			message: "Task result kind must match task kind",
+		});
+	}
+};
+
+export const taskSchema = z.object(taskShape).superRefine(validateTaskPayloadKinds);
+const persistedTaskShape = {
+	...taskShape,
+	input: persistedTaskInputSchema,
+	persistenceFormatVersion: z.literal(TASK_PERSISTENCE_FORMAT_VERSION),
+	targetDisplayName: z.string(),
+};
+export const persistedTaskSchema = z.object(persistedTaskShape).superRefine(validateTaskPayloadKinds);
+
+const {
+	organizationId: _organizationId,
+	outcome: _outcome,
+	targetDisplayName: _targetDisplayName,
+	...taskDtoShape
+} = taskShape;
+
+export const taskDtoSchema = z.object(taskDtoShape);
+
+export type TaskStatus = z.infer<typeof taskStatusSchema>;
+export type ActiveTaskStatus = z.infer<typeof activeTaskStatusSchema>;
+export type FinishedTaskStatus = z.infer<typeof finishedTaskStatusSchema>;
+export type TaskOutcome = z.infer<typeof taskOutcomeSchema>;
+export type TaskPersistenceFormatVersion = typeof TASK_PERSISTENCE_FORMAT_VERSION;
+export type TaskResourceType = z.infer<typeof taskResourceTypeSchema>;
+export type MirrorSyncPhase = z.infer<typeof mirrorSyncPhaseSchema>;
+export type TaskInput = z.infer<typeof taskInputSchema>;
+export type TaskProgress = z.infer<typeof taskProgressSchema>;
+export type TaskResult = z.infer<typeof taskResultSchema>;
+export type ParsedTask = z.infer<typeof taskSchema>;
+export type PersistedTask = z.infer<typeof persistedTaskSchema>;
+export type TaskDto = z.infer<typeof taskDtoSchema>;

@@ -1,4 +1,4 @@
-import type { UseFormReturn } from "react-hook-form";
+import { useWatch, type UseFormReturn } from "react-hook-form";
 import type { FormValues } from "../create-volume-form";
 import {
 	FormControl,
@@ -12,12 +12,16 @@ import { Input } from "../../../../components/ui/input";
 import { SecretInput } from "../../../../components/ui/secret-input";
 import { Textarea } from "../../../../components/ui/textarea";
 import { Switch } from "../../../../components/ui/switch";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "../../../../components/ui/collapsible";
 
 type Props = {
 	form: UseFormReturn<FormValues>;
 };
 
 export const SFTPForm = ({ form }: Props) => {
+	const skipHostKeyCheck = useWatch({ control: form.control, name: "skipHostKeyCheck" });
+	const unsafeSymlinkTargetsDisabled = Boolean(skipHostKeyCheck);
+
 	return (
 		<>
 			<FormField
@@ -76,7 +80,9 @@ export const SFTPForm = ({ form }: Props) => {
 						<FormControl>
 							<SecretInput placeholder="••••••••" value={field.value ?? ""} onChange={field.onChange} />
 						</FormControl>
-						<FormDescription>Password for SFTP authentication (optional if using private key).</FormDescription>
+						<FormDescription>
+							Password for SFTP authentication (optional if using private key).
+						</FormDescription>
 						<FormMessage />
 					</FormItem>
 				)}
@@ -96,7 +102,9 @@ export const SFTPForm = ({ form }: Props) => {
 								value={field.value ?? ""}
 							/>
 						</FormControl>
-						<FormDescription>SSH private key for authentication (optional if using password).</FormDescription>
+						<FormDescription>
+							SSH private key for authentication (optional if using password).
+						</FormDescription>
 						<FormMessage />
 					</FormItem>
 				)}
@@ -127,12 +135,23 @@ export const SFTPForm = ({ form }: Props) => {
 							</FormDescription>
 						</div>
 						<FormControl>
-							<Switch checked={field.value} onCheckedChange={field.onChange} />
+							<Switch
+								checked={field.value}
+								onCheckedChange={(checked) => {
+									field.onChange(checked);
+									if (checked) {
+										form.setValue("allowUnsafeSymlinkTargets", false, {
+											shouldDirty: true,
+											shouldValidate: true,
+										});
+									}
+								}}
+							/>
 						</FormControl>
 					</FormItem>
 				)}
 			/>
-			{!form.watch("skipHostKeyCheck") && (
+			{!skipHostKeyCheck && (
 				<FormField
 					control={form.control}
 					name="knownHosts"
@@ -156,6 +175,53 @@ export const SFTPForm = ({ form }: Props) => {
 					)}
 				/>
 			)}
+			<Collapsible>
+				<CollapsibleTrigger>Advanced Settings</CollapsibleTrigger>
+				<CollapsibleContent className="pb-4 pt-4 space-y-4">
+					<FormField
+						control={form.control}
+						name="allowLegacySshRsa"
+						render={({ field }) => (
+							<FormItem className="flex flex-row items-center justify-between rounded-lg border p-3 shadow-sm">
+								<div className="space-y-0.5">
+									<FormLabel>Allow legacy SSH RSA/SHA1 algorithms</FormLabel>
+									<FormDescription>
+										Only enable this for legacy SFTP servers that offer <code>ssh-rsa</code> only.
+										It permits RSA/SHA1 signatures, which are weaker than modern SSH algorithms.
+									</FormDescription>
+								</div>
+								<FormControl>
+									<Switch checked={field.value ?? false} onCheckedChange={field.onChange} />
+								</FormControl>
+							</FormItem>
+						)}
+					/>
+					<FormField
+						control={form.control}
+						name="allowUnsafeSymlinkTargets"
+						render={({ field }) => (
+							<FormItem className="flex flex-row items-center justify-between rounded-lg border p-3 shadow-sm">
+								<div className="space-y-0.5">
+									<FormLabel>Allow absolute and parent-directory symlinks</FormLabel>
+									<FormDescription>
+										Only enable this for trusted SFTP servers with host key verification and known
+										hosts configured. It disables SSHFS symlink containment so Restic can archive
+										symlinks with absolute targets or <code>..</code> path components.
+									</FormDescription>
+								</div>
+								<FormControl>
+									<Switch
+										checked={field.value ?? false}
+										onCheckedChange={field.onChange}
+										disabled={unsafeSymlinkTargetsDisabled}
+									/>
+								</FormControl>
+								<FormMessage />
+							</FormItem>
+						)}
+					/>
+				</CollapsibleContent>
+			</Collapsible>
 		</>
 	);
 };

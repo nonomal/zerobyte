@@ -9,7 +9,7 @@ import { weeklyDays } from "./types";
 
 type FrequencySectionProps = {
 	form: UseFormReturn<InternalFormValues>;
-	frequency: string;
+	frequency: string | undefined;
 };
 
 export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => {
@@ -22,11 +22,12 @@ export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => 
 					<FormItem>
 						<FormLabel>Backup frequency</FormLabel>
 						<FormControl>
-							<Select {...field} onValueChange={field.onChange}>
+							<Select {...field} onValueChange={field.onChange} value={field.value ?? ""}>
 								<SelectTrigger>
 									<SelectValue placeholder="Select frequency" />
 								</SelectTrigger>
 								<SelectContent>
+									<SelectItem value="manual">Manual only</SelectItem>
 									<SelectItem value="hourly">Hourly</SelectItem>
 									<SelectItem value="daily">Daily</SelectItem>
 									<SelectItem value="weekly">Weekly</SelectItem>
@@ -46,12 +47,16 @@ export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => 
 					control={form.control}
 					name="cronExpression"
 					render={({ field, fieldState }) => (
-						<CronInput value={field.value || ""} onChange={field.onChange} error={fieldState.error?.message} />
+						<CronInput
+							value={field.value || ""}
+							onChange={field.onChange}
+							error={fieldState.error?.message}
+						/>
 					)}
 				/>
 			)}
 
-			{frequency !== "hourly" && frequency !== "cron" && (
+			{frequency !== "hourly" && frequency !== "cron" && frequency !== "manual" && (
 				<FormField
 					control={form.control}
 					name="dailyTime"
@@ -73,10 +78,10 @@ export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => 
 					control={form.control}
 					name="weeklyDay"
 					render={({ field }) => (
-						<FormItem className="@md:col-span-2">
+						<FormItem className="@medium:col-span-2">
 							<FormLabel>Execution day</FormLabel>
 							<FormControl>
-								<Select {...field} onValueChange={field.onChange}>
+								<Select {...field} onValueChange={field.onChange} value={field.value ?? ""}>
 									<SelectTrigger>
 										<SelectValue placeholder="Select a day" />
 									</SelectTrigger>
@@ -101,7 +106,7 @@ export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => 
 					control={form.control}
 					name="monthlyDays"
 					render={({ field }) => (
-						<FormItem className="@md:col-span-2">
+						<FormItem className="@medium:col-span-2">
 							<FormLabel>Days of the month</FormLabel>
 							<FormControl>
 								<div className="grid grid-cols-7 gap-4 w-max">
@@ -116,7 +121,9 @@ export const FrequencySection = ({ form, frequency }: FrequencySectionProps) => 
 												size="icon"
 												onClick={() => {
 													const current = field.value || [];
-													const next = isSelected ? current.filter((d) => d !== day) : [...current, day];
+													const next = isSelected
+														? current.filter((d) => d !== day)
+														: [...current, day];
 													field.onChange(next);
 												}}
 											>

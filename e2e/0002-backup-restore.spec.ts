@@ -1,73 +1,759 @@
-import { expect, test } from "@playwright/test";
-import path from "node:path";
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
+import path from "node:path";
+import { type Page, type TestInfo } from "@playwright/test";
+import { expect, test } from "./test";
+import { gotoAndWaitForAppReady } from "./helpers/page";
 
-test.beforeAll(() => {
-	const testDataPath = path.join(process.cwd(), "playwright", "temp");
-	if (fs.existsSync(testDataPath)) {
-		for (const file of fs.readdirSync(testDataPath)) {
-			fs.rmSync(path.join(testDataPath, file), { recursive: true, force: true });
-		}
-	} else {
-		fs.mkdirSync(testDataPath, { recursive: true });
-	}
-});
+const testDataPath = path.join(process.cwd(), "playwright", "temp");
 
-test("can backup & restore a file", async ({ page }) => {
-	await page.goto("/");
-	await expect(page).toHaveURL("/volumes");
+type ScenarioNames = {
+	volumeName: string;
+	repositoryName: string;
+	backupName: string;
+};
 
-	// 0. Create a test file in /test-data
-	const testDataPath = path.join(process.cwd(), "playwright", "temp");
-	const filePath = path.join(testDataPath, "test.json");
+type BackupSelectionOptions = {
+	includePatterns?: string;
+	excludePatterns?: string;
+	excludeIfPresent?: string;
+	selectedPaths?: string[];
+};
+
+type ScenarioOptions = BackupSelectionOptions & {
+	repositoryBasePath?: string;
+};
+
+type BackupJobOptions = BackupSelectionOptions & {
+	backupName: string;
+	volumeName: string;
+	repositoryName: string;
+};
+
+type RepositoryListItem = {
+	name: string;
+	shortId: string;
+};
+
+type RepositoryDetail = RepositoryListItem & {
+	config: {
+		backend: string;
+		path?: string;
+		isExistingRepository?: boolean;
+	};
+	status: "healthy" | "error" | "unknown" | "doctor" | "cancelled" | null;
+};
+
+type SnapshotListItem = {
+	id: string;
+	short_id: string;
+	tags: string[];
+};
+
+type ImportMode = {
+	slug: "recovery-key" | "manual-password";
+	shortName: "rk" | "pw";
+	testName: string;
+	useCustomPassword: boolean;
+};
+
+const importModes: ImportMode[] = [
+	{
+		slug: "recovery-key",
+		shortName: "rk",
+		testName: "can import an existing Zerobyte-created repository with the recovery key",
+		useCustomPassword: false,
+	},
+	{
+		slug: "manual-password",
+		shortName: "pw",
+		testName: "can import an existing Zerobyte-created repository with a manual password",
+		useCustomPassword: true,
+	},
+];
+
+function getRunId(testInfo: TestInfo) {
+	return `${testInfo.parallelIndex}-${testInfo.retry}-${randomUUID().slice(0, 8)}`;
+}
+
+function getWorkerTestDataPath() {
+	fs.mkdirSync(testDataPath, { recursive: true });
+	return testDataPath;
+}
+
+function getScenarioNames(runId: string): ScenarioNames {
+	return {
+		volumeName: `Volume-${runId}`,
+		repositoryName: `Repo-${runId}`,
+		backupName: `Backup-${runId}`,
+	};
+}
+
+function prepareTestFile(runId: string, fileName = "test.json"): string {
+	const runPath = path.join(getWorkerTestDataPath(), runId);
+	fs.mkdirSync(runPath, { recursive: true });
+
+	const filePath = path.join(runPath, fileName);
 	fs.writeFileSync(filePath, JSON.stringify({ data: "test file" }));
 
-	// 1. Create a local volume on /test-data
-	await page.getByRole("button", { name: "Create Volume" }).click();
-	await page.getByRole("textbox", { name: "Name" }).fill("Test Volume");
-	await page.getByRole("button", { name: "Change" }).click();
+	return filePath;
+}
+
+function escapeRegExp(value: string) {
+	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function createBackupScenario(page: Page, names: ScenarioNames, options: ScenarioOptions = {}) {
+	const workerTestDataPath = getWorkerTestDataPath();
+	const { repositoryBasePath, ...backupOptions } = options;
+	const scenarioPath = names.volumeName.replace(/^Volume-/, "");
+	const selectedPaths =
+		backupOptions.selectedPaths ??
+		(backupOptions.includePatterns || !fs.existsSync(path.join(workerTestDataPath, scenarioPath))
+			? undefined
+			: [`/${scenarioPath}`]);
+
+	await createVolume(page, names.volumeName);
+	await createRepository(page, names.repositoryName, repositoryBasePath);
+	await createBackupJob(page, {
+		backupName: names.backupName,
+		volumeName: names.volumeName,
+		repositoryName: names.repositoryName,
+		selectedPaths,
+		...backupOptions,
+	});
+}
+
+async function createVolume(page: Page, volumeName: string) {
+	await gotoAndWaitForAppReady(page, "/volumes");
+	const volumeNameInput = page.getByRole("textbox", { name: "Name" });
+	await expect(async () => {
+		await page.getByRole("button", { name: "Create Volume" }).click();
+		await expect(volumeNameInput).toBeVisible();
+	}).toPass({ timeout: 10000 });
+
+	await page.getByRole("textbox", { name: "Name" }).fill(volumeName);
+	await page.getByRole("button", { name: "Change", exact: true }).click();
 	await page.getByRole("button", { name: "test-data" }).click();
 	await page.getByRole("button", { name: "Create Volume" }).click();
 	await expect(page.getByText("Volume created successfully")).toBeVisible();
+}
 
-	// 2. Create a local repository on the default location
-	await page.getByRole("link", { name: "Repositories" }).click();
-	await page.getByRole("button", { name: "Create repository" }).click();
-	await page.getByRole("textbox", { name: "Name" }).fill("Test Repo");
+async function createRepository(page: Page, repositoryName: string, repositoryBasePath?: string) {
+	await gotoAndWaitForAppReady(page, "/repositories/create");
+	await expect(page.getByRole("textbox", { name: "Name" })).toBeVisible();
+	await page.getByRole("textbox", { name: "Name" }).fill(repositoryName);
 	await page.getByRole("combobox", { name: "Backend" }).click();
 	await page.getByRole("option", { name: "Local" }).click();
+	if (repositoryBasePath) {
+		await selectRepositoryDirectory(page, repositoryBasePath);
+	}
 	await page.getByRole("button", { name: "Create repository" }).click();
-	await expect(page.getByText("Repository created successfully")).toBeVisible();
+	await expect(page.getByText("Repository created successfully")).toBeVisible({ timeout: 30000 });
+}
 
-	// 3. Create a backup schedule
-	await page.getByRole("link", { name: "Backups" }).click();
-	await page.getByRole("button", { name: "Create a backup job" }).click();
-	await page.getByRole("combobox").filter({ hasText: "Choose a volume to backup" }).click();
-	await page.getByRole("option", { name: "Test Volume" }).click();
-	await page.getByRole("textbox", { name: "Backup name" }).fill("Test Backup");
+async function selectRepositoryDirectory(page: Page, directoryPath: string) {
+	const segments = directoryPath.split("/").filter(Boolean);
+
+	await page.getByRole("button", { name: "Change", exact: true }).click();
+	await page.getByRole("button", { name: "I Understand, Continue" }).click();
+
+	const dialog = page.getByRole("alertdialog");
+	await expect(dialog.getByRole("heading", { name: "Select Repository Directory" })).toBeVisible();
+
+	for (const [index, segment] of segments.entries()) {
+		const folderRow = dialog.getByRole("button", { name: segment, exact: true });
+		await expect(folderRow).toBeVisible({ timeout: 10000 });
+
+		if (index === segments.length - 1) {
+			await folderRow.click();
+		} else {
+			await folderRow.locator("svg").first().click();
+		}
+	}
+
+	await expect(dialog.getByText(directoryPath, { exact: true })).toBeVisible();
+	await dialog.getByRole("button", { name: "Done" }).click();
+}
+
+async function createBackupJob(page: Page, options: BackupJobOptions) {
+	await gotoAndWaitForAppReady(page, "/backups");
+
+	const createBackupButton = page.getByRole("button", { name: "Create a backup job" }).first();
+	if (await createBackupButton.isVisible()) {
+		await createBackupButton.click();
+	} else {
+		await page.getByRole("link", { name: "Create a backup job" }).first().click();
+	}
+	const volumeSelect = page.getByRole("combobox").filter({ hasText: "Choose a volume to backup" });
+	const volumeOption = page.getByRole("option", { name: options.volumeName });
+	await expect(async () => {
+		await volumeSelect.click();
+		await expect(volumeOption).toBeVisible();
+	}).toPass({ timeout: 10000 });
+	await volumeOption.click();
+	await page.getByRole("textbox", { name: "Backup name" }).fill(options.backupName);
 	await page.getByRole("combobox").filter({ hasText: "Select a repository" }).click();
-	await page.getByRole("option", { name: "Test Repo" }).click();
+	await page.getByRole("option", { name: options.repositoryName }).click();
 	await page.getByRole("combobox").filter({ hasText: "Select frequency" }).click();
 	await page.getByRole("option", { name: "Daily" }).click();
 	await page.getByRole("textbox", { name: "Execution time" }).fill("00:00");
+	if (options.includePatterns) {
+		await page.getByLabel("Additional include patterns").fill(options.includePatterns);
+	}
+	if (options.selectedPaths) {
+		for (const selectedPath of options.selectedPaths) {
+			const escapedPath = escapeRegExp(path.posix.basename(selectedPath));
+			await page
+				.getByRole("button", { name: new RegExp(escapedPath) })
+				.getByRole("checkbox")
+				.click();
+		}
+	}
+	if (options.excludePatterns) {
+		await page.getByLabel("Exclusion patterns").fill(options.excludePatterns);
+	}
+	if (options.excludeIfPresent) {
+		await page.getByLabel("Exclude if file present").fill(options.excludeIfPresent);
+	}
 	await page.getByRole("button", { name: "Create" }).click();
 	await expect(page.getByText("Backup job created successfully")).toBeVisible();
+}
 
-	// 4. Runs that schedule once
+async function listRepositories(page: Page) {
+	const response = await page.request.get("/api/v1/repositories");
+	expect(response.ok()).toBe(true);
+	return (await response.json()) as RepositoryListItem[];
+}
+
+async function getRepositoryByName(page: Page, repositoryName: string) {
+	const repositories = await listRepositories(page);
+	const repository = repositories.find((entry) => entry.name === repositoryName);
+	expect(repository).toBeDefined();
+	return repository!;
+}
+
+async function getRepositoryDetail(page: Page, repositoryShortId: string) {
+	const response = await page.request.get(`/api/v1/repositories/${repositoryShortId}`);
+	expect(response.ok()).toBe(true);
+	return (await response.json()) as RepositoryDetail;
+}
+
+function getLocalRepositoryPath(repository: RepositoryDetail) {
+	expect(repository.config.backend).toBe("local");
+	expect(repository.config.path).toBeTruthy();
+	return repository.config.path!;
+}
+
+async function waitForRepositorySnapshots(page: Page, repositoryShortId: string, expectedCount: number) {
+	let snapshots: SnapshotListItem[] = [];
+
+	await expect(async () => {
+		const response = await page.request.get(`/api/v1/repositories/${repositoryShortId}/snapshots`);
+		expect(response.ok()).toBe(true);
+		snapshots = (await response.json()) as SnapshotListItem[];
+		expect(snapshots).toHaveLength(expectedCount);
+	}).toPass({ timeout: 30000 });
+
+	return snapshots;
+}
+
+async function deleteRepositoryConfig(page: Page, repositoryShortId: string) {
+	const response = await page.request.delete(`/api/v1/repositories/${repositoryShortId}`);
+	expect(response.ok()).toBe(true);
+
+	await expect(async () => {
+		const repositories = await listRepositories(page);
+		expect(repositories.find((entry) => entry.shortId === repositoryShortId)).toBeUndefined();
+	}).toPass({ timeout: 10000 });
+}
+
+async function downloadResticPassword(page: Page) {
+	const response = await page.request.post("/api/v1/system/restic-password", {
+		data: {
+			password: "password123",
+		},
+	});
+
+	expect(response.ok()).toBe(true);
+	return (await response.text()).trim();
+}
+
+async function importExistingLocalRepository(
+	page: Page,
+	repositoryName: string,
+	repositoryPath: string,
+	customPassword?: string,
+) {
+	await gotoAndWaitForAppReady(page, "/repositories/create");
+	await expect(page.getByRole("textbox", { name: "Name" })).toBeVisible();
+	await page.getByRole("textbox", { name: "Name" }).fill(repositoryName);
+	await page.getByRole("combobox", { name: "Backend" }).click();
+	await page.getByRole("option", { name: "Local" }).click();
+	await page.getByRole("checkbox", { name: "Import existing repository" }).click();
+
+	if (customPassword) {
+		await page.getByRole("combobox").filter({ hasText: "Use the existing recovery key" }).click();
+		await page.getByRole("option", { name: "Enter password manually" }).click();
+		await page.getByPlaceholder("Enter repository password").fill(customPassword);
+	}
+
+	await selectRepositoryDirectory(page, repositoryPath);
+	await page.getByRole("button", { name: "Create repository" }).click();
+	await expect(page.getByText("Repository created successfully")).toBeVisible({ timeout: 30000 });
+}
+
+async function openRepositorySnapshots(page: Page, repositoryName: string) {
+	const repository = await getRepositoryByName(page, repositoryName);
+	await gotoAndWaitForAppReady(page, `/repositories/${repository.shortId}`);
+	await page.getByRole("tab", { name: "Snapshots" }).click();
+	await expect(page.getByText("Backup snapshots stored in this repository.")).toBeVisible();
+}
+
+async function openFirstBackupSnapshot(page: Page) {
+	await page
+		.getByRole("button", { name: /^Select snapshot / })
+		.first()
+		.click();
+}
+
+for (const importMode of importModes) {
+	test(importMode.testName, async ({ page }, testInfo) => {
+		const runId = getRunId(testInfo);
+		const scenarioId = `${runId}-${importMode.shortName}`;
+		const names = getScenarioNames(scenarioId);
+		const importedRepositoryName = `Import-${scenarioId}`;
+		const sourceRepositoryBaseName = `import-source-${runId}-${importMode.slug}`;
+		const sourceRepositoryBasePath = `/test-data/${sourceRepositoryBaseName}`;
+		const sourceRepositoryBaseHostPath = path.join(getWorkerTestDataPath(), sourceRepositoryBaseName);
+
+		fs.mkdirSync(sourceRepositoryBaseHostPath, { recursive: true });
+		prepareTestFile(scenarioId, `import-${importMode.shortName}.json`);
+
+		await gotoAndWaitForAppReady(page, "/");
+		await expect(page).toHaveURL("/volumes");
+
+		await createBackupScenario(page, names, {
+			repositoryBasePath: sourceRepositoryBasePath,
+			selectedPaths: [`/${scenarioId}`],
+		});
+
+		const sourceRepository = await getRepositoryByName(page, names.repositoryName);
+		const sourceRepositoryDetail = await getRepositoryDetail(page, sourceRepository.shortId);
+		const sourceRepositoryPath = getLocalRepositoryPath(sourceRepositoryDetail);
+		expect(sourceRepositoryPath.startsWith(`${sourceRepositoryBasePath}/`)).toBe(true);
+
+		await page.getByRole("button", { name: "Backup now" }).click();
+		await expect(page.getByText("Backup started successfully")).toBeVisible();
+		await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+		const sourceSnapshots = await waitForRepositorySnapshots(page, sourceRepository.shortId, 1);
+		const importedSnapshotShortId = sourceSnapshots[0].short_id;
+
+		await deleteRepositoryConfig(page, sourceRepository.shortId);
+
+		const customPassword = importMode.useCustomPassword ? await downloadResticPassword(page) : undefined;
+		await importExistingLocalRepository(page, importedRepositoryName, sourceRepositoryPath, customPassword);
+
+		const importedRepository = await getRepositoryByName(page, importedRepositoryName);
+		const importedRepositoryDetail = await getRepositoryDetail(page, importedRepository.shortId);
+		expect(importedRepositoryDetail.status).toBe("healthy");
+		expect(getLocalRepositoryPath(importedRepositoryDetail)).toBe(sourceRepositoryPath);
+
+		const importedSnapshots = await waitForRepositorySnapshots(page, importedRepository.shortId, 1);
+		expect(importedSnapshots[0].short_id).toBe(importedSnapshotShortId);
+
+		await openRepositorySnapshots(page, importedRepositoryName);
+		await expect(page.getByText(importedSnapshotShortId, { exact: true })).toBeVisible();
+	});
+}
+
+test("can backup & restore a file", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const filePath = prepareTestFile(runId);
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
 	await page.getByRole("button", { name: "Backup now" }).click();
 	await expect(page.getByText("Backup started successfully")).toBeVisible();
 	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
 
-	// 5. Modify the json file after the backup
 	fs.writeFileSync(filePath, JSON.stringify({ data: "modified file" }));
 
-	// 6. Restores the file from backup
+	await openFirstBackupSnapshot(page);
 	await page.getByRole("link", { name: "Restore" }).click();
 	await expect(page).toHaveURL(/\/restore/);
 	await page.getByRole("button", { name: "Restore All" }).click();
 	await expect(page.getByText("Restore completed")).toBeVisible({ timeout: 30000 });
 
-	// 7. Ensures that the file is back to its previous state
 	const restoredContent = fs.readFileSync(filePath, "utf8");
 	expect(JSON.parse(restoredContent)).toEqual({ data: "test file" });
+});
+
+test("can restore a single selected file to a custom location", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const workerTestDataPath = getWorkerTestDataPath();
+	const fileName = `single-file-${runId}.json`;
+	const filePath = prepareTestFile(runId, fileName);
+	const restoreTargetPath = path.join(workerTestDataPath, fileName);
+	const escapedFileName = fileName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+	fs.rmSync(restoreTargetPath, { force: true });
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	fs.writeFileSync(filePath, JSON.stringify({ data: "modified file" }));
+
+	await openFirstBackupSnapshot(page);
+	await page.getByRole("link", { name: "Restore" }).click();
+	await expect(page).toHaveURL(/\/restore/);
+
+	await page.getByRole("button", { name: "Custom location" }).click();
+	await page.getByRole("button", { name: "Change", exact: true }).click();
+	await page.getByRole("button", { name: /^test-data$/ }).click();
+	await expect(page.getByText("/test-data", { exact: true })).toBeVisible();
+
+	const runFolderRow = page.getByRole("button", { name: new RegExp(runId) });
+	await runFolderRow.locator("svg").first().click();
+
+	const fileRow = page.getByRole("button", { name: new RegExp(escapedFileName) });
+	await fileRow.getByRole("checkbox").click();
+	await expect(page.getByText("1 item selected")).toBeVisible();
+
+	await page.getByRole("button", { name: "Restore 1 item" }).click();
+	await expect(page.getByText("Restore completed")).toBeVisible({ timeout: 30000 });
+
+	const restoredContent = fs.readFileSync(restoreTargetPath, "utf8");
+	expect(JSON.parse(restoredContent)).toEqual({ data: "test file" });
+
+	fs.rmSync(restoreTargetPath, { force: true });
+});
+
+test("can re-tag a snapshot to another backup schedule", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const secondBackupName = `${names.backupName}-retag`;
+
+	prepareTestFile(runId, "retag.json");
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	await createBackupJob(page, {
+		backupName: secondBackupName,
+		volumeName: names.volumeName,
+		repositoryName: names.repositoryName,
+	});
+
+	await openRepositorySnapshots(page, names.repositoryName);
+	await expect(page.getByRole("link", { name: names.backupName, exact: true })).toBeVisible();
+
+	await page
+		.getByRole("checkbox", { name: /Select snapshot/ })
+		.first()
+		.check();
+	await page.getByRole("button", { name: "Re-tag" }).click();
+	const retagSelect = page.getByRole("combobox");
+	const retagOption = page.getByRole("option", { name: secondBackupName, exact: true });
+	await expect(async () => {
+		await retagSelect.click();
+		await expect(retagOption).toBeVisible();
+	}).toPass({ timeout: 10000 });
+	await retagOption.click();
+	await page.getByRole("button", { name: "Apply tags" }).click();
+
+	await expect(page.getByText(`Snapshots re-tagged to ${secondBackupName}`)).toBeVisible({ timeout: 30000 });
+	await expect(page.getByRole("link", { name: secondBackupName, exact: true })).toBeVisible();
+	await expect(page.getByRole("link", { name: names.backupName, exact: true })).toHaveCount(0);
+});
+
+test("can delete a snapshot from the repository snapshots tab", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+
+	prepareTestFile(runId, "delete.json");
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	await openRepositorySnapshots(page, names.repositoryName);
+	await expect(page.getByRole("checkbox", { name: /Select snapshot/ })).toHaveCount(1);
+
+	await page
+		.getByRole("checkbox", { name: /Select snapshot/ })
+		.first()
+		.check();
+	await page.getByRole("button", { name: "Delete" }).click();
+	await expect(page.getByText("Delete 1 snapshots?")).toBeVisible();
+	await page.getByRole("button", { name: "Delete 1 snapshots" }).click();
+
+	await expect(page.getByText("Snapshot deleted")).toBeVisible({ timeout: 30000 });
+	await expect(page.getByRole("checkbox", { name: /Select snapshot/ })).toHaveCount(0);
+	await expect(page.getByRole("link", { name: names.backupName, exact: true })).toHaveCount(0);
+});
+
+test("can download a selected snapshot directory as a tar archive", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const workerTestDataPath = getWorkerTestDataPath();
+	const fileName = `download-${runId}.json`;
+	const filePath = prepareTestFile(runId, fileName);
+	const downloadedPath = path.join(workerTestDataPath, `downloaded-${runId}.tar`);
+
+	fs.rmSync(downloadedPath, { force: true });
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	fs.writeFileSync(filePath, JSON.stringify({ data: "modified file" }));
+
+	await openFirstBackupSnapshot(page);
+	await page.getByRole("link", { name: "Restore" }).click();
+	await expect(page).toHaveURL(/\/restore/);
+
+	const runFolderRow = page.getByRole("button", { name: new RegExp(runId) });
+	await runFolderRow.getByRole("checkbox").click();
+	await expect(page.getByText("1 item selected")).toBeVisible();
+
+	const downloadPromise = page.waitForEvent("download");
+	await page.getByRole("button", { name: "Download 1 item" }).click();
+	const download = await downloadPromise;
+
+	expect(download.suggestedFilename()).toMatch(/^snapshot-.*\.tar$/);
+	await download.saveAs(downloadedPath);
+
+	const stats = fs.statSync(downloadedPath);
+	expect(stats.size).toBeGreaterThan(0);
+
+	fs.rmSync(downloadedPath, { force: true });
+});
+
+test("deleting a volume cascades and removes its backup schedule", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names);
+
+	await gotoAndWaitForAppReady(page, "/backups");
+	await page.getByText(names.backupName, { exact: true }).first().click();
+
+	const volumeLink = page.locator("main").getByRole("link", { name: names.volumeName, exact: true }).first();
+	await expect(volumeLink).toBeVisible();
+	await volumeLink.click();
+	await expect(page).toHaveURL(/\/volumes\/[^/?#]+/);
+
+	const actionsButton = page.getByRole("button", { name: "Actions" });
+	await expect(actionsButton).toBeVisible();
+
+	const deleteVolumeMenuItem = page.getByRole("menuitem", { name: "Delete", exact: true });
+	await expect(async () => {
+		const isDeleteVolumeMenuItemVisible = await deleteVolumeMenuItem.isVisible();
+		if (!isDeleteVolumeMenuItemVisible) {
+			await actionsButton.click();
+		}
+		await deleteVolumeMenuItem.click({ timeout: 2000 });
+	}).toPass({ timeout: 10000 });
+	await expect(page.getByRole("heading", { name: "Delete volume?" })).toBeVisible({ timeout: 10000 });
+	await expect(
+		page.getByText("All backup schedules associated with this volume will also be removed."),
+	).toBeVisible();
+	await page.getByRole("button", { name: "Delete volume" }).click();
+	await expect(page.getByText("Volume deleted successfully")).toBeVisible();
+
+	await gotoAndWaitForAppReady(page, "/backups");
+	await expect(page.getByText(names.backupName, { exact: true })).toHaveCount(0);
+});
+
+test("backup applies excludes inside included directories but keeps exact include matches", async ({
+	page,
+}, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const workerTestDataPath = getWorkerTestDataPath();
+
+	const keptDir = `kept-${runId}`;
+	const secondKeptDir = `second-kept-${runId}`;
+	const blockedDir = `blocked-${runId}`;
+	const nestedBlockedDir = `nested-blocked-${runId}`;
+	const globOnlyDir = `glob-only-${runId}`;
+	const dataDir = `data-${runId}`;
+	const configDir = `config-${runId}`;
+
+	const explicitMarkedFile = `explicit-marker-dir-${runId}.xyz`;
+	const nestedBlockedFile = `blocked-${runId}.xyz`;
+	const dataIncludedFile = `data-${runId}.txt`;
+	const configIncludedFile = `config-${runId}.json`;
+	const configExplicitlyIncludedFile = `secret-${runId}.json`;
+	const configNonJsonFile = `config-${runId}.txt`;
+	const rootDbFile = `root-${runId}.db`;
+	const secondRootDbFile = `archive-${runId}.db`;
+	const rootNonDbFile = `root-${runId}.txt`;
+
+	const keptPath = path.join(workerTestDataPath, keptDir);
+	const secondKeptPath = path.join(workerTestDataPath, secondKeptDir);
+	const blockedPath = path.join(workerTestDataPath, blockedDir);
+	const nestedBlockedPath = path.join(blockedPath, nestedBlockedDir);
+	const globOnlyPath = path.join(workerTestDataPath, globOnlyDir);
+	const dataPath = path.join(workerTestDataPath, dataDir);
+	const configPath = path.join(workerTestDataPath, configDir);
+
+	fs.mkdirSync(keptPath, { recursive: true });
+	fs.mkdirSync(secondKeptPath, { recursive: true });
+	fs.mkdirSync(blockedPath, { recursive: true });
+	fs.mkdirSync(nestedBlockedPath, { recursive: true });
+	fs.mkdirSync(globOnlyPath, { recursive: true });
+	fs.mkdirSync(dataPath, { recursive: true });
+	fs.mkdirSync(configPath, { recursive: true });
+
+	fs.writeFileSync(path.join(keptPath, "keep.xyz"), "xyz content");
+	fs.writeFileSync(path.join(keptPath, ".DS_Store"), "excluded metadata");
+	fs.writeFileSync(path.join(keptPath, "skip.tmp"), "excluded tmp");
+
+	fs.writeFileSync(path.join(secondKeptPath, "second.xyz"), "xyz content");
+	fs.writeFileSync(path.join(secondKeptPath, ".DS_Store"), "excluded metadata");
+
+	fs.writeFileSync(path.join(blockedPath, ".nobackup"), "marker");
+	fs.writeFileSync(path.join(blockedPath, explicitMarkedFile), "explicitly included marker directory content");
+	fs.writeFileSync(path.join(nestedBlockedPath, ".nobackup"), "nested marker");
+	fs.writeFileSync(path.join(nestedBlockedPath, nestedBlockedFile), "nested marker directory content");
+
+	fs.writeFileSync(path.join(globOnlyPath, "glob-only.xyz"), "glob include");
+
+	fs.writeFileSync(path.join(dataPath, dataIncludedFile), "data include");
+	fs.writeFileSync(path.join(configPath, configIncludedFile), "json include");
+	fs.writeFileSync(path.join(configPath, configExplicitlyIncludedFile), "json matched by explicit include glob");
+	fs.writeFileSync(path.join(configPath, configNonJsonFile), "not included by /config/*.json");
+
+	fs.writeFileSync(path.join(workerTestDataPath, rootDbFile), "root db include");
+	fs.writeFileSync(path.join(workerTestDataPath, secondRootDbFile), "second root db include");
+	fs.writeFileSync(path.join(workerTestDataPath, rootNonDbFile), "root non-db exclude");
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names, {
+		includePatterns: [
+			`/${keptDir}`,
+			`/${secondKeptDir}`,
+			`/${blockedDir}`,
+			`/${dataDir}/**`,
+			`/${configDir}/*.json`,
+			"*.db",
+			"**/*.xyz",
+		].join("\n"),
+		excludePatterns: [".DS_Store", "*.tmp", `/${configDir}/secret*.json`].join("\n"),
+		excludeIfPresent: ".nobackup",
+	});
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	await openFirstBackupSnapshot(page);
+	await expect(page.getByText("File Browser")).toBeVisible();
+
+	for (const folder of [keptDir, secondKeptDir, globOnlyDir, dataDir, configDir, blockedDir]) {
+		const folderRow = page.getByRole("button", { name: folder, exact: true });
+		await expect(folderRow).toBeVisible();
+		await folderRow.locator("svg").first().click();
+	}
+
+	await expect(page.getByRole("button", { name: /keep\.xyz/ })).toBeVisible({ timeout: 15000 });
+	await expect(page.getByRole("button", { name: /second\.xyz/ })).toBeVisible({ timeout: 15000 });
+	await expect(page.getByRole("button", { name: /glob-only\.xyz/ })).toBeVisible({ timeout: 15000 });
+	await expect(page.getByRole("button", { name: new RegExp(dataIncludedFile.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
+	await expect(page.getByRole("button", { name: new RegExp(configIncludedFile.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
+	await expect(
+		page.getByRole("button", { name: new RegExp(configExplicitlyIncludedFile.replace(".", "\\.")) }),
+	).toBeVisible({
+		timeout: 15000,
+	});
+	await expect(page.getByRole("button", { name: new RegExp(rootDbFile.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
+	await expect(page.getByRole("button", { name: new RegExp(secondRootDbFile.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
+	await expect(page.getByRole("button", { name: new RegExp(explicitMarkedFile.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
+
+	await expect(page.getByRole("button", { name: /\.DS_Store/ })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: /skip\.tmp/ })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: new RegExp(configNonJsonFile.replace(".", "\\.")) })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: new RegExp(rootNonDbFile.replace(".", "\\.")) })).toHaveCount(0);
+
+	await expect(page.getByRole("button", { name: /\.nobackup/ })).toBeVisible();
+	await expect(page.getByRole("button", { name: nestedBlockedDir, exact: true })).toHaveCount(0);
+	await expect(page.getByRole("button", { name: new RegExp(nestedBlockedFile.replace(".", "\\.")) })).toHaveCount(0);
+});
+
+test("backup can include a selected folder whose name contains brackets", async ({ page }, testInfo) => {
+	const runId = getRunId(testInfo);
+	const names = getScenarioNames(runId);
+	const workerTestDataPath = getWorkerTestDataPath();
+	const bracketDir = `movies [${runId}]`;
+	const bracketPath = path.join(workerTestDataPath, bracketDir);
+	const fileName = `inside-${runId}.txt`;
+
+	fs.mkdirSync(bracketPath, { recursive: true });
+	fs.writeFileSync(path.join(bracketPath, fileName), "bracket path content");
+
+	await gotoAndWaitForAppReady(page, "/");
+	await expect(page).toHaveURL("/volumes");
+
+	await createBackupScenario(page, names, {
+		selectedPaths: [`/${bracketDir}`],
+	});
+
+	await page.getByRole("button", { name: "Backup now" }).click();
+	await expect(page.getByText("Backup started successfully")).toBeVisible();
+	await expect(page.getByText("✓ Success")).toBeVisible({ timeout: 30000 });
+
+	await openFirstBackupSnapshot(page);
+	const bracketFolderRow = page.getByRole("button", {
+		name: new RegExp(bracketDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+	});
+	await expect(bracketFolderRow).toBeVisible();
+	await bracketFolderRow.locator("svg").first().click();
+	await expect(page.getByRole("button", { name: new RegExp(fileName.replace(".", "\\.")) })).toBeVisible({
+		timeout: 15000,
+	});
 });

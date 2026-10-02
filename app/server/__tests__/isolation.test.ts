@@ -1,6 +1,6 @@
-import { test, describe, expect } from "bun:test";
+import { beforeAll, beforeEach, describe, expect, test } from "vitest";
 import { createApp } from "~/server/app";
-import { createTestSession, getAuthHeaders } from "~/test/helpers/auth";
+import { createTestSession } from "~/test/helpers/auth";
 import { db } from "~/server/db/db";
 import {
 	repositoriesTable,
@@ -18,9 +18,33 @@ import { eq } from "drizzle-orm";
 const app = createApp();
 
 describe("multi-organization isolation", () => {
-	test("should reject requests when session active organization is not a membership", async () => {
-		const session = await createTestSession();
+	let session1: Awaited<ReturnType<typeof createTestSession>>;
+	let session2: Awaited<ReturnType<typeof createTestSession>>;
 
+	beforeAll(async () => {
+		session1 = await createTestSession();
+		session2 = await createTestSession();
+	});
+
+	beforeEach(async () => {
+		await db.delete(backupScheduleNotificationsTable);
+		await db.delete(notificationDestinationsTable);
+		await db.delete(backupSchedulesTable);
+		await db.delete(volumesTable);
+		await db.delete(repositoriesTable);
+
+		await db
+			.update(sessionsTable)
+			.set({ activeOrganizationId: session1.organizationId })
+			.where(eq(sessionsTable.id, session1.session.id));
+
+		await db
+			.update(sessionsTable)
+			.set({ activeOrganizationId: session2.organizationId })
+			.where(eq(sessionsTable.id, session2.session.id));
+	});
+
+	test("should reject requests when session active organization is not a membership", async () => {
 		// Create a different organization the user is NOT a member of
 		const foreignOrgId = crypto.randomUUID();
 		await db.insert(organization).values({
@@ -39,14 +63,13 @@ describe("multi-organization isolation", () => {
 		});
 
 		// Force the session to point at the foreign organization
-		const rawSessionToken = decodeURIComponent(session.token).split(".")[0];
 		await db
 			.update(sessionsTable)
 			.set({ activeOrganizationId: foreignOrgId })
-			.where(eq(sessionsTable.id, rawSessionToken));
+			.where(eq(sessionsTable.id, session1.session.id));
 
 		const res = await app.request("/api/v1/repositories", {
-			headers: getAuthHeaders(session.token),
+			headers: session1.headers,
 		});
 
 		expect(res.status).toBe(403);
@@ -55,40 +78,34 @@ describe("multi-organization isolation", () => {
 	});
 
 	test("should not be able to access repositories from another organization", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		expect(session1.organizationId).not.toBe(session2.organizationId);
 
 		const repoId = crypto.randomUUID();
-		const shortId = generateShortId();
+		const repoShortId = generateShortId();
 		await db.insert(repositoriesTable).values({
 			id: repoId,
-			shortId,
+			shortId: repoShortId,
 			name: "Org 1 Repo",
 			type: "local",
 			config: { backend: "local", name: "org1repo", path: "/tmp/repo1" },
 			organizationId: session1.organizationId,
 		});
 
-		const res = await app.request(`/api/v1/repositories/${repoId}`, {
-			headers: getAuthHeaders(session2.token),
+		const res = await app.request(`/api/v1/repositories/${repoShortId}`, {
+			headers: session2.headers,
 		});
 
 		expect(res.status).toBe(404);
 		const body = await res.json();
 		expect(body.message).toBe("Repository not found");
 
-		const resOk = await app.request(`/api/v1/repositories/${repoId}`, {
-			headers: getAuthHeaders(session1.token),
+		const resOk = await app.request(`/api/v1/repositories/${repoShortId}`, {
+			headers: session1.headers,
 		});
 		expect(resOk.status).toBe(200);
 	});
 
 	test("should not list repositories from another organization", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		await db.insert(repositoriesTable).values({
 			id: crypto.randomUUID(),
 			shortId: generateShortId(),
@@ -108,29 +125,27 @@ describe("multi-organization isolation", () => {
 		});
 
 		const res1 = await app.request("/api/v1/repositories", {
-			headers: getAuthHeaders(session1.token),
+			headers: session1.headers,
 		});
 		const list1 = await res1.json();
 
 		expect(list1.length).toBeGreaterThanOrEqual(1);
-		expect(list1.some((r: any) => r.name === "Org 2 Repo")).toBe(false);
+		expect(list1.some((r: { name: string }) => r.name === "Org 2 Repo")).toBe(false);
 
 		const res2 = await app.request("/api/v1/repositories", {
-			headers: getAuthHeaders(session2.token),
+			headers: session2.headers,
 		});
 		const list2 = await res2.json();
-		expect(list2.some((r: any) => r.name === "Org 1 Repo")).toBe(false);
-		expect(list2.some((r: any) => r.name === "Org 2 Repo")).toBe(true);
+		expect(list2.some((r: { name: string }) => r.name === "Org 1 Repo")).toBe(false);
+		expect(list2.some((r: { name: string }) => r.name === "Org 2 Repo")).toBe(true);
 	});
 
 	test("should not be able to access volumes from another organization", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		const volumeId = Math.floor(Math.random() * 1000000);
+		const volumeShortId = generateShortId();
 		await db.insert(volumesTable).values({
 			id: volumeId,
-			shortId: generateShortId(),
+			shortId: volumeShortId,
 			name: "Org 1 Volume",
 			type: "directory",
 			config: { backend: "directory", path: "/tmp/vol1" },
@@ -138,17 +153,14 @@ describe("multi-organization isolation", () => {
 			status: "unmounted",
 		});
 
-		const res = await app.request(`/api/v1/volumes/${volumeId}`, {
-			headers: getAuthHeaders(session2.token),
+		const res = await app.request(`/api/v1/volumes/${volumeShortId}`, {
+			headers: session2.headers,
 		});
 
 		expect(res.status).toBe(404);
 	});
 
 	test("should not be able to create a backup schedule referencing resources from another organization", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		const vol1Id = Math.floor(Math.random() * 1000000);
 		await db.insert(volumesTable).values({
 			id: vol1Id,
@@ -173,7 +185,7 @@ describe("multi-organization isolation", () => {
 		const res = await app.request("/api/v1/backups", {
 			method: "POST",
 			headers: {
-				...getAuthHeaders(session2.token),
+				...session2.headers,
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify({
@@ -189,9 +201,6 @@ describe("multi-organization isolation", () => {
 	});
 
 	test("should not be able to access backup schedules from another organization", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		const vol1Id = Math.floor(Math.random() * 1000000);
 		await db.insert(volumesTable).values({
 			id: vol1Id,
@@ -224,22 +233,19 @@ describe("multi-organization isolation", () => {
 			})
 			.returning();
 
-		const res = await app.request(`/api/v1/backups/${schedule.id}`, {
-			headers: getAuthHeaders(session2.token),
+		const res = await app.request(`/api/v1/backups/${schedule.shortId}`, {
+			headers: session2.headers,
 		});
 
 		expect(res.status).toBe(404);
 
-		const resOk = await app.request(`/api/v1/backups/${schedule.id}`, {
-			headers: getAuthHeaders(session1.token),
+		const resOk = await app.request(`/api/v1/backups/${schedule.shortId}`, {
+			headers: session1.headers,
 		});
 		expect(resOk.status).toBe(200);
 	});
 
 	test("should not be able to access or modify notifications for another organization's schedule", async () => {
-		const session1 = await createTestSession();
-		const session2 = await createTestSession();
-
 		const volId = Math.floor(Math.random() * 1000000);
 		await db.insert(volumesTable).values({
 			id: volId,
@@ -293,15 +299,15 @@ describe("multi-organization isolation", () => {
 			notifyOnFailure: true,
 		});
 
-		const resGet = await app.request(`/api/v1/backups/${schedule.id}/notifications`, {
-			headers: getAuthHeaders(session2.token),
+		const resGet = await app.request(`/api/v1/backups/${schedule.shortId}/notifications`, {
+			headers: session2.headers,
 		});
 		expect(resGet.status).toBe(404);
 
-		const resPut = await app.request(`/api/v1/backups/${schedule.id}/notifications`, {
+		const resPut = await app.request(`/api/v1/backups/${schedule.shortId}/notifications`, {
 			method: "PUT",
 			headers: {
-				...getAuthHeaders(session2.token),
+				...session2.headers,
 				"Content-Type": "application/json",
 			},
 			body: JSON.stringify({

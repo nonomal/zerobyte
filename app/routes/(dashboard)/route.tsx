@@ -1,0 +1,71 @@
+import { createFileRoute, redirect } from "@tanstack/react-router";
+import { createServerFn } from "@tanstack/react-start";
+import { getCookie, getRequestHeaders } from "@tanstack/react-start/server";
+import { Layout } from "~/client/components/layout";
+import { RouteError } from "~/client/components/route-error";
+import { authMiddleware } from "~/middleware/auth";
+import { auth } from "~/server/lib/auth";
+import { getCurrentPermissionsOptions } from "~/server/lib/functions/current-permissions";
+import { getOrganizationContext } from "~/server/lib/functions/organization-context";
+import { getServerConstants } from "~/server/lib/functions/server-constants";
+import { isPasswordAuthSupported, userHasPassword } from "~/server/modules/auth/helpers";
+import { authService } from "~/server/modules/auth/auth.service";
+import { RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME } from "~/lib/recovery-key-skip";
+import { getSystemInfoOptions } from "~/client/api-client/@tanstack/react-query.gen";
+
+export const fetchUser = createServerFn({ method: "GET" }).handler(async () => {
+	const headers = getRequestHeaders();
+	const session = await auth.api.getSession({ headers });
+	const hasUsers = await authService.hasUsers();
+	const passwordAuthSupported = isPasswordAuthSupported();
+	const hasPassword = passwordAuthSupported && session?.user ? await userHasPassword(session.user.id) : false;
+
+	const hasSkippedRecoveryKeyDownload =
+		!!session?.user && getCookie(RECOVERY_KEY_DOWNLOAD_SKIPPED_COOKIE_NAME) === session.user.id;
+
+	return {
+		user: session?.user ? { ...session.user, hasPassword } : null,
+		passwordAuthSupported,
+		hasUsers,
+		hasSkippedRecoveryKeyDownload,
+	};
+});
+
+export const Route = createFileRoute("/(dashboard)")({
+	component: PathlessLayoutComponent,
+	errorComponent: RouteError,
+	server: {
+		middleware: [authMiddleware],
+	},
+	beforeLoad: async ({ context }) => context.queryClient.fetchQuery(getCurrentPermissionsOptions()),
+	loader: async ({ context }) => {
+		const [authContext] = await Promise.all([
+			fetchUser(),
+			context.queryClient.ensureQueryData(getSystemInfoOptions()),
+			context.queryClient.ensureQueryData({
+				queryKey: ["organization-context"],
+				queryFn: () => getOrganizationContext(),
+			}),
+			context.queryClient.ensureQueryData({
+				queryKey: ["server-constants"],
+				queryFn: () => getServerConstants(),
+			}),
+		]);
+
+		if (
+			authContext.user &&
+			!authContext.user.hasDownloadedResticPassword &&
+			!authContext.hasSkippedRecoveryKeyDownload
+		) {
+			throw redirect({ to: "/download-recovery-key" });
+		}
+
+		return authContext;
+	},
+});
+
+function PathlessLayoutComponent() {
+	const loaderData = Route.useLoaderData();
+
+	return <Layout loaderData={loaderData} />;
+}

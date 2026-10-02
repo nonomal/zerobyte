@@ -1,36 +1,35 @@
-import { LifeBuoy } from "lucide-react";
-import { Outlet, redirect, useNavigate } from "react-router";
+import { LifeBuoy, LogOut } from "lucide-react";
 import { toast } from "sonner";
-import { appContext } from "~/context";
-import { authMiddleware } from "~/middleware/auth";
-import type { Route } from "./+types/layout";
-import { AppBreadcrumb } from "./app-breadcrumb";
+import { type AppContext } from "~/context";
 import { GridBackground } from "./grid-background";
-import { Button } from "./ui/button";
+import { Button, buttonVariants } from "./ui/button";
 import { SidebarProvider, SidebarTrigger } from "./ui/sidebar";
 import { AppSidebar } from "./app-sidebar";
 import { authClient } from "../lib/auth-client";
+import { DevPanelListener } from "./dev-panel-listener";
+import { Outlet, useNavigate } from "@tanstack/react-router";
+import { AppBreadcrumb } from "./app-breadcrumb";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./ui/tooltip";
+import { ThemeToggle } from "./theme-toggle";
+import { PermissionsProvider, usePermissions } from "../hooks/use-permissions";
+import { useOrganizationContext } from "../hooks/use-org-context";
+import { RecoveryKeyReminder } from "./recovery-key-reminder";
+import { useSystemInfo } from "../hooks/use-system-info";
 
-export const clientMiddleware = [authMiddleware];
+type Props = {
+	loaderData: AppContext;
+};
 
-export async function clientLoader({ context }: Route.LoaderArgs) {
-	const ctx = context.get(appContext);
-
-	if (ctx.user && !ctx.user.hasDownloadedResticPassword) {
-		throw redirect("/download-recovery-key");
-	}
-
-	return ctx;
-}
-
-export default function Layout({ loaderData }: Route.ComponentProps) {
+export function Layout({ loaderData }: Props) {
 	const navigate = useNavigate();
+	const { runtime } = useSystemInfo();
+	const isDesktop = runtime === "desktop";
 
 	const handleLogout = async () => {
 		await authClient.signOut({
 			fetchOptions: {
 				onSuccess: () => {
-					void navigate("/login", { replace: true });
+					void navigate({ to: "/login", replace: true });
 				},
 				onError: ({ error }) => {
 					toast.error("Logout failed", { description: error.message });
@@ -40,49 +39,88 @@ export default function Layout({ loaderData }: Route.ComponentProps) {
 	};
 
 	return (
-		<SidebarProvider defaultOpen={true}>
-			<AppSidebar />
-			<div className="w-full relative flex flex-col h-screen overflow-hidden">
-				<header className="z-50 bg-card-header border-b border-border/50 shrink-0">
-					<div className="flex items-center justify-between py-3 sm:py-4 px-2 sm:px-8 mx-auto container gap-4">
-						<div className="flex items-center gap-4 min-w-0">
-							<SidebarTrigger />
-							<AppBreadcrumb />
-						</div>
-						{loaderData.user && (
-							<div className="flex items-center gap-4">
-								<span className="text-sm text-muted-foreground hidden md:inline-flex">
-									Welcome,&nbsp;
-									<span className="text-strong-accent">{loaderData.user?.username}</span>
-								</span>
-								<Button variant="default" size="sm" onClick={handleLogout}>
-									Logout
-								</Button>
-								<Button variant="default" size="sm" className="relative overflow-hidden hidden lg:inline-flex">
-									<a
-										href="https://github.com/nicotsx/zerobyte/issues/new"
-										target="_blank"
-										rel="noreferrer"
-										className="flex items-center gap-2"
-									>
-										<span className="flex items-center gap-2">
-											<LifeBuoy />
-											<span>Report an issue</span>
-										</span>
-									</a>
-								</Button>
+		<SidebarProvider className="relative">
+			<PermissionsProvider>
+				<AppSidebar />
+				<DashboardRecoveryKeyReminder />
+				<div className="w-full relative flex flex-col min-h-screen md:h-screen md:overflow-hidden">
+					<header className="z-50 bg-card-header border-b border-border/80 dark:border-border/50 shrink-0 h-16.25">
+						<div className="flex items-center h-full justify-between px-2 sm:px-8 mx-auto container gap-4">
+							<div className="flex items-center gap-4 min-w-0">
+								<SidebarTrigger />
+								<AppBreadcrumb />
 							</div>
-						)}
+							{loaderData.user && (
+								<div className="flex items-center bg-card dark:bg-muted/30 border border-border/80 dark:border-border/50 px-2 py-1 rounded-full shadow-[0_2px_10px_-4px_rgba(0,0,0,0.05)] dark:shadow-sm">
+									{!isDesktop && (
+										<span className="text-sm text-muted-foreground hidden md:inline-flex pl-2 mr-5">
+											<span className="text-foreground">{loaderData.user.name}</span>
+										</span>
+									)}
+									<ThemeToggle />
+									{!isDesktop && (
+										<Tooltip>
+											<TooltipTrigger asChild>
+												<Button
+													variant="ghost"
+													size="icon"
+													className="rounded-full h-7 text-xs text-muted-foreground hover:text-foreground"
+													onClick={handleLogout}
+													aria-label="Logout"
+												>
+													<LogOut className="w-4 h-4" />
+												</Button>
+											</TooltipTrigger>
+											<TooltipContent>Logout</TooltipContent>
+										</Tooltip>
+									)}
+									<Tooltip>
+										<TooltipTrigger asChild>
+											<a
+												href="https://github.com/nicotsx/zerobyte/issues/new/choose"
+												target="_blank"
+												rel="noreferrer"
+												className={buttonVariants({
+													variant: "ghost",
+													size: "icon",
+													className:
+														"relative overflow-hidden hidden lg:inline-flex rounded-full h-7 w-7 text-muted-foreground hover:text-foreground",
+												})}
+											>
+												<LifeBuoy className="w-4 h-4" />
+											</a>
+										</TooltipTrigger>
+										<TooltipContent>Report an issue</TooltipContent>
+									</Tooltip>
+								</div>
+							)}
+						</div>
+					</header>
+					<div className="main-content flex-1 md:overflow-y-auto">
+						<GridBackground>
+							<main className="flex flex-col p-2 pb-6 pt-2 sm:p-8 sm:pt-6 mx-auto">
+								<Outlet />
+							</main>
+						</GridBackground>
 					</div>
-				</header>
-				<div className="main-content flex-1 overflow-y-auto">
-					<GridBackground>
-						<main className="flex flex-col p-2 pb-6 pt-2 sm:p-8 sm:pt-6 mx-auto @container">
-							<Outlet />
-						</main>
-					</GridBackground>
 				</div>
-			</div>
+				<DevPanelListener />
+			</PermissionsProvider>
 		</SidebarProvider>
+	);
+}
+
+export function DashboardRecoveryKeyReminder() {
+	const { activeOrganization } = useOrganizationContext();
+	const permissions = usePermissions();
+	const permissionsMatchActiveOrganization = permissions.activeOrganizationId === activeOrganization.id;
+	const canDownloadRecoveryKey = permissionsMatchActiveOrganization && permissions.can("recoveryKey.download");
+
+	return (
+		<RecoveryKeyReminder
+			key={activeOrganization.id}
+			organization={activeOrganization}
+			canDownloadRecoveryKey={canDownloadRecoveryKey}
+		/>
 	);
 }

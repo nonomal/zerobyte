@@ -1,0 +1,73 @@
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { listFilesOptions } from "~/client/api-client/@tanstack/react-query.gen";
+import { FileBrowser, type FileBrowserUiProps } from "~/client/components/file-browsers/file-browser";
+import { useFileBrowser, type FetchFolderResult } from "~/client/hooks/use-file-browser";
+import { parseError } from "~/client/lib/errors";
+import { logger } from "~/client/lib/logger";
+import { useIsDesktop } from "~/client/hooks/use-is-desktop";
+import { FolderAccessError } from "./folder-access-error";
+
+type VolumeFileBrowserProps = FileBrowserUiProps & {
+	volumeId: string;
+	enabled?: boolean;
+};
+
+export const VolumeFileBrowser = ({ volumeId, enabled = true, ...uiProps }: VolumeFileBrowserProps) => {
+	const queryClient = useQueryClient();
+	const isDesktop = useIsDesktop();
+
+	const { data, isLoading, error } = useQuery({
+		...listFilesOptions({ path: { shortId: volumeId } }),
+		enabled,
+	});
+
+	const fileBrowser = useFileBrowser({
+		initialData: data,
+		isLoading,
+		fetchFolder: async (path, offset): Promise<FetchFolderResult> => {
+			return await queryClient.ensureQueryData(
+				listFilesOptions({
+					path: { shortId: volumeId },
+					query: { path, offset: offset },
+				}),
+			);
+		},
+		prefetchFolder: isDesktop
+			? undefined
+			: (path) => {
+					void queryClient
+						.prefetchQuery(
+							listFilesOptions({
+								path: { shortId: volumeId },
+								query: { path },
+							}),
+						)
+						.catch((e) => logger.error(e));
+				},
+	});
+
+	return (
+		<FileBrowser
+			{...uiProps}
+			folderErrors={fileBrowser.folderErrors}
+			renderError={(message) => (
+				<FolderAccessError
+					message={message}
+					openPrivacySettings={isDesktop ? window.zerobyteDesktop?.openPrivacySettings : undefined}
+				/>
+			)}
+			fileArray={fileBrowser.fileArray}
+			expandedFolders={fileBrowser.expandedFolders}
+			loadingFolders={fileBrowser.loadingFolders}
+			onFolderToggle={fileBrowser.handleFolderToggle}
+			onFolderHover={fileBrowser.handleFolderHover}
+			onLoadMore={fileBrowser.handleLoadMore}
+			getFolderPagination={fileBrowser.getFolderPagination}
+			isLoading={fileBrowser.isLoading}
+			isEmpty={fileBrowser.isEmpty}
+			errorMessage={parseError(error)?.message}
+			loadingMessage={uiProps.loadingMessage ?? "Loading files..."}
+			emptyMessage={uiProps.emptyMessage ?? "This volume appears to be empty."}
+		/>
+	);
+};

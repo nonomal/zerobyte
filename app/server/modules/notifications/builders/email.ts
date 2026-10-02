@@ -1,14 +1,23 @@
 import type { NotificationConfig } from "~/schemas/notifications";
 
 export const buildEmailShoutrrrUrl = (config: Extract<NotificationConfig, { type: "email" }>) => {
-	const auth =
-		config.username && config.password
-			? `${encodeURIComponent(config.username)}:${encodeURIComponent(config.password)}@`
-			: "";
-	const host = `${config.smtpHost}:${config.smtpPort}`;
-	const toRecipients = config.to.map((email) => encodeURIComponent(email)).join(",");
-	const useStartTLS = config.useTLS ? "yes" : "no";
-	const fromNameParam = config.fromName ? `&fromname=${encodeURIComponent(config.fromName)}` : "";
+	const shoutrrrUrl = new URL("smtp://placeholder");
 
-	return `smtp://${auth}${host}/?from=${encodeURIComponent(config.from)}${fromNameParam}&to=${toRecipients}&starttls=${useStartTLS}`;
+	shoutrrrUrl.hostname = config.smtpHost;
+	shoutrrrUrl.port = String(config.smtpPort);
+	shoutrrrUrl.pathname = "/";
+
+	let auth = "";
+	if (config.username && config.password) {
+		auth = `${encodeURIComponent(config.username)}:${encodeURIComponent(config.password)}@`;
+	}
+
+	shoutrrrUrl.searchParams.set("from", config.from);
+	if (config.fromName) {
+		shoutrrrUrl.searchParams.set("fromname", config.fromName);
+	}
+	shoutrrrUrl.searchParams.set("to", config.to.join(","));
+	shoutrrrUrl.searchParams.set("starttls", config.useTLS ? "yes" : "no");
+
+	return shoutrrrUrl.toString().replace("smtp://", `smtp://${auth}`);
 };

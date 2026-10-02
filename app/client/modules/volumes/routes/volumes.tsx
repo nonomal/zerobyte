@@ -1,7 +1,15 @@
-import { useQuery } from "@tanstack/react-query";
+import { useSuspenseQuery } from "@tanstack/react-query";
+import {
+	createColumnHelper,
+	flexRender,
+	type ColumnFiltersState,
+	type SortingState,
+	useTable,
+} from "@tanstack/react-table";
 import { HardDrive, Plus, RotateCcw } from "lucide-react";
 import { useState } from "react";
-import { useNavigate } from "react-router";
+import { listVolumesOptions } from "~/client/api-client/@tanstack/react-query.gen";
+import { DataTableSortHeader } from "~/client/components/data-table-sort-header";
 import { EmptyState } from "~/client/components/empty-state";
 import { StatusDot } from "~/client/components/status-dot";
 import { Button } from "~/client/components/ui/button";
@@ -10,10 +18,11 @@ import { Input } from "~/client/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/client/components/ui/table";
 import { VolumeIcon } from "~/client/components/volume-icon";
-import type { Route } from "./+types/volumes";
-import { listVolumes } from "~/client/api-client";
-import { listVolumesOptions } from "~/client/api-client/@tanstack/react-query.gen";
 import type { VolumeStatus } from "~/client/lib/types";
+import { useNavigate } from "@tanstack/react-router";
+import { dataTableFeatures } from "~/client/lib/data-table";
+import { cn } from "~/client/lib/utils";
+import { useCookieState } from "~/client/hooks/use-cookie-state";
 
 const getVolumeStatusVariant = (status: VolumeStatus): "success" | "neutral" | "error" | "warning" => {
 	const statusMap = {
@@ -25,54 +34,66 @@ const getVolumeStatusVariant = (status: VolumeStatus): "success" | "neutral" | "
 	return statusMap[status];
 };
 
-export const handle = {
-	breadcrumb: () => [{ label: "Volumes" }],
+type VolumeRow = {
+	shortId: string;
+	name: string;
+	type: "directory" | "nfs" | "smb" | "webdav" | "sftp" | "rclone";
+	status: VolumeStatus;
 };
 
-export function meta(_: Route.MetaArgs) {
-	return [
-		{ title: "Zerobyte - Volumes" },
-		{
-			name: "description",
-			content: "Create, manage, monitor, and automate your Docker volumes with ease.",
-		},
-	];
-}
+const volumeColumnHelper = createColumnHelper<typeof dataTableFeatures, VolumeRow>();
+const volumeColumns = volumeColumnHelper.columns([
+	volumeColumnHelper.accessor("name", {
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Name" sortDirection={column.getIsSorted()} />
+		),
+		cell: ({ row }) => (
+			<div className="flex items-center gap-2">
+				<span>{row.original.name}</span>
+			</div>
+		),
+	}),
+	volumeColumnHelper.accessor("type", {
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Backend" sortDirection={column.getIsSorted()} />
+		),
+		cell: ({ row }) => <VolumeIcon backend={row.original.type} />,
+		filterFn: (row, id, value) => row.getValue(id) === value,
+	}),
+	volumeColumnHelper.accessor("status", {
+		header: ({ column }) => (
+			<DataTableSortHeader column={column} title="Status" sortDirection={column.getIsSorted()} center />
+		),
+		cell: ({ row }) => (
+			<StatusDot variant={getVolumeStatusVariant(row.original.status)} label={row.original.status} />
+		),
+		filterFn: (row, id, value) => row.getValue(id) === value,
+	}),
+]);
 
-export const clientLoader = async () => {
-	const volumes = await listVolumes();
-	if (volumes.data) return volumes.data;
-	return [];
-};
-
-export default function Volumes({ loaderData }: Route.ComponentProps) {
-	const [searchQuery, setSearchQuery] = useState("");
-	const [statusFilter, setStatusFilter] = useState("");
-	const [backendFilter, setBackendFilter] = useState("");
-
-	const clearFilters = () => {
-		setSearchQuery("");
-		setStatusFilter("");
-		setBackendFilter("");
-	};
+export function VolumesPage() {
+	const [columnFilters, setColumnFilters] = useState<ColumnFiltersState>([]);
+	const [sorting, setSorting] = useCookieState<SortingState>("sorting_volumes", []);
 
 	const navigate = useNavigate();
+	const { data } = useSuspenseQuery({ ...listVolumesOptions() });
 
-	const { data } = useQuery({
-		...listVolumesOptions(),
-		initialData: loaderData,
+	const table = useTable({
+		features: dataTableFeatures,
+		data,
+		columns: volumeColumns,
+		state: { columnFilters, sorting },
+		onColumnFiltersChange: setColumnFilters,
+		onSortingChange: setSorting,
 	});
 
-	const filteredVolumes =
-		data.filter((volume) => {
-			const matchesSearch = volume.name.toLowerCase().includes(searchQuery.toLowerCase());
-			const matchesStatus = !statusFilter || volume.status === statusFilter;
-			const matchesBackend = !backendFilter || volume.type === backendFilter;
-			return matchesSearch && matchesStatus && matchesBackend;
-		}) || [];
+	const rows = table.getRowModel().rows;
+	const hasFilters = columnFilters.length > 0;
+
+	const clearFilters = () => table.resetColumnFilters();
 
 	const hasNoVolumes = data.length === 0;
-	const hasNoFilteredVolumes = filteredVolumes.length === 0 && !hasNoVolumes;
+	const hasNoFilteredVolumes = rows.length === 0 && !hasNoVolumes;
 
 	if (hasNoVolumes) {
 		return (
@@ -81,7 +102,7 @@ export default function Volumes({ loaderData }: Route.ComponentProps) {
 				title="No volume"
 				description="Manage and monitor all your storage backends in one place with advanced features like automatic mounting and health checks."
 				button={
-					<Button onClick={() => navigate("/volumes/create")}>
+					<Button onClick={() => navigate({ to: "/volumes/create" })}>
 						<Plus size={16} className="mr-2" />
 						Create Volume
 					</Button>
@@ -90,18 +111,22 @@ export default function Volumes({ loaderData }: Route.ComponentProps) {
 		);
 	}
 
+	const search = (table.getColumn("name")?.getFilterValue() as string) ?? "";
+	const status = (table.getColumn("status")?.getFilterValue() as string) ?? "";
+	const type = (table.getColumn("type")?.getFilterValue() as string) ?? "";
+
 	return (
 		<Card className="p-0 gap-0">
 			<div className="flex flex-col lg:flex-row items-stretch lg:items-center gap-2 md:justify-between p-4 bg-card-header py-4">
-				<span className="flex flex-col sm:flex-row items-stretch md:items-center gap-0 flex-wrap ">
+				<span className="flex flex-col sm:flex-row items-stretch md:items-center gap-2 flex-wrap">
 					<Input
-						className="w-full lg:w-[180px] min-w-[180px] -mr-px -mt-px"
-						placeholder="Search volumes…"
-						value={searchQuery}
-						onChange={(e) => setSearchQuery(e.target.value)}
+						className="w-full lg:w-45 min-w-45"
+						placeholder="Search…"
+						value={search}
+						onChange={(e) => table.getColumn("name")?.setFilterValue(e.target.value)}
 					/>
-					<Select value={statusFilter} onValueChange={setStatusFilter}>
-						<SelectTrigger className="w-full lg:w-[180px] min-w-[180px] -mr-px -mt-px">
+					<Select value={status} onValueChange={(value) => table.getColumn("status")?.setFilterValue(value)}>
+						<SelectTrigger className="w-full lg:w-45 min-w-45">
 							<SelectValue placeholder="All status" />
 						</SelectTrigger>
 						<SelectContent>
@@ -110,24 +135,27 @@ export default function Volumes({ loaderData }: Route.ComponentProps) {
 							<SelectItem value="error">Error</SelectItem>
 						</SelectContent>
 					</Select>
-					<Select value={backendFilter} onValueChange={setBackendFilter}>
-						<SelectTrigger className="w-full lg:w-[180px] min-w-[180px] -mt-px">
+					<Select value={type} onValueChange={(value) => table.getColumn("type")?.setFilterValue(value)}>
+						<SelectTrigger className="w-full lg:w-45 min-w-45">
 							<SelectValue placeholder="All backends" />
 						</SelectTrigger>
 						<SelectContent>
 							<SelectItem value="directory">Directory</SelectItem>
 							<SelectItem value="nfs">NFS</SelectItem>
 							<SelectItem value="smb">SMB</SelectItem>
+							<SelectItem value="webdav">WebDAV</SelectItem>
+							<SelectItem value="sftp">SFTP</SelectItem>
+							<SelectItem value="rclone">rclone</SelectItem>
 						</SelectContent>
 					</Select>
-					{(searchQuery || statusFilter || backendFilter) && (
+					{hasFilters && (
 						<Button onClick={clearFilters} className="w-full lg:w-auto mt-2 lg:mt-0 lg:ml-2">
 							<RotateCcw className="h-4 w-4 mr-2" />
 							Clear filters
 						</Button>
 					)}
 				</span>
-				<Button onClick={() => navigate("/volumes/create")}>
+				<Button onClick={() => navigate({ to: "/volumes/create" })}>
 					<Plus size={16} className="mr-2" />
 					Create Volume
 				</Button>
@@ -135,55 +163,67 @@ export default function Volumes({ loaderData }: Route.ComponentProps) {
 			<div className="overflow-x-auto">
 				<Table className="border-t">
 					<TableHeader className="bg-card-header">
-						<TableRow>
-							<TableHead className="w-[100px] uppercase">Name</TableHead>
-							<TableHead className="uppercase text-left">Backend</TableHead>
-							<TableHead className="uppercase text-center">Status</TableHead>
-						</TableRow>
+						{table.getHeaderGroups().map((headerGroup) => (
+							<TableRow key={headerGroup.id}>
+								{headerGroup.headers.map((header) => (
+									<TableHead
+										key={header.id}
+										className={cn("uppercase", {
+											"w-25": header.column.id === "name",
+											"text-left": header.column.id === "type",
+											"text-center": header.column.id === "status",
+										})}
+									>
+										{header.isPlaceholder
+											? null
+											: flexRender(header.column.columnDef.header, header.getContext())}
+									</TableHead>
+								))}
+							</TableRow>
+						))}
 					</TableHeader>
 					<TableBody>
-						{hasNoFilteredVolumes ? (
-							<TableRow>
-								<TableCell colSpan={4} className="text-center py-12">
-									<div className="flex flex-col items-center gap-3">
-										<p className="text-muted-foreground">No volumes match your filters.</p>
-										<Button onClick={clearFilters} variant="outline" size="sm">
-											<RotateCcw className="h-4 w-4 mr-2" />
-											Clear filters
-										</Button>
-									</div>
-								</TableCell>
+						<TableRow className={cn({ hidden: !hasNoFilteredVolumes })}>
+							<TableCell colSpan={3} className="text-center py-12">
+								<div className="flex flex-col items-center gap-3">
+									<p className="text-muted-foreground">No volumes match your filters.</p>
+									<Button onClick={clearFilters} variant="outline" size="sm">
+										<RotateCcw className="h-4 w-4 mr-2" />
+										Clear filters
+									</Button>
+								</div>
+							</TableCell>
+						</TableRow>
+						{rows.map((row) => (
+							<TableRow
+								key={row.original.shortId}
+								className="hover:bg-muted/50 hover:cursor-pointer transition-colors h-12"
+								onClick={() => navigate({ to: `/volumes/${row.original.shortId}` })}
+							>
+								{row.getVisibleCells().map((cell) => (
+									<TableCell
+										key={cell.id}
+										className={cn("font-mono", {
+											"font-medium text-strong-accent": cell.column.id === "name",
+											"text-muted-foreground": cell.column.id === "type",
+											"text-center": cell.column.id === "status",
+										})}
+									>
+										{flexRender(cell.column.columnDef.cell, cell.getContext())}
+									</TableCell>
+								))}
 							</TableRow>
-						) : (
-							filteredVolumes.map((volume) => (
-								<TableRow
-									key={volume.name}
-									className="hover:bg-accent/50 hover:cursor-pointer"
-									onClick={() => navigate(`/volumes/${volume.shortId}`)}
-								>
-									<TableCell className="font-medium text-strong-accent">{volume.name}</TableCell>
-									<TableCell>
-										<VolumeIcon backend={volume.type} />
-									</TableCell>
-									<TableCell className="text-center">
-										<StatusDot
-											variant={getVolumeStatusVariant(volume.status)}
-											label={volume.status[0].toUpperCase() + volume.status.slice(1)}
-										/>
-									</TableCell>
-								</TableRow>
-							))
-						)}
+						))}
 					</TableBody>
 				</Table>
 			</div>
-			<div className="px-4 py-2 text-sm text-muted-foreground bg-card-header flex justify-end border-t">
+			<div className="px-4 py-2 text-sm text-muted-foreground bg-card-header flex justify-end border-t font-mono">
 				{hasNoFilteredVolumes ? (
 					"No volumes match filters."
 				) : (
-					<span>
-						<span className="text-strong-accent">{filteredVolumes.length}</span> volume
-						{filteredVolumes.length > 1 ? "s" : ""}
+					<span className="font-mono">
+						<span className="text-strong-accent font-bold">{rows.length}</span> volume
+						{rows.length > 1 ? "s" : ""}
 					</span>
 				)}
 			</div>

@@ -58,7 +58,7 @@ export const RcloneForm = ({ form }: Props) => {
 				render={({ field }) => (
 					<FormItem>
 						<FormLabel>Remote</FormLabel>
-						<Select onValueChange={(v) => field.onChange(v)} value={field.value}>
+						<Select onValueChange={(v) => field.onChange(v)} value={field.value ?? ""}>
 							<FormControl>
 								<SelectTrigger>
 									<SelectValue placeholder="Select an rclone remote" />
@@ -108,6 +108,7 @@ export const RcloneForm = ({ form }: Props) => {
 							<div className="flex items-center space-x-2">
 								<input
 									type="checkbox"
+									aria-label="Mount volume as read-only"
 									checked={field.value ?? false}
 									onChange={(e) => field.onChange(e.target.checked)}
 									className="rounded border-gray-300"

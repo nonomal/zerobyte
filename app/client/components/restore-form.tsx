@@ -1,176 +1,278 @@
 import { useCallback, useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useNavigate } from "react-router";
-import { toast } from "sonner";
-import { ChevronDown, FileIcon, FolderOpen, RotateCcw } from "lucide-react";
+import { useMutation } from "@tanstack/react-query";
+import { AlertTriangle, ChevronDown, Download, FolderOpen, RotateCcw, Square } from "lucide-react";
 import { Button } from "~/client/components/ui/button";
+import { Tooltip, TooltipContent, TooltipTrigger } from "~/client/components/ui/tooltip";
+import { Alert, AlertDescription, AlertTitle } from "~/client/components/ui/alert";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
-import { Checkbox } from "~/client/components/ui/checkbox";
 import { Input } from "~/client/components/ui/input";
 import { Label } from "~/client/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
-import { PathSelector } from "~/client/components/path-selector";
-import { FileTree } from "~/client/components/file-tree";
-import { listSnapshotFilesOptions, restoreSnapshotMutation } from "~/client/api-client/@tanstack/react-query.gen";
-import { useFileBrowser } from "~/client/hooks/use-file-browser";
-import { OVERWRITE_MODES, type OverwriteMode } from "~/schemas/restic";
+import {
+	AlertDialog,
+	AlertDialogAction,
+	AlertDialogContent,
+	AlertDialogDescription,
+	AlertDialogFooter,
+	AlertDialogHeader,
+	AlertDialogTitle,
+} from "~/client/components/ui/alert-dialog";
+import { FolderSelector } from "~/client/components/folder-selector";
+import { SnapshotTreeBrowser } from "~/client/components/file-browsers/snapshot-tree-browser";
+import { RestoreProgress } from "~/client/components/restore-progress";
+import { cancelTaskMutation, restoreSnapshotMutation } from "~/client/api-client/@tanstack/react-query.gen";
+import { useRestoreTask } from "~/client/modules/repositories/restore-tasks";
+import { OVERWRITE_MODES, type OverwriteMode } from "@zerobyte/core/restic";
+import { isPathWithin } from "@zerobyte/core/utils";
 import type { Repository, Snapshot } from "~/client/lib/types";
+import { handleRepositoryError } from "~/client/lib/errors";
+import { useNavigate } from "@tanstack/react-router";
+import { cn } from "~/client/lib/utils";
+import { useTimeFormat } from "~/client/lib/datetime";
 
 type RestoreLocation = "original" | "custom";
 
 interface RestoreFormProps {
-	snapshot: Snapshot;
 	repository: Repository;
-	snapshotId: string;
+	snapshot: Snapshot;
 	returnPath: string;
+	queryBasePath?: string;
+	displayBasePath?: string;
+	hasNonPosixSnapshotPaths?: boolean;
+	volumeReadOnly?: boolean;
 }
 
-export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: RestoreFormProps) {
+export function RestoreForm({
+	repository,
+	snapshot,
+	returnPath,
+	queryBasePath,
+	displayBasePath,
+	hasNonPosixSnapshotPaths = false,
+	volumeReadOnly = false,
+}: RestoreFormProps) {
+	const snapshotId = snapshot.short_id;
 	const navigate = useNavigate();
-	const queryClient = useQueryClient();
+	const { formatDateTime } = useTimeFormat();
 
-	const volumeBasePath = snapshot.paths[0]?.match(/^(.*?_data)(\/|$)/)?.[1] || "/";
+	const snapshotBasePath = queryBasePath ?? "/";
+	const hasMismatchedDisplayBasePath = displayBasePath && !isPathWithin(displayBasePath, snapshotBasePath);
+	const hasSourcePathMismatch = hasNonPosixSnapshotPaths || !!hasMismatchedDisplayBasePath;
+	const restoreRequiresCustomTarget = hasSourcePathMismatch || volumeReadOnly;
 
-	const [restoreLocation, setRestoreLocation] = useState<RestoreLocation>("original");
+	const [restoreLocation, setRestoreLocation] = useState<RestoreLocation>(
+		restoreRequiresCustomTarget ? "custom" : "original",
+	);
 	const [customTargetPath, setCustomTargetPath] = useState("");
 	const [overwriteMode, setOverwriteMode] = useState<OverwriteMode>("always");
 	const [showAdvanced, setShowAdvanced] = useState(false);
 	const [excludeXattr, setExcludeXattr] = useState("");
-	const [deleteExtraFiles, setDeleteExtraFiles] = useState(false);
 
 	const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
+	const [selectedPathKind, setSelectedPathKind] = useState<"file" | "dir" | null>(null);
+	const trimmedCustomTargetPath = customTargetPath.trim();
+	const hasCustomTargetPath = trimmedCustomTargetPath !== "";
+	const selectedPathCount = selectedPaths.size;
 
-	const { data: filesData, isLoading: filesLoading } = useQuery({
-		...listSnapshotFilesOptions({
-			path: { id: repository.id, snapshotId },
-			query: { path: volumeBasePath },
-		}),
-	});
+	if (restoreRequiresCustomTarget && restoreLocation !== "custom") {
+		setRestoreLocation("custom");
+	}
 
-	const stripBasePath = useCallback(
-		(path: string): string => {
-			if (!volumeBasePath) return path;
-			if (path === volumeBasePath) return "/";
-			if (path.startsWith(`${volumeBasePath}/`)) {
-				const stripped = path.slice(volumeBasePath.length);
-				return stripped;
-			}
-			return path;
-		},
-		[volumeBasePath],
-	);
-
-	const addBasePath = useCallback(
-		(displayPath: string): string => {
-			const vbp = volumeBasePath === "/" ? "" : volumeBasePath;
-
-			if (!vbp) return displayPath;
-			if (displayPath === "/") return vbp;
-			return `${vbp}${displayPath}`;
-		},
-		[volumeBasePath],
-	);
-
-	const fileBrowser = useFileBrowser({
-		initialData: filesData,
-		isLoading: filesLoading,
-		fetchFolder: async (path, offset = 0) => {
-			return await queryClient.ensureQueryData(
-				listSnapshotFilesOptions({
-					path: { id: repository.id, snapshotId },
-					query: { path, offset: offset.toString(), limit: "500" },
-				}),
-			);
-		},
-		prefetchFolder: (path) => {
-			void queryClient.prefetchQuery(
-				listSnapshotFilesOptions({
-					path: { id: repository.id, snapshotId },
-					query: { path, offset: "0", limit: "500" },
-				}),
-			);
-		},
-		pathTransform: {
-			strip: stripBasePath,
-			add: addBasePath,
-		},
-	});
-
-	const { mutate: restoreSnapshot, isPending: isRestoring } = useMutation({
+	const {
+		data: restoreStart,
+		mutate: restoreSnapshot,
+		isPending: isRestoring,
+		reset: resetRestoreMutation,
+	} = useMutation({
 		...restoreSnapshotMutation(),
-		onSuccess: () => {
-			toast.success("Restore completed");
-			void navigate(returnPath);
-		},
 		onError: (error) => {
-			toast.error("Restore failed", { description: error.message || "Failed to restore snapshot" });
+			handleRepositoryError("Restore failed", error, repository.shortId);
+		},
+	});
+
+	const {
+		restoreProgress,
+		finishedRestoreTask,
+		clearFinishedRestoreTask,
+		activeRestoreTaskId,
+		isRestoreRunning: isRestoreTaskRunning,
+	} = useRestoreTask(repository.shortId, snapshotId, restoreStart?.restoreId);
+
+	const cancelRestore = useMutation({
+		...cancelTaskMutation(),
+		onError: (error) => {
+			handleRepositoryError("Failed to cancel restore", error, repository.shortId);
 		},
 	});
 
 	const handleRestore = useCallback(() => {
-		const excludeXattrArray = excludeXattr
-			?.split(",")
-			.map((s) => s.trim())
+		const excludeXattrValues = excludeXattr
+			.split(",")
+			.map((value) => value.trim())
 			.filter(Boolean);
 
 		const isCustomLocation = restoreLocation === "custom";
-		const targetPath = isCustomLocation && customTargetPath.trim() ? customTargetPath.trim() : undefined;
+		const targetPath = isCustomLocation && hasCustomTargetPath ? trimmedCustomTargetPath : undefined;
 
-		const pathsArray = Array.from(selectedPaths);
-		const includePaths = pathsArray.map((path) => addBasePath(path));
+		const includePaths = Array.from(selectedPaths);
+
+		clearFinishedRestoreTask();
+		resetRestoreMutation();
 
 		restoreSnapshot({
-			path: { id: repository.id },
+			path: { shortId: repository.shortId },
 			body: {
 				snapshotId,
 				include: includePaths.length > 0 ? includePaths : undefined,
-				delete: deleteExtraFiles,
-				excludeXattr: excludeXattrArray && excludeXattrArray.length > 0 ? excludeXattrArray : undefined,
+				selectedItemKind: includePaths.length === 1 ? (selectedPathKind ?? undefined) : undefined,
+				excludeXattr: excludeXattrValues.length > 0 ? excludeXattrValues : undefined,
 				targetPath,
 				overwrite: overwriteMode,
 			},
 		});
 	}, [
-		repository.id,
+		repository.shortId,
 		snapshotId,
 		excludeXattr,
+		hasCustomTargetPath,
 		restoreLocation,
-		customTargetPath,
+		trimmedCustomTargetPath,
 		selectedPaths,
-		addBasePath,
-		deleteExtraFiles,
+		selectedPathKind,
 		overwriteMode,
+		clearFinishedRestoreTask,
+		resetRestoreMutation,
 		restoreSnapshot,
 	]);
 
-	const canRestore = restoreLocation === "original" || customTargetPath.trim();
+	const handleDownload = useCallback(() => {
+		if (selectedPaths.size > 1) return;
+
+		const url = new URL(
+			`/api/v1/repositories/${repository.shortId}/snapshots/${snapshotId}/dump`,
+			window.location.origin,
+		);
+
+		const [selectedPath] = selectedPaths;
+		if (selectedPath) {
+			url.searchParams.set("path", selectedPath);
+			if (selectedPathKind) {
+				url.searchParams.set("kind", selectedPathKind);
+			}
+		}
+
+		window.location.assign(url.toString());
+	}, [repository.shortId, snapshotId, selectedPathKind, selectedPaths]);
+
+	const acknowledgeRestoreResult = useCallback(() => {
+		clearFinishedRestoreTask();
+		resetRestoreMutation();
+	}, [clearFinishedRestoreTask, resetRestoreMutation]);
+
+	const canRestore = restoreRequiresCustomTarget
+		? hasCustomTargetPath
+		: restoreLocation === "original" || hasCustomTargetPath;
+	const canDownload = selectedPathCount <= 1;
+	const isRestoreRunning = isRestoring || isRestoreTaskRunning;
+
+	function getDownloadButtonText(): string {
+		if (selectedPathCount > 0) {
+			return `Download ${selectedPathCount} ${selectedPathCount === 1 ? "item" : "items"}`;
+		}
+		return "Download All";
+	}
+
+	function getRestoreButtonText(): string {
+		if (isRestoreRunning) {
+			return "Restoring...";
+		}
+		if (selectedPathCount > 0) {
+			return `Restore ${selectedPathCount} ${selectedPathCount === 1 ? "item" : "items"}`;
+		}
+		return "Restore All";
+	}
 
 	return (
 		<div className="space-y-6">
-			<div className="flex items-center justify-between">
+			<div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
 				<div>
 					<h1 className="text-2xl font-bold">Restore Snapshot</h1>
 					<p className="text-sm text-muted-foreground">
 						{repository.name} / {snapshotId}
+						{` / ${snapshot.hostname || "Unknown"} / ${formatDateTime(snapshot.time)}`}
 					</p>
 				</div>
-				<div className="flex gap-2">
-					<Button variant="outline" onClick={() => navigate(returnPath)}>
+				<div className="flex flex-wrap gap-2">
+					<Button variant="outline" onClick={() => navigate({ to: returnPath })}>
 						Cancel
 					</Button>
-					<Button variant="primary" onClick={handleRestore} disabled={isRestoring || !canRestore}>
-						<RotateCcw className="h-4 w-4 mr-2" />
-						{isRestoring
-							? "Restoring..."
-							: selectedPaths.size > 0
-								? `Restore ${selectedPaths.size} ${selectedPaths.size === 1 ? "item" : "items"}`
-								: "Restore All"}
-					</Button>
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<span className="inline-flex">
+								<Button variant="outline" onClick={handleDownload} disabled={!canDownload}>
+									<Download className="h-4 w-4 mr-2" />
+									{getDownloadButtonText()}
+								</Button>
+							</span>
+						</TooltipTrigger>
+						<TooltipContent className={cn({ hidden: canDownload })}>
+							<p>
+								Download is available only for one selected item, or with no selection to download
+								everything.
+							</p>
+						</TooltipContent>
+					</Tooltip>
+					{activeRestoreTaskId ? (
+						<Button
+							variant="destructive"
+							loading={cancelRestore.isPending}
+							onClick={() =>
+								cancelRestore.mutate({
+									path: { taskId: activeRestoreTaskId },
+								})
+							}
+						>
+							<Square className="h-4 w-4 mr-2" />
+							Cancel restore
+						</Button>
+					) : (
+						<Button variant="primary" onClick={handleRestore} disabled={isRestoreRunning || !canRestore}>
+							<RotateCcw className="h-4 w-4 mr-2" />
+							{getRestoreButtonText()}
+						</Button>
+					)}
 				</div>
 			</div>
 
 			<div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 				<div className="space-y-6">
+					{isRestoreRunning && <RestoreProgress progress={restoreProgress} />}
+
+					{restoreRequiresCustomTarget && (
+						<Alert variant="warning">
+							<AlertTriangle className="size-4" />
+							{volumeReadOnly && !hasSourcePathMismatch ? (
+								<>
+									<AlertTitle>Volume is read-only</AlertTitle>
+									<AlertDescription>
+										The volume backing this backup is mounted read-only. Restoring to the original
+										location is unavailable. Restore it to a custom location, or download it
+										instead.
+									</AlertDescription>
+								</>
+							) : (
+								<>
+									<AlertTitle>Source paths do not match</AlertTitle>
+									<AlertDescription>
+										This snapshot was created from source paths that do not match this Zerobyte
+										server or the current linked volume. Restoring to the original location is
+										unavailable. Restore it to a custom location, or download it instead.
+									</AlertDescription>
+								</>
+							)}
+						</Alert>
+					)}
+
 					<Card>
 						<CardHeader>
 							<CardTitle>Restore Location</CardTitle>
@@ -184,6 +286,7 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 									size="sm"
 									className="flex justify-start gap-2"
 									onClick={() => setRestoreLocation("original")}
+									disabled={!!restoreRequiresCustomTarget}
 								>
 									<RotateCcw size={16} className="mr-1" />
 									Original location
@@ -201,8 +304,10 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 							</div>
 							{restoreLocation === "custom" && (
 								<div className="space-y-2">
-									<PathSelector value={customTargetPath || "/"} onChange={setCustomTargetPath} />
-									<p className="text-xs text-muted-foreground">Files will be restored directly to this path</p>
+									<FolderSelector value={customTargetPath || "/"} onChange={setCustomTargetPath} />
+									<p className="text-xs text-muted-foreground">
+										Files will be restored directly to this path
+									</p>
 								</div>
 							)}
 						</CardContent>
@@ -214,7 +319,10 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 							<CardDescription>How to handle existing files</CardDescription>
 						</CardHeader>
 						<CardContent className="space-y-3">
-							<Select value={overwriteMode} onValueChange={(value) => setOverwriteMode(value as OverwriteMode)}>
+							<Select
+								value={overwriteMode}
+								onValueChange={(value) => setOverwriteMode(value as OverwriteMode)}
+							>
 								<SelectTrigger className="w-full">
 									<SelectValue placeholder="Select overwrite behavior" />
 								</SelectTrigger>
@@ -242,7 +350,10 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 						<CardHeader className="cursor-pointer" onClick={() => setShowAdvanced(!showAdvanced)}>
 							<div className="flex items-center justify-between">
 								<CardTitle className="text-base">Advanced options</CardTitle>
-								<ChevronDown size={16} className={`transition-transform ${showAdvanced ? "rotate-180" : ""}`} />
+								<ChevronDown
+									size={16}
+									className={`transition-transform ${showAdvanced ? "rotate-180" : ""}`}
+								/>
 							</div>
 						</CardHeader>
 						{showAdvanced && (
@@ -261,21 +372,11 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 										Exclude specific extended attributes during restore (comma-separated)
 									</p>
 								</div>
-								<div className="flex items-center space-x-2">
-									<Checkbox
-										id="delete-extra"
-										checked={deleteExtraFiles}
-										onCheckedChange={(checked) => setDeleteExtraFiles(checked === true)}
-									/>
-									<Label htmlFor="delete-extra" className="text-sm font-normal cursor-pointer">
-										Delete files not present in the snapshot
-									</Label>
-								</div>
 							</CardContent>
 						)}
 					</Card>
 				</div>
-				<Card className="lg:col-span-2 flex flex-col">
+				<Card className="lg:col-span-2 flex flex-col pb-0">
 					<CardHeader>
 						<CardTitle>Select Files to Restore</CardTitle>
 						<CardDescription>
@@ -285,39 +386,50 @@ export function RestoreForm({ snapshot, repository, snapshotId, returnPath }: Re
 						</CardDescription>
 					</CardHeader>
 					<CardContent className="flex-1 overflow-hidden flex flex-col p-0">
-						{fileBrowser.isLoading && (
-							<div className="flex items-center justify-center flex-1">
-								<p className="text-muted-foreground">Loading files...</p>
-							</div>
-						)}
-
-						{fileBrowser.isEmpty && (
-							<div className="flex flex-col items-center justify-center flex-1 text-center p-8">
-								<FileIcon className="w-12 h-12 text-muted-foreground/50 mb-4" />
-								<p className="text-muted-foreground">No files in this snapshot</p>
-							</div>
-						)}
-
-						{!fileBrowser.isLoading && !fileBrowser.isEmpty && (
-							<div className="overflow-auto flex-1 border border-border rounded-md bg-card m-4">
-								<FileTree
-									files={fileBrowser.fileArray}
-									onFolderExpand={fileBrowser.handleFolderExpand}
-									onFolderHover={fileBrowser.handleFolderHover}
-									expandedFolders={fileBrowser.expandedFolders}
-									loadingFolders={fileBrowser.loadingFolders}
-									onLoadMore={fileBrowser.handleLoadMore}
-									getFolderPagination={fileBrowser.getFolderPagination}
-									className="px-2 py-2"
-									withCheckboxes={true}
-									selectedPaths={selectedPaths}
-									onSelectionChange={setSelectedPaths}
-								/>
-							</div>
-						)}
+						<SnapshotTreeBrowser
+							repositoryId={repository.shortId}
+							snapshotId={snapshotId}
+							queryBasePath={snapshotBasePath}
+							displayBasePath={displayBasePath}
+							pageSize={500}
+							className="flex flex-1 min-h-0 flex-col"
+							treeContainerClassName="overflow-auto flex-1 min-h-0 border border-border rounded-md bg-card m-4"
+							treeClassName="px-2 py-2"
+							loadingMessage="Loading files..."
+							emptyMessage="No files in this snapshot"
+							withCheckboxes
+							selectedPaths={selectedPaths}
+							onSelectionChange={setSelectedPaths}
+							onSingleSelectionKindChange={setSelectedPathKind}
+							stateClassName="flex-1 min-h-0"
+						/>
 					</CardContent>
 				</Card>
 			</div>
+
+			<AlertDialog open={finishedRestoreTask !== null}>
+				<AlertDialogContent>
+					<AlertDialogHeader>
+						<AlertDialogTitle>
+							{finishedRestoreTask?.status === "succeeded"
+								? "Restore completed"
+								: finishedRestoreTask?.status === "cancelled"
+									? "Restore cancelled"
+									: "Restore failed"}
+						</AlertDialogTitle>
+						<AlertDialogDescription>
+							{finishedRestoreTask?.status === "succeeded"
+								? `Snapshot ${snapshotId} was restored successfully.`
+								: finishedRestoreTask?.status === "cancelled"
+									? finishedRestoreTask.error || `Restore of snapshot ${snapshotId} was cancelled.`
+									: finishedRestoreTask?.error || `Snapshot ${snapshotId} could not be restored.`}
+						</AlertDialogDescription>
+					</AlertDialogHeader>
+					<AlertDialogFooter>
+						<AlertDialogAction onClick={acknowledgeRestoreResult}>OK</AlertDialogAction>
+					</AlertDialogFooter>
+				</AlertDialogContent>
+			</AlertDialog>
 		</div>
 	);
 }

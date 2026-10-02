@@ -1,3 +1,4 @@
+// fallow-ignore-file unused-export
 "use client";
 
 import * as React from "react";
@@ -6,6 +7,7 @@ import { cva, type VariantProps } from "class-variance-authority";
 import { PanelLeftIcon } from "lucide-react";
 
 import { useIsMobile } from "~/client/hooks/use-mobile";
+import { useCookieState } from "~/client/hooks/use-cookie-state";
 import { cn } from "~/client/lib/utils";
 import { Button } from "~/client/components/ui/button";
 import { Input } from "~/client/components/ui/input";
@@ -14,7 +16,7 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Skeleton } from "~/client/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "~/client/components/ui/tooltip";
 
-const SIDEBAR_COOKIE_NAME = "sidebar_state";
+export const SIDEBAR_COOKIE_NAME = "sidebar_state";
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
 const SIDEBAR_WIDTH = "14rem";
 const SIDEBAR_WIDTH_MOBILE = "18rem";
@@ -60,21 +62,15 @@ function SidebarProvider({
 
 	// This is the internal state of the sidebar.
 	// We use openProp and setOpenProp for control from outside the component.
-	const [_open, _setOpen] = React.useState(defaultOpen);
+	const [_open, _setOpen] = useCookieState(SIDEBAR_COOKIE_NAME, defaultOpen, SIDEBAR_COOKIE_MAX_AGE);
 	const open = openProp ?? _open;
 	const setOpen = React.useCallback(
 		(value: boolean | ((value: boolean) => boolean)) => {
 			const openState = typeof value === "function" ? value(open) : value;
-			if (setOpenProp) {
-				setOpenProp(openState);
-			} else {
-				_setOpen(openState);
-			}
-
-			// This sets the cookie to keep the sidebar state.
-			document.cookie = `${SIDEBAR_COOKIE_NAME}=${openState}; path=/; max-age=${SIDEBAR_COOKIE_MAX_AGE}`;
+			_setOpen(openState);
+			setOpenProp?.(openState);
 		},
-		[setOpenProp, open],
+		[_setOpen, setOpenProp, open],
 	);
 
 	// Helper to toggle the sidebar.
@@ -344,7 +340,7 @@ function SidebarContent({ className, ...props }: React.ComponentProps<"div">) {
 			data-slot="sidebar-content"
 			data-sidebar="content"
 			className={cn(
-				"flex min-h-0 flex-1 flex-col gap-2 overflow-auto group-data-[collapsible=icon]:overflow-hidden",
+				"flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto overflow-x-hidden group-data-[collapsible=icon]:overflow-hidden",
 				className,
 			)}
 			{...props}
@@ -565,10 +561,16 @@ function SidebarMenuSkeleton({
 }: React.ComponentProps<"div"> & {
 	showIcon?: boolean;
 }) {
-	// Random width between 50 to 90%.
+	const skeletonId = React.useId();
 	const width = React.useMemo(() => {
-		return `${Math.floor(Math.random() * 40) + 50}%`;
-	}, []);
+		let hash = 0;
+
+		for (const char of skeletonId) {
+			hash = (hash * 31 + char.charCodeAt(0)) % 40;
+		}
+
+		return `${hash + 50}%`;
+	}, [skeletonId]);
 
 	return (
 		<div

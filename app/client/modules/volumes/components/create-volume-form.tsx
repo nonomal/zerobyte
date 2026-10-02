@@ -1,11 +1,10 @@
-import { arktypeResolver } from "@hookform/resolvers/arktype";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
-import { type } from "arktype";
 import { CheckCircle, Loader2, Plug, Save, XCircle } from "lucide-react";
-import { useEffect, useState } from "react";
-import { useForm } from "react-hook-form";
+import { useState } from "react";
+import { useForm, useWatch } from "react-hook-form";
+import { z } from "zod";
 import { cn } from "~/client/lib/utils";
-import { deepClean } from "~/utils/object";
 import { Button } from "../../../components/ui/button";
 import {
 	Form,
@@ -18,18 +17,52 @@ import {
 } from "../../../components/ui/form";
 import { Input } from "../../../components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "../../../components/ui/select";
-import { volumeConfigSchemaBase } from "~/schemas/volumes";
+import {
+	directoryConfigSchema,
+	nfsConfigSchema,
+	rcloneConfigSchema,
+	sftpConfigSchema,
+	smbConfigSchema,
+	volumeConfigSchema,
+	webdavConfigSchema,
+	type BackendType,
+} from "@zerobyte/contracts/volumes";
 import { testConnectionMutation } from "../../../api-client/@tanstack/react-query.gen";
-import { Tooltip, TooltipContent, TooltipTrigger } from "../../../components/ui/tooltip";
 import { useSystemInfo } from "~/client/hooks/use-system-info";
+import { useScrollToFormError } from "~/client/hooks/use-scroll-to-form-error";
 import { DirectoryForm, NFSForm, SMBForm, WebDAVForm, RcloneForm, SFTPForm } from "./volume-forms";
 
-export const formSchema = type({
-	name: "2<=string<=32",
-}).and(volumeConfigSchemaBase);
-const cleanSchema = type.pipe((d) => formSchema(deepClean(d)));
+export const formSchema = z
+	.discriminatedUnion("backend", [
+		directoryConfigSchema.extend({ name: z.string().min(2).max(32) }),
+		nfsConfigSchema.extend({ name: z.string().min(2).max(32) }),
+		smbConfigSchema.extend({ name: z.string().min(2).max(32) }),
+		webdavConfigSchema.extend({ name: z.string().min(2).max(32) }),
+		rcloneConfigSchema.extend({ name: z.string().min(2).max(32) }),
+		sftpConfigSchema.extend({ name: z.string().min(2).max(32) }),
+	])
+	.superRefine((value, ctx) => {
+		if (value.backend === "sftp" && !value.skipHostKeyCheck && !value.knownHosts?.trim()) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Known hosts are required unless host key verification is skipped",
+				path: ["knownHosts"],
+			});
+		}
+		if (
+			value.backend === "sftp" &&
+			value.allowUnsafeSymlinkTargets &&
+			(value.skipHostKeyCheck || !value.knownHosts?.trim())
+		) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Unsafe symlink targets require host key verification with known hosts",
+				path: ["allowUnsafeSymlinkTargets"],
+			});
+		}
+	});
 
-export type FormValues = typeof formSchema.inferIn;
+export type FormValues = z.input<typeof formSchema>;
 
 type Props = {
 	onSubmit: (values: FormValues) => void;
@@ -38,20 +71,28 @@ type Props = {
 	formId?: string;
 	loading?: boolean;
 	className?: string;
+	readOnly?: boolean;
 };
 
 const defaultValuesForType = {
 	directory: { backend: "directory" as const, path: "/" },
 	nfs: { backend: "nfs" as const, port: 2049, version: "4.1" as const },
-	smb: { backend: "smb" as const, port: 445, vers: "3.0" as const },
+	smb: { backend: "smb" as const, port: 445, vers: "3.0" as const, mapToContainerUidGid: false },
 	webdav: { backend: "webdav" as const, port: 80, ssl: false, path: "/webdav" },
 	rclone: { backend: "rclone" as const, path: "/" },
-	sftp: { backend: "sftp" as const, port: 22, path: "/", skipHostKeyCheck: false },
+	sftp: {
+		backend: "sftp" as const,
+		port: 22,
+		path: "/",
+		skipHostKeyCheck: false,
+		allowLegacySshRsa: false,
+		allowUnsafeSymlinkTargets: false,
+	},
 };
 
 export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, formId, loading, className }: Props) => {
 	const form = useForm<FormValues>({
-		resolver: arktypeResolver(cleanSchema as unknown as typeof formSchema),
+		resolver: zodResolver(formSchema, undefined, { raw: true }),
 		defaultValues: initialValues || {
 			name: "",
 			backend: "directory",
@@ -62,19 +103,12 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 		},
 	});
 
-	const { watch, getValues } = form;
+	const { getValues } = form;
 
 	const { capabilities } = useSystemInfo();
-	const watchedBackend = watch("backend");
-
-	useEffect(() => {
-		if (mode === "create") {
-			form.reset({
-				name: form.getValues().name,
-				...defaultValuesForType[watchedBackend as keyof typeof defaultValuesForType],
-			});
-		}
-	}, [watchedBackend, form, mode]);
+	const isBackendAllowed = (backend: BackendType) => capabilities.volumeBackends.includes(backend);
+	const scrollToFirstError = useScrollToFormError();
+	const watchedBackend = useWatch({ control: form.control, name: "backend" });
 
 	const [testMessage, setTestMessage] = useState<{ success: boolean; message: string } | null>(null);
 
@@ -96,132 +130,101 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 
 	const handleTestConnection = async () => {
 		const formValues = getValues();
+		const { name: _, ...configCandidate } = formValues;
+		const parsedConfig = volumeConfigSchema.safeParse(configCandidate);
+
+		if (!parsedConfig.success) {
+			setTestMessage({ success: false, message: "Please fix validation errors before testing the connection." });
+			return;
+		}
 
 		if (
-			formValues.backend === "nfs" ||
-			formValues.backend === "smb" ||
-			formValues.backend === "webdav" ||
-			formValues.backend === "sftp"
+			parsedConfig.data.backend === "nfs" ||
+			parsedConfig.data.backend === "smb" ||
+			parsedConfig.data.backend === "webdav" ||
+			parsedConfig.data.backend === "sftp"
 		) {
 			testBackendConnection.mutate({
-				body: { config: formValues },
+				body: { config: parsedConfig.data },
 			});
 		}
 	};
 
 	return (
 		<Form {...form}>
-			<form id={formId} onSubmit={form.handleSubmit(onSubmit)} className={cn("space-y-4", className)}>
-				<FormField
-					control={form.control}
-					name="name"
-					render={({ field }) => (
-						<FormItem>
-							<FormLabel>Name</FormLabel>
-							<FormControl>
-								<Input
-									{...field}
-									placeholder="Volume name"
-									maxLength={32}
-									minLength={2}
-								/>
-							</FormControl>
-							<FormDescription>Unique identifier for the volume.</FormDescription>
-							<FormMessage />
-						</FormItem>
-					)}
-				/>
-				<FormField
-					control={form.control}
-					name="backend"
-					defaultValue="directory"
-					render={({ field }) => (
-						<FormItem>
-							<FormLabel>Backend</FormLabel>
-							<Select onValueChange={field.onChange} value={field.value}>
+			<form
+				id={formId}
+				onSubmit={form.handleSubmit(onSubmit, scrollToFirstError)}
+				className={cn("space-y-4", className)}
+			>
+				<fieldset className="space-y-4">
+					<FormField
+						control={form.control}
+						name="name"
+						render={({ field }) => (
+							<FormItem>
+								<FormLabel>Name</FormLabel>
 								<FormControl>
-									<SelectTrigger>
-										<SelectValue placeholder="Select a backend" />
-									</SelectTrigger>
+									<Input {...field} placeholder="Volume name" maxLength={32} minLength={2} />
 								</FormControl>
-								<SelectContent>
-									<SelectItem value="directory">Directory</SelectItem>
-									<Tooltip>
-										<TooltipTrigger asChild>
-											<div>
-												<SelectItem disabled={!capabilities.sysAdmin} value="nfs">
-													NFS
-												</SelectItem>
-											</div>
-										</TooltipTrigger>
-										<TooltipContent className={cn({ hidden: capabilities.sysAdmin })}>
-											<p>Remote mounts require SYS_ADMIN capability</p>
-										</TooltipContent>
-									</Tooltip>
-									<Tooltip>
-										<TooltipTrigger asChild>
-											<div>
-												<SelectItem disabled={!capabilities.sysAdmin} value="smb">
-													SMB
-												</SelectItem>
-											</div>
-										</TooltipTrigger>
-										<TooltipContent className={cn({ hidden: capabilities.sysAdmin })}>
-											<p>Remote mounts require SYS_ADMIN capability</p>
-										</TooltipContent>
-									</Tooltip>
-									<Tooltip>
-										<TooltipTrigger asChild>
-											<div>
-												<SelectItem disabled={!capabilities.sysAdmin} value="webdav">
-													WebDAV
-												</SelectItem>
-											</div>
-										</TooltipTrigger>
-										<TooltipContent className={cn({ hidden: capabilities.sysAdmin })}>
-											<p>Remote mounts require SYS_ADMIN capability</p>
-										</TooltipContent>
-									</Tooltip>
-									<Tooltip>
-										<TooltipTrigger asChild>
-											<div>
-												<SelectItem disabled={!capabilities.sysAdmin} value="sftp">
-													SFTP
-												</SelectItem>
-											</div>
-										</TooltipTrigger>
-										<TooltipContent className={cn({ hidden: capabilities.sysAdmin })}>
-											<p>Remote mounts require SYS_ADMIN capability</p>
-										</TooltipContent>
-									</Tooltip>
-									<Tooltip>
-										<TooltipTrigger asChild>
-											<div>
-												<SelectItem disabled={!capabilities.rclone || !capabilities.sysAdmin} value="rclone">
-													rclone
-												</SelectItem>
-											</div>
-										</TooltipTrigger>
-										<TooltipContent className={cn({ hidden: capabilities.sysAdmin })}>
-											<p>Remote mounts require SYS_ADMIN capability</p>
-										</TooltipContent>
-										<TooltipContent className={cn({ hidden: !capabilities.sysAdmin || capabilities.rclone })}>
-											<p>Setup rclone to use this backend</p>
-										</TooltipContent>
-									</Tooltip>
-								</SelectContent>
-							</Select>
-							<FormDescription>Choose the storage backend for this volume.</FormDescription>
-							<FormMessage />
-						</FormItem>
+								<FormDescription>Unique identifier for the volume.</FormDescription>
+								<FormMessage />
+							</FormItem>
+						)}
+					/>
+					{capabilities.volumeBackends.length > 1 && (
+						<FormField
+							control={form.control}
+							name="backend"
+							defaultValue="directory"
+							render={({ field }) => (
+								<FormItem>
+									<FormLabel>Backend</FormLabel>
+									<Select
+										onValueChange={(value) => {
+											field.onChange(value);
+											if (mode === "create") {
+												form.reset({
+													name: form.getValues().name,
+													...defaultValuesForType[value as keyof typeof defaultValuesForType],
+												});
+											}
+										}}
+										value={field.value}
+									>
+										<FormControl>
+											<SelectTrigger>
+												<SelectValue placeholder="Select a backend" />
+											</SelectTrigger>
+										</FormControl>
+										<SelectContent>
+											{isBackendAllowed("directory") && (
+												<SelectItem value="directory">Directory</SelectItem>
+											)}
+											{isBackendAllowed("nfs") && <SelectItem value="nfs">NFS</SelectItem>}
+											{isBackendAllowed("smb") && <SelectItem value="smb">SMB</SelectItem>}
+											{isBackendAllowed("webdav") && (
+												<SelectItem value="webdav">WebDAV</SelectItem>
+											)}
+											{isBackendAllowed("sftp") && <SelectItem value="sftp">SFTP</SelectItem>}
+											{isBackendAllowed("rclone") && (
+												<SelectItem value="rclone">rclone</SelectItem>
+											)}
+										</SelectContent>
+									</Select>
+									<FormDescription>Choose the storage backend for this volume.</FormDescription>
+									<FormMessage />
+								</FormItem>
+							)}
+						/>
 					)}
-				/>
-				{watchedBackend === "directory" && <DirectoryForm form={form} />}
-				{watchedBackend === "nfs" && <NFSForm form={form} />}
-				{watchedBackend === "webdav" && <WebDAVForm form={form} />}
-				{watchedBackend === "smb" && <SMBForm form={form} />}
-				{watchedBackend === "rclone" && <RcloneForm form={form} />}
-				{watchedBackend === "sftp" && <SFTPForm form={form} />}
+					{watchedBackend === "directory" && <DirectoryForm form={form} />}
+					{watchedBackend === "nfs" && <NFSForm form={form} />}
+					{watchedBackend === "webdav" && <WebDAVForm form={form} />}
+					{watchedBackend === "smb" && <SMBForm form={form} />}
+					{watchedBackend === "rclone" && <RcloneForm form={form} />}
+					{watchedBackend === "sftp" && <SFTPForm form={form} />}
+				</fieldset>
 				{watchedBackend && watchedBackend !== "directory" && watchedBackend !== "rclone" && (
 					<div className="space-y-3">
 						<div className="flex items-center gap-2">
@@ -234,7 +237,7 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 							>
 								{testBackendConnection.isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
 								{!testBackendConnection.isPending && testMessage?.success && (
-									<CheckCircle className="mr-2 h-4 w-4 text-green-500" />
+									<CheckCircle className="mr-2 h-4 w-4 text-success" />
 								)}
 								{!testBackendConnection.isPending && testMessage && !testMessage.success && (
 									<XCircle className="mr-2 h-4 w-4 text-red-500" />
@@ -252,7 +255,7 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 						{testMessage && (
 							<div
 								className={cn("text-xs p-2 rounded-md text-wrap wrap-anywhere", {
-									"bg-green-50 text-green-700 border border-green-200": testMessage.success,
+									"bg-success/10 text-success border border-success/30": testMessage.success,
 									"bg-red-50 text-red-700 border border-red-200": !testMessage.success,
 								})}
 							>
@@ -261,7 +264,7 @@ export const CreateVolumeForm = ({ onSubmit, mode = "create", initialValues, for
 						)}
 					</div>
 				)}
-				{mode === "update" && (
+				{mode === "update" && !formId && (
 					<Button type="submit" className="w-full" loading={loading}>
 						<Save className="h-4 w-4 mr-2" />
 						Save changes

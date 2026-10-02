@@ -3,8 +3,6 @@ name: Checks
 on:
   workflow_call:
   pull_request:
-    branches:
-      - main
   push:
     branches:
       - main
@@ -12,31 +10,101 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: checks-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
-  checks:
-    timeout-minutes: 15
+  lint:
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          fetch-depth: 0
+          fetch-depth: 1
 
       - name: Install dependencies
         uses: "./.github/actions/install-dependencies"
 
-      - uses: oxc-project/oxlint-action@latest
+      - name: Run lint
+        shell: bash
+        run: bun run lint:ci
+
+  typecheck:
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          config: .oxlintrc.json
-          deny-warnings: true
+          fetch-depth: 1
+
+      - name: Install dependencies
+        uses: "./.github/actions/install-dependencies"
 
       - name: Run type checks
         shell: bash
         run: bun run tsc
 
-      - name: Run tests
+  test-server:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        uses: "./.github/actions/install-dependencies"
+
+      - name: Run server tests
         shell: bash
-        run: bun run test --ci --coverage
+        run: bun run test:server
+
+  test-client:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        uses: "./.github/actions/install-dependencies"
+
+      - name: Run client tests
+        shell: bash
+        run: bun run test:client
+
+  test-desktop:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        uses: "./.github/actions/install-dependencies"
+
+      - name: Run desktop tests
+        run: bun run test:desktop
+
+  build:
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        uses: "./.github/actions/install-dependencies"
 
       - name: Build project
         shell: bash

@@ -1,17 +1,20 @@
-import { arktypeResolver } from "@hookform/resolvers/arktype";
+import { zodResolver } from "@hookform/resolvers/zod";
 import { useCallback, useState } from "react";
-import { useForm } from "react-hook-form";
+import { useForm, useWatch } from "react-hook-form";
+import { useScrollToFormError } from "~/client/hooks/use-scroll-to-form-error";
 import { Form } from "~/client/components/ui/form";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
+import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "~/client/components/ui/collapsible";
 import type { BackupSchedule, Volume } from "~/client/lib/types";
+import { AdvancedSection } from "./advanced-section";
 import { BasicInfoSection } from "./basic-info-section";
 import { ExcludeSection } from "./exclude-section";
 import { FrequencySection } from "./frequency-section";
 import { PathsSection } from "./paths-section";
 import { RetentionSection } from "./retention-section";
 import { SummarySection } from "./summary-section";
-import { cleanSchema, type BackupScheduleFormValues, type InternalFormValues } from "./types";
-import { backupScheduleToFormValues } from "./utils";
+import { internalFormSchema, type BackupScheduleFormValues, type InternalFormValues } from "./types";
+import { backupScheduleToFormValues, parseMultilineEntries, toWebhookConfig } from "./utils";
 
 export type { BackupScheduleFormValues };
 
@@ -25,64 +28,66 @@ type Props = {
 };
 
 export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: Props) => {
+	const initialFormValues = backupScheduleToFormValues(initialValues);
+	const defaultValues = initialFormValues ?? { compressionMode: null };
 	const form = useForm<InternalFormValues>({
-		resolver: arktypeResolver(cleanSchema as unknown as typeof import("./types").internalFormSchema),
-		defaultValues: backupScheduleToFormValues(initialValues),
+		resolver: zodResolver(internalFormSchema, undefined, { raw: true }),
+		defaultValues,
 	});
+
+	const scrollToFirstError = useScrollToFormError();
 
 	const handleSubmit = useCallback(
 		(data: InternalFormValues) => {
+			const parsedData = internalFormSchema.parse(data);
 			const {
 				excludePatternsText,
 				excludeIfPresentText,
-				includePatternsText,
-				includePatterns: fileBrowserPatterns,
+				includePatterns,
+				customResticParamsText,
+				includePaths,
 				cronExpression,
+				maxRetries,
+				retryDelay,
+				preBackupWebhook,
+				postBackupWebhook,
 				...rest
-			} = data;
-			const excludePatterns = excludePatternsText
-				? excludePatternsText
-						.split("\n")
-						.map((p) => p.trim())
-						.filter(Boolean)
-				: [];
-
-			const excludeIfPresent = excludeIfPresentText
-				? excludeIfPresentText
-						.split("\n")
-						.map((p) => p.trim())
-						.filter(Boolean)
-				: [];
-
-			const textPatterns = includePatternsText
-				? includePatternsText
-						.split("\n")
-						.map((p) => p.trim())
-						.filter(Boolean)
-				: [];
-			const includePatterns = [...(fileBrowserPatterns || []), ...textPatterns];
+			} = parsedData;
+			const excludePatterns = parseMultilineEntries(excludePatternsText);
+			const excludeIfPresent = parseMultilineEntries(excludeIfPresentText);
+			const parsedIncludePatterns = parseMultilineEntries(includePatterns);
+			const customResticParams = parseMultilineEntries(customResticParamsText);
+			const backupWebhooks = {
+				pre: toWebhookConfig(preBackupWebhook ?? {}),
+				post: toWebhookConfig(postBackupWebhook ?? {}),
+			};
 
 			onSubmit({
 				...rest,
 				cronExpression,
-				includePatterns: includePatterns.length > 0 ? includePatterns : [],
+				includePaths: includePaths?.length ? includePaths : [],
+				includePatterns: parsedIncludePatterns.length > 0 ? parsedIncludePatterns : [],
 				excludePatterns,
 				excludeIfPresent,
+				customResticParams,
+				backupWebhooks: backupWebhooks.pre || backupWebhooks.post ? backupWebhooks : null,
+				maxRetries,
+				retryDelay,
 			});
 		},
 		[onSubmit],
 	);
 
-	const frequency = form.watch("frequency");
-	const formValues = form.watch();
+	const formValues = useWatch({ control: form.control });
+	const frequency = formValues.frequency;
 
-	const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set(initialValues?.includePatterns || []));
+	const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set(initialValues?.includePaths || []));
 	const [showAllSelectedPaths, setShowAllSelectedPaths] = useState(false);
 
 	const handleSelectionChange = useCallback(
 		(paths: Set<string>) => {
 			setSelectedPaths(paths);
-			form.setValue("includePatterns", Array.from(paths));
+			form.setValue("includePaths", Array.from(paths));
 		},
 		[form],
 	);
@@ -92,7 +97,7 @@ export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: 
 			const newPaths = new Set(selectedPaths);
 			newPaths.delete(pathToRemove);
 			setSelectedPaths(newPaths);
-			form.setValue("includePatterns", Array.from(newPaths));
+			form.setValue("includePaths", Array.from(newPaths));
 		},
 		[selectedPaths, form],
 	);
@@ -100,19 +105,19 @@ export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: 
 	return (
 		<Form {...form}>
 			<form
-				onSubmit={form.handleSubmit(handleSubmit)}
+				onSubmit={form.handleSubmit(handleSubmit, scrollToFirstError)}
 				className="grid gap-4 xl:grid-cols-[minmax(0,2.3fr)_minmax(320px,1fr)]"
 				id={formId}
 			>
 				<div className="grid gap-4 min-w-0">
-					<Card className="min-w-0">
+					<Card className="min-w-0 @container">
 						<CardHeader>
 							<CardTitle>Backup automation</CardTitle>
 							<CardDescription className="mt-1">
 								Schedule automated backups of <strong>{volume.name}</strong> to a secure repository.
 							</CardDescription>
 						</CardHeader>
-						<CardContent className="grid gap-6 @md:grid-cols-2">
+						<CardContent className="grid gap-6 @medium:grid-cols-2">
 							<BasicInfoSection form={form} volume={volume} />
 							<FrequencySection form={form} frequency={frequency} />
 						</CardContent>
@@ -122,8 +127,8 @@ export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: 
 						<CardHeader>
 							<CardTitle>Backup paths</CardTitle>
 							<CardDescription>
-								Select which folders or files to include in the backup. If no paths are selected, the entire volume will
-								be backed up.
+								Select which folders or files to include in the backup. If no paths are selected, the
+								entire volume will be backed up.
 							</CardDescription>
 						</CardHeader>
 						<CardContent>
@@ -143,8 +148,8 @@ export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: 
 						<CardHeader>
 							<CardTitle>Exclude patterns</CardTitle>
 							<CardDescription>
-								Optionally specify patterns to exclude from backups. Enter one pattern per line (e.g., *.tmp,
-								node_modules/**, .cache/).
+								Optionally specify patterns to exclude from backups. Enter one pattern per line (e.g.,
+								*.tmp, node_modules/**, .cache/).
 							</CardDescription>
 						</CardHeader>
 						<CardContent>
@@ -152,13 +157,26 @@ export const CreateScheduleForm = ({ initialValues, formId, onSubmit, volume }: 
 						</CardContent>
 					</Card>
 
-					<Card className="min-w-0">
+					<Card className="min-w-0 @container">
 						<CardHeader>
 							<CardTitle>Retention policy</CardTitle>
-							<CardDescription>Define how many snapshots to keep. Leave empty to keep all.</CardDescription>
+							<CardDescription>
+								Define how many snapshots to keep. Leave empty to keep all.
+							</CardDescription>
 						</CardHeader>
-						<CardContent className="grid gap-4 @md:grid-cols-2">
+						<CardContent className="grid gap-4 @medium:grid-cols-2">
 							<RetentionSection form={form} />
+						</CardContent>
+					</Card>
+
+					<Card className="min-w-0 @container">
+						<CardContent>
+							<Collapsible>
+								<CollapsibleTrigger>Advanced</CollapsibleTrigger>
+								<CollapsibleContent className="pb-4 space-y-4">
+									<AdvancedSection form={form} />
+								</CollapsibleContent>
+							</Collapsible>
 						</CardContent>
 					</Card>
 				</div>

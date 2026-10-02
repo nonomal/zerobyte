@@ -1,0 +1,527 @@
+import path from "node:path";
+import { type Browser, type Page } from "@playwright/test";
+import { expect, test } from "./test";
+import { trackBrowserErrors } from "./helpers/browser-errors";
+import { gotoAndWaitForAppReady, waitForAppReady } from "./helpers/page";
+
+const tinyauthOrigin = process.env.E2E_TINYAUTH_ORIGIN ?? "https://tinyauth.example.com:5557";
+const issuer = tinyauthOrigin;
+const discoveryEndpoint = `${issuer}/.well-known/openid-configuration`;
+const appBaseUrl = `http://${process.env.SERVER_IP ?? "localhost"}:4096`;
+const appOrigin = new URL(appBaseUrl).origin;
+const setupAuthFile = path.join(process.cwd(), "playwright", ".auth", "user.json");
+
+const providerIds = {
+	uninvited: "test-oidc-uninvited",
+	invited: "test-oidc-invited",
+	autoLinkNoInvite: "test-oidc-register",
+	autoLink: "test-oidc-autolink",
+	existingMember: "test-oidc-existing-member",
+} as const;
+
+const tinyauthPassword = "password";
+const uninvitedUserEmail = "admin@example.com";
+const invitedUserEmail = "user@example.com";
+const autoLinkUninvitedLocalEmail = "linkguard@example.com";
+const autoLinkTargetEmail = "test@example.com";
+const autoLinkTargetUsername = "sso-link-target";
+const autoLinkUninvitedLocalUsername = "sso-link-guard";
+const existingMemberLocalEmail = "memberlink@example.com";
+const existingMemberLocalUsername = "sso-existing-member";
+const inviteOnlyMessage =
+	"Access is invite-only. Ask an organization admin to send you an invitation before signing in with SSO.";
+const accountLinkRequiredMessage =
+	"SSO sign-in was blocked because this email already belongs to another user in this instance. Contact your administrator to resolve the account conflict. If you have an invitation to this organization, verify it from your account page before signing in with SSO.";
+
+type OrgMembersResponse = {
+	members: {
+		id: string;
+		user: {
+			email: string;
+		};
+	}[];
+};
+
+type SsoSettingsResponse = {
+	invitations: {
+		id: string;
+		email: string;
+		status: string;
+	}[];
+};
+
+type CreateUserResponse = {
+	user?: {
+		id?: string;
+	};
+};
+
+type SsoSignInResponse = {
+	url?: string;
+};
+
+type OidcUiState = "app" | "authorize" | "loading" | "login";
+
+async function openSsoSettings(page: Page) {
+	await gotoAndWaitForAppReady(page, "/settings?tab=organization");
+	await expect(page.getByText("Single Sign-On")).toBeVisible();
+}
+
+async function registerOidcProvider(page: Page, providerId: string) {
+	await gotoAndWaitForAppReady(page, "/settings/sso/new");
+
+	await page.getByRole("textbox", { name: "Provider ID" }).fill(providerId);
+	await page.getByRole("textbox", { name: "Organization Domain" }).fill("example.com");
+	await page.getByRole("textbox", { name: "Issuer URL" }).fill(issuer);
+	await page.getByRole("textbox", { name: "Discovery Endpoint" }).fill(discoveryEndpoint);
+	await page.getByRole("textbox", { name: "Client ID" }).fill("zerobyte-test");
+	await page.getByRole("textbox", { name: "Client Secret" }).fill("test-secret-12345");
+	await page.getByRole("button", { name: "Register Provider" }).click();
+
+	await expect(page.getByText("SSO provider registered successfully")).toBeVisible();
+	await expect(page.getByRole("cell", { name: providerId, exact: true })).toBeVisible();
+}
+
+async function createPendingInvitation(page: Page, email: string) {
+	const response = await page.request.post("/api/auth/organization/invite-member", {
+		headers: {
+			Origin: appBaseUrl,
+		},
+		data: {
+			email,
+			role: "member",
+		},
+	});
+
+	if (!response.ok()) {
+		throw new Error(`Failed to invite ${email}: ${await response.text()}`);
+	}
+}
+
+async function createLocalUser(browser: Browser, email: string, username: string) {
+	const adminContext = await browser.newContext({
+		baseURL: appBaseUrl,
+		storageState: setupAuthFile,
+	});
+
+	try {
+		const response = await adminContext.request.post("/api/auth/admin/create-user", {
+			headers: {
+				Origin: appBaseUrl,
+			},
+			data: {
+				email,
+				password: tinyauthPassword,
+				name: "SSO Link Target",
+				role: "user",
+				data: {
+					username,
+					hasDownloadedResticPassword: true,
+				},
+			},
+		});
+
+		if (!response.ok()) {
+			throw new Error(`Failed to create local user ${email}: ${await response.text()}`);
+		}
+
+		const body = (await response.json()) as CreateUserResponse;
+		if (!body.user?.id) {
+			throw new Error(`Create user response missing id for ${email}`);
+		}
+
+		return body.user.id;
+	} finally {
+		await adminContext.close();
+	}
+}
+
+async function getOrgMemberIdByEmail(page: Page, email: string) {
+	const response = await page.request.get("/api/v1/auth/org-members", {
+		headers: {
+			Origin: appBaseUrl,
+		},
+	});
+
+	if (!response.ok()) {
+		throw new Error(`Failed to get organization members: ${await response.text()}`);
+	}
+
+	const body = (await response.json()) as OrgMembersResponse;
+	const member = body.members.find((entry) => entry.user.email.toLowerCase() === email.toLowerCase());
+
+	return member?.id ?? null;
+}
+
+async function removeOrgMemberById(page: Page, memberId: string) {
+	const response = await page.request.delete(`/api/v1/auth/org-members/${memberId}`, {
+		headers: {
+			Origin: appBaseUrl,
+		},
+	});
+
+	if (!response.ok()) {
+		throw new Error(`Failed to remove org member ${memberId}: ${await response.text()}`);
+	}
+}
+
+async function getInvitationByEmail(page: Page, email: string) {
+	const response = await page.request.get("/api/v1/auth/sso-settings", {
+		headers: {
+			Origin: appBaseUrl,
+		},
+	});
+
+	if (!response.ok()) {
+		throw new Error(`Failed to read SSO settings: ${await response.text()}`);
+	}
+
+	const body = (await response.json()) as SsoSettingsResponse;
+	return body.invitations.find((entry) => entry.email.toLowerCase() === email.toLowerCase()) ?? null;
+}
+
+async function getInvitationStatusByEmail(page: Page, email: string) {
+	const invitation = await getInvitationByEmail(page, email);
+
+	return invitation?.status ?? null;
+}
+
+async function getInvitationIdByEmail(page: Page, email: string) {
+	const invitation = await getInvitationByEmail(page, email);
+
+	return invitation?.id ?? null;
+}
+
+async function verifyInvitationAsLocalUserWithSso(
+	browser: Browser,
+	email: string,
+	invitationId: string,
+	providerId: string,
+) {
+	const context = await browser.newContext({
+		baseURL: appBaseUrl,
+		storageState: {
+			cookies: [],
+			origins: [],
+		},
+	});
+	const page = await context.newPage();
+
+	try {
+		const signInResponse = await context.request.post("/api/auth/sign-in/email", {
+			headers: {
+				Origin: appBaseUrl,
+			},
+			data: {
+				email,
+				password: tinyauthPassword,
+			},
+		});
+
+		if (!signInResponse.ok()) {
+			throw new Error(`Failed to sign in local user ${email}: ${await signInResponse.text()}`);
+		}
+
+		const intentResponse = await context.request.post(`/api/v1/auth/sso-invitations/${invitationId}/verify`, {
+			headers: {
+				Origin: appBaseUrl,
+			},
+			data: {
+				providerId,
+			},
+		});
+
+		if (!intentResponse.ok()) {
+			throw new Error(`Failed to start invitation verification ${invitationId}: ${await intentResponse.text()}`);
+		}
+
+		const ssoUrl = await startSsoLogin(page, providerId);
+		await page.goto(ssoUrl);
+
+		let oidcUiState = await waitForOidcUiState(page, ["app", "authorize", "login"]);
+
+		if (oidcUiState === "login") {
+			const tinyauthLoginInput = page.locator('input[name="username"]');
+			await tinyauthLoginInput.fill(email);
+			await page.locator('input[name="password"]').fill(tinyauthPassword);
+			await page.locator('button[type="submit"]').click();
+
+			oidcUiState = await waitForOidcUiState(page, ["app", "authorize"]);
+		}
+
+		if (oidcUiState === "authorize") {
+			await page.getByRole("button", { name: /authorize|allow/i }).click();
+		}
+
+		await page.waitForURL(/\/volumes/, { timeout: 30000 });
+		await waitForAppReady(page);
+	} finally {
+		await context.close();
+	}
+}
+
+async function setProviderAutoLinking(page: Page, providerId: string, enabled: boolean) {
+	await openSsoSettings(page);
+	const providerRow = page
+		.getByRole("row")
+		.filter({ has: page.getByRole("cell", { name: providerId, exact: true }) })
+		.first();
+	const autoLinkSwitch = providerRow.getByRole("switch");
+	const expectedState = enabled ? "true" : "false";
+	const currentState = await autoLinkSwitch.getAttribute("aria-checked");
+	const expectedToast = enabled ? "Automatic account linking enabled" : "Automatic account linking disabled";
+
+	if (currentState !== expectedState) {
+		await autoLinkSwitch.click();
+		await expect(page.getByText(expectedToast)).toBeVisible();
+	}
+
+	await expect(autoLinkSwitch).toHaveAttribute("aria-checked", expectedState);
+}
+
+async function startSsoLogin(page: Page, providerId: string) {
+	const response = await page.request.post("/api/auth/sign-in/sso", {
+		headers: {
+			Origin: appBaseUrl,
+		},
+		data: {
+			providerId,
+			callbackURL: "/volumes",
+			errorCallbackURL: "/api/v1/auth/login-error",
+		},
+	});
+
+	if (!response.ok()) {
+		throw new Error(`Failed to start SSO login for ${providerId}: ${await response.text()}`);
+	}
+
+	const body = (await response.json()) as SsoSignInResponse;
+
+	if (!body.url) {
+		throw new Error(`SSO login response missing redirect URL for ${providerId}`);
+	}
+
+	return body.url;
+}
+
+async function getOidcUiState(page: Page) {
+	const currentUrl = new URL(page.url());
+
+	if (currentUrl.origin === appOrigin) {
+		return "app" satisfies OidcUiState;
+	}
+
+	const tinyauthLoginInput = page.locator('input[name="username"]');
+	if (await tinyauthLoginInput.isVisible().catch(() => false)) {
+		return "login" satisfies OidcUiState;
+	}
+
+	const authorizeButton = page.getByRole("button", { name: /authorize|allow/i });
+	if (await authorizeButton.isVisible().catch(() => false)) {
+		return "authorize" satisfies OidcUiState;
+	}
+
+	return "loading" satisfies OidcUiState;
+}
+
+async function waitForOidcUiState(page: Page, expectedStates: OidcUiState[], timeout = 15000) {
+	const expectedPattern = new RegExp(`^(?:${expectedStates.join("|")})$`);
+
+	await expect
+		.poll(
+			async () => {
+				return getOidcUiState(page);
+			},
+			{ timeout },
+		)
+		.toMatch(expectedPattern);
+
+	return getOidcUiState(page);
+}
+
+async function withOidcLoginAttempt(
+	browser: Browser,
+	providerId: string,
+	tinyauthLogin: string,
+	assertions: (page: Page) => Promise<void>,
+) {
+	const context = await browser.newContext({
+		storageState: {
+			cookies: [],
+			origins: [],
+		},
+	});
+	const browserErrorTracker = trackBrowserErrors(context, {
+		attach: async (name, body, contentType) => {
+			await test.info().attach(name, { body, contentType });
+		},
+	});
+	const page = await context.newPage();
+
+	try {
+		const ssoUrl = await startSsoLogin(page, providerId);
+		await page.goto(ssoUrl);
+
+		let oidcUiState = await waitForOidcUiState(page, ["app", "authorize", "login"]);
+
+		if (oidcUiState === "login") {
+			const tinyauthLoginInput = page.locator('input[name="username"]');
+			await tinyauthLoginInput.fill(tinyauthLogin);
+			await page.locator('input[name="password"]').fill(tinyauthPassword);
+			await page.locator('button[type="submit"]').click();
+
+			oidcUiState = await waitForOidcUiState(page, ["app", "authorize"]);
+		}
+
+		if (oidcUiState === "authorize") {
+			await page.getByRole("button", { name: /authorize|allow/i }).click();
+		}
+
+		await assertions(page);
+		await browserErrorTracker.assertNoBrowserErrors();
+	} finally {
+		await context.close().catch(() => undefined);
+	}
+}
+
+function isLoginPath(url: string): boolean {
+	const parsedUrl = new URL(url);
+	return parsedUrl.origin === appOrigin && (parsedUrl.pathname === "/login" || parsedUrl.pathname === "/login/error");
+}
+
+async function expectInviteOnlyLoginError(page: Page) {
+	await expect.poll(() => isLoginPath(page.url()), { timeout: 30000 }).toBe(true);
+	await waitForAppReady(page);
+	await expect(page.getByText(inviteOnlyMessage)).toBeVisible();
+}
+
+async function expectAccountLinkRequiredLoginError(page: Page) {
+	await expect.poll(() => isLoginPath(page.url()), { timeout: 30000 }).toBe(true);
+	await waitForAppReady(page);
+	await expect(page.getByText(accountLinkRequiredMessage)).toBeVisible();
+}
+
+test("uninvited OIDC users are blocked", async ({ page, browser }) => {
+	await registerOidcProvider(page, providerIds.uninvited);
+
+	await withOidcLoginAttempt(browser, providerIds.uninvited, uninvitedUserEmail, async (ssoPage) => {
+		await expectInviteOnlyLoginError(ssoPage);
+	});
+});
+
+test("invited OIDC users can sign in, retain access, and are blocked after removal", async ({ page, browser }) => {
+	await registerOidcProvider(page, providerIds.invited);
+	await createPendingInvitation(page, invitedUserEmail);
+
+	await withOidcLoginAttempt(browser, providerIds.invited, invitedUserEmail, async (ssoPage) => {
+		await ssoPage.waitForURL(/\/volumes/, { timeout: 30000 });
+		await waitForAppReady(ssoPage);
+		await expect(ssoPage).toHaveURL(/\/volumes/);
+	});
+
+	await expect
+		.poll(async () => {
+			return getInvitationStatusByEmail(page, invitedUserEmail);
+		})
+		.toBe("accepted");
+
+	await withOidcLoginAttempt(browser, providerIds.invited, invitedUserEmail, async (ssoPage) => {
+		await ssoPage.waitForURL(/\/volumes/, { timeout: 30000 });
+		await waitForAppReady(ssoPage);
+		await expect(ssoPage).toHaveURL(/\/volumes/);
+	});
+
+	await expect
+		.poll(async () => {
+			return getOrgMemberIdByEmail(page, invitedUserEmail);
+		})
+		.not.toBeNull();
+
+	const memberId = await getOrgMemberIdByEmail(page, invitedUserEmail);
+
+	if (!memberId) {
+		throw new Error(`Missing organization member for ${invitedUserEmail}`);
+	}
+
+	await removeOrgMemberById(page, memberId);
+
+	await withOidcLoginAttempt(browser, providerIds.invited, invitedUserEmail, async (ssoPage) => {
+		await expectInviteOnlyLoginError(ssoPage);
+	});
+});
+
+test("auto-link policy requires local acceptance for existing credential accounts", async ({ page, browser }) => {
+	await registerOidcProvider(page, providerIds.autoLinkNoInvite);
+	await createLocalUser(browser, autoLinkUninvitedLocalEmail, autoLinkUninvitedLocalUsername);
+	await setProviderAutoLinking(page, providerIds.autoLinkNoInvite, true);
+
+	await withOidcLoginAttempt(browser, providerIds.autoLinkNoInvite, autoLinkUninvitedLocalEmail, async (ssoPage) => {
+		await expectAccountLinkRequiredLoginError(ssoPage);
+	});
+
+	await registerOidcProvider(page, providerIds.autoLink);
+	await createLocalUser(browser, autoLinkTargetEmail, autoLinkTargetUsername);
+	await createPendingInvitation(page, autoLinkTargetEmail);
+	await setProviderAutoLinking(page, providerIds.autoLink, false);
+
+	await withOidcLoginAttempt(browser, providerIds.autoLink, autoLinkTargetEmail, async (ssoPage) => {
+		await expectAccountLinkRequiredLoginError(ssoPage);
+	});
+
+	await setProviderAutoLinking(page, providerIds.autoLink, true);
+
+	await withOidcLoginAttempt(browser, providerIds.autoLink, autoLinkTargetEmail, async (ssoPage) => {
+		await expectAccountLinkRequiredLoginError(ssoPage);
+	});
+
+	await expect
+		.poll(async () => {
+			return getInvitationStatusByEmail(page, autoLinkTargetEmail);
+		})
+		.toBe("pending");
+
+	await expect
+		.poll(async () => {
+			return getOrgMemberIdByEmail(page, autoLinkTargetEmail);
+		})
+		.toBeNull();
+});
+
+test("existing local org members can link via SSO without a pending invitation", async ({ page, browser }) => {
+	await registerOidcProvider(page, providerIds.existingMember);
+	await createLocalUser(browser, existingMemberLocalEmail, existingMemberLocalUsername);
+	await createPendingInvitation(page, existingMemberLocalEmail);
+
+	const invitationId = await getInvitationIdByEmail(page, existingMemberLocalEmail);
+
+	if (!invitationId) {
+		throw new Error(`Missing invitation for ${existingMemberLocalEmail}`);
+	}
+
+	await verifyInvitationAsLocalUserWithSso(
+		browser,
+		existingMemberLocalEmail,
+		invitationId,
+		providerIds.existingMember,
+	);
+
+	await expect
+		.poll(async () => {
+			return getInvitationStatusByEmail(page, existingMemberLocalEmail);
+		})
+		.toBe("accepted");
+
+	await expect
+		.poll(async () => {
+			return getOrgMemberIdByEmail(page, existingMemberLocalEmail);
+		})
+		.not.toBeNull();
+
+	await setProviderAutoLinking(page, providerIds.existingMember, true);
+
+	await withOidcLoginAttempt(browser, providerIds.existingMember, existingMemberLocalEmail, async (ssoPage) => {
+		await ssoPage.waitForURL(/\/volumes/, { timeout: 30000 });
+		await waitForAppReady(ssoPage);
+		await expect(ssoPage).toHaveURL(/\/volumes/);
+	});
+});

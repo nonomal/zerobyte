@@ -10,24 +10,29 @@ import { SnapshotsTable } from "~/client/components/snapshots-table";
 import { Button } from "~/client/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
 import { Input } from "~/client/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
 import { Table, TableBody, TableCell, TableRow } from "~/client/components/ui/table";
-import type { Repository, Snapshot } from "~/client/lib/types";
+import type { BackupSchedule, Repository, Snapshot } from "~/client/lib/types";
 import { toast } from "sonner";
 
 type Props = {
 	repository: Repository;
+	initialSnapshots?: Snapshot[];
+	initialBackupSchedules?: BackupSchedule[];
 };
 
-export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
+export const RepositorySnapshotsTabContent = ({ repository, initialSnapshots, initialBackupSchedules }: Props) => {
 	const [searchQuery, setSearchQuery] = useState("");
+	const [selectedHost, setSelectedHost] = useState<string | null>(null);
 
-	const { data, isFetching, failureReason } = useQuery({
-		...listSnapshotsOptions({ path: { id: repository.id } }),
-		initialData: [],
+	const { data, isPending, failureReason } = useQuery({
+		...listSnapshotsOptions({ path: { shortId: repository.shortId } }),
+		initialData: initialSnapshots,
 	});
 
 	const schedules = useQuery({
 		...listBackupSchedulesOptions(),
+		initialData: initialBackupSchedules,
 	});
 
 	const refreshMutation = useMutation({
@@ -41,10 +46,16 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 	});
 
 	const handleRefresh = () => {
-		refreshMutation.mutate({ path: { id: repository.id } });
+		refreshMutation.mutate({ path: { shortId: repository.shortId } });
 	};
 
-	const filteredSnapshots = data.filter((snapshot: Snapshot) => {
+	const snapshots = data ?? [];
+	const hosts = Array.from(new Set(snapshots.map((snapshot) => snapshot.hostname))).sort((a, b) =>
+		a.localeCompare(b),
+	);
+
+	const filteredSnapshots = snapshots.filter((snapshot: Snapshot) => {
+		if (selectedHost !== null && snapshot.hostname !== selectedHost) return false;
 		if (!searchQuery) return true;
 		const searchLower = searchQuery.toLowerCase();
 
@@ -58,7 +69,7 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 		);
 	});
 
-	const hasNoFilteredSnapshots = !filteredSnapshots?.length;
+	const hasNoFilteredSnapshots = !filteredSnapshots.length;
 
 	if (repository.status === "error") {
 		return (
@@ -91,7 +102,7 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 		);
 	}
 
-	if (isFetching && !data.length) {
+	if (isPending) {
 		return (
 			<Card>
 				<CardContent className="flex items-center justify-center py-12">
@@ -101,7 +112,7 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 		);
 	}
 
-	if (!data.length) {
+	if (!snapshots.length) {
 		return (
 			<Card>
 				<CardContent className="flex flex-col items-center justify-center text-center py-16 px-4">
@@ -131,16 +142,32 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 					<div className="flex-1">
 						<CardTitle>Snapshots</CardTitle>
 						<CardDescription className="mt-1">
-							Backup snapshots stored in this repository. Total: {data.length}
+							Backup snapshots stored in this repository. Total: {snapshots.length}
 						</CardDescription>
 					</div>
-					<div className="flex gap-2 items-center">
+					<div className="flex flex-col sm:flex-row gap-2 sm:items-center">
 						<Input
 							className="w-full lg:w-60"
 							placeholder="Search snapshots..."
 							value={searchQuery}
 							onChange={(e) => setSearchQuery(e.target.value)}
 						/>
+						<Select
+							value={selectedHost === null ? "all" : `host:${selectedHost}`}
+							onValueChange={(value) => setSelectedHost(value === "all" ? null : value.slice(5))}
+						>
+							<SelectTrigger className="w-full sm:w-48" aria-label="Filter snapshots by host">
+								<SelectValue placeholder="All hosts" />
+							</SelectTrigger>
+							<SelectContent>
+								<SelectItem value="all">All hosts</SelectItem>
+								{hosts.map((host) => (
+									<SelectItem key={host} value={`host:${host}`}>
+										{host || "Unknown"}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
 						<Button
 							onClick={handleRefresh}
 							variant="outline"
@@ -156,12 +183,19 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 				<Table className="border-t">
 					<TableBody>
 						<TableRow>
-							<TableCell colSpan={5} className="text-center py-12">
+							<TableCell colSpan={7} className="text-center py-12">
 								<div className="flex flex-col items-center gap-3">
-									<p className="text-muted-foreground">No snapshots match your search.</p>
-									<Button onClick={() => setSearchQuery("")} variant="outline" size="sm">
+									<p className="text-muted-foreground">No snapshots match your filters.</p>
+									<Button
+										onClick={() => {
+											setSearchQuery("");
+											setSelectedHost(null);
+										}}
+										variant="outline"
+										size="sm"
+									>
 										<X className="h-4 w-4 mr-2" />
-										Clear search
+										Clear filters
 									</Button>
 								</div>
 							</TableCell>
@@ -179,7 +213,7 @@ export const RepositorySnapshotsTabContent = ({ repository }: Props) => {
 				<span>
 					{hasNoFilteredSnapshots
 						? "No snapshots match filters."
-						: `Showing ${filteredSnapshots.length} of ${data.length}`}
+						: `Showing ${filteredSnapshots.length} of ${snapshots.length}`}
 				</span>
 			</div>
 		</Card>

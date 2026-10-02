@@ -1,0 +1,311 @@
+import type { ComponentProps } from "react";
+import { afterEach, describe, expect, test } from "vitest";
+import { HttpResponse, http, server } from "~/test/msw/server";
+import { cleanup, fireEvent, render, screen, userEvent, waitFor, within } from "~/test/test-utils";
+
+type SnapshotFilesRequest = {
+	shortId: string;
+	snapshotId: string;
+	path: string | null;
+	offset: string | null;
+	limit: string | null;
+};
+
+const snapshotFiles = {
+	files: [
+		{ name: "project", path: "/mnt/project", type: "dir" },
+		{ name: "a.txt", path: "/mnt/project/a.txt", type: "file" },
+	],
+};
+
+type SnapshotFilesResponse = Pick<ListSnapshotFilesResponse, "files">;
+
+import { SnapshotTreeBrowser } from "../snapshot-tree-browser";
+import type { ListSnapshotFilesResponse } from "~/client/api-client";
+
+const mockListSnapshotFiles = (response: SnapshotFilesResponse = snapshotFiles) => {
+	const requests: SnapshotFilesRequest[] = [];
+
+	server.use(
+		http.get("/api/v1/repositories/:shortId/snapshots/:snapshotId/files", ({ params, request }) => {
+			const url = new URL(request.url);
+			requests.push({
+				shortId: String(params.shortId),
+				snapshotId: String(params.snapshotId),
+				path: url.searchParams.get("path"),
+				offset: url.searchParams.get("offset"),
+				limit: url.searchParams.get("limit"),
+			});
+
+			return HttpResponse.json(response);
+		}),
+	);
+
+	return requests;
+};
+
+const renderSnapshotTreeBrowser = (props: Partial<ComponentProps<typeof SnapshotTreeBrowser>> = {}) => {
+	return render(
+		<SnapshotTreeBrowser
+			repositoryId="repo-1"
+			snapshotId="snap-1"
+			queryBasePath="/mnt/project"
+			displayBasePath="/mnt"
+			{...props}
+		/>,
+	);
+};
+
+afterEach(() => {
+	cleanup();
+});
+
+describe("SnapshotTreeBrowser", () => {
+	test("inspects a synthesized ancestor independently of restore selection", async () => {
+		mockListSnapshotFiles({ files: [{ name: "report.txt", path: "/mnt/project/report.txt", type: "file" }] });
+		renderSnapshotTreeBrowser({
+			queryBasePath: "/mnt/project/report.txt",
+			withCheckboxes: true,
+			selectedPaths: new Set(["/mnt/project"]),
+		});
+		const row = await screen.findByRole("button", { name: "project" });
+		await userEvent.click(row);
+		const details = screen.getByRole("region", { name: "Selected entry details" });
+		expect(within(details).getByText("/project")).toBeTruthy();
+		expect(within(details).getByText("Directory")).toBeTruthy();
+		expect(within(row).getByRole("checkbox").getAttribute("aria-checked")).toBe("true");
+	});
+
+	test("retains metadata for a real directory even when its child appears first", async () => {
+		mockListSnapshotFiles({
+			files: [
+				{ name: "report.txt", path: "/mnt/project/report.txt", type: "file" },
+				{
+					name: "project",
+					path: "/mnt/project",
+					type: "dir",
+					mode: 2 ** 31 + 0o750,
+					mtime: "1970-01-01T00:00:00Z",
+				},
+			],
+		});
+		renderSnapshotTreeBrowser();
+		await userEvent.click(await screen.findByRole("button", { name: "project" }));
+		const details = screen.getByRole("region", { name: "Selected entry details" });
+		expect(within(details).getByText("0750")).toBeTruthy();
+		expect(within(details).getByText(/1970/)).toBeTruthy();
+	});
+	test("renders the query root folder when display base path is broader than query base path", async () => {
+		mockListSnapshotFiles();
+
+		renderSnapshotTreeBrowser();
+
+		expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+	});
+
+	test("renders ancestor folders when the query root is nested multiple levels below the display root", async () => {
+		mockListSnapshotFiles({
+			files: [
+				{ name: "subdir", path: "/mnt/project/subdir", type: "dir" },
+				{ name: "a.txt", path: "/mnt/project/subdir/a.txt", type: "file" },
+			],
+		});
+
+		renderSnapshotTreeBrowser({
+			queryBasePath: "/mnt/project/subdir",
+			displayBasePath: "/mnt",
+		});
+
+		expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+	});
+
+	test("renders synthesized ancestor folders for a single file when no display base path is available", async () => {
+		const requests = mockListSnapshotFiles({
+			files: [{ name: "report.txt", path: "/mnt/project/report.txt", type: "file" }],
+		});
+
+		renderSnapshotTreeBrowser({
+			queryBasePath: "/mnt/project/report.txt",
+			displayBasePath: undefined,
+		});
+
+		const mntRow = await screen.findByRole("button", { name: "mnt" });
+		await waitFor(() => expect(screen.queryByRole("button", { name: "project" })).toBeNull());
+		const mntExpandIcon = mntRow.querySelector("svg");
+		if (!mntExpandIcon) {
+			throw new Error("Expected expand icon for mnt row");
+		}
+		await userEvent.click(mntExpandIcon);
+
+		expect(await screen.findByRole("button", { name: "project" })).toBeTruthy();
+		expect(requests[0]).toEqual({
+			shortId: "repo-1",
+			snapshotId: "snap-1",
+			path: "/mnt/project/report.txt",
+			offset: null,
+			limit: null,
+		});
+	});
+
+	test("returns the ancestor folder path when selecting above the query root", async () => {
+		mockListSnapshotFiles({
+			files: [
+				{ name: "subdir", path: "/mnt/project/subdir", type: "dir" },
+				{ name: "a.txt", path: "/mnt/project/subdir/a.txt", type: "file" },
+			],
+		});
+
+		let selectedPaths: Set<string> | undefined;
+		let selectedKind: "file" | "dir" | null = null;
+
+		renderSnapshotTreeBrowser({
+			queryBasePath: "/mnt/project/subdir",
+			displayBasePath: "/mnt",
+			withCheckboxes: true,
+			onSelectionChange: (paths) => {
+				selectedPaths = paths;
+			},
+			onSingleSelectionKindChange: (kind) => {
+				selectedKind = kind;
+			},
+		});
+
+		const row = await screen.findByRole("button", { name: "project" });
+		const checkbox = within(row).getByRole("checkbox");
+
+		await userEvent.click(checkbox);
+
+		expect(selectedPaths ? Array.from(selectedPaths) : []).toEqual(["/mnt/project"]);
+		expect(selectedKind === "dir").toBe(true);
+	});
+
+	test("keeps full paths when the display root does not contain the query root", async () => {
+		mockListSnapshotFiles();
+
+		let selectedPaths: Set<string> | undefined;
+		let selectedKind: "file" | "dir" | null = null;
+
+		renderSnapshotTreeBrowser({
+			queryBasePath: "/mnt/project",
+			displayBasePath: "/other/root",
+			withCheckboxes: true,
+			onSelectionChange: (paths) => {
+				selectedPaths = paths;
+			},
+			onSingleSelectionKindChange: (kind) => {
+				selectedKind = kind;
+			},
+		});
+
+		const row = await screen.findByRole("button", { name: "mnt" });
+		const checkbox = within(row).getByRole("checkbox");
+
+		await userEvent.click(checkbox);
+
+		expect(selectedPaths ? Array.from(selectedPaths) : []).toEqual(["/mnt"]);
+		expect(selectedKind === "dir").toBe(true);
+	});
+
+	test("shows selected folder state when full paths are provided from the parent", async () => {
+		mockListSnapshotFiles();
+
+		renderSnapshotTreeBrowser({
+			withCheckboxes: true,
+			selectedPaths: new Set(["/mnt/project"]),
+			onSelectionChange: () => {},
+		});
+
+		const row = await screen.findByRole("button", { name: "project" });
+		const checkbox = within(row).getByRole("checkbox");
+
+		expect(checkbox.getAttribute("aria-checked")).toBe("true");
+	});
+
+	test("returns the full snapshot path and kind when selecting a displayed folder", async () => {
+		mockListSnapshotFiles();
+
+		let selectedPaths: Set<string> | undefined;
+		let selectedKind: "file" | "dir" | null = null;
+
+		renderSnapshotTreeBrowser({
+			withCheckboxes: true,
+			onSelectionChange: (paths) => {
+				selectedPaths = paths;
+			},
+			onSingleSelectionKindChange: (kind) => {
+				selectedKind = kind;
+			},
+		});
+
+		const row = await screen.findByRole("button", { name: "project" });
+		const checkbox = within(row).getByRole("checkbox");
+
+		await userEvent.click(checkbox);
+
+		expect(selectedPaths ? Array.from(selectedPaths) : []).toEqual(["/mnt/project"]);
+		expect(selectedKind === "dir").toBe(true);
+	});
+
+	test("uses the query base path for the initial request when display base path is broader", async () => {
+		const requests = mockListSnapshotFiles();
+
+		renderSnapshotTreeBrowser();
+
+		await waitFor(() => {
+			expect(requests[0]).toEqual({
+				shortId: "repo-1",
+				snapshotId: "snap-1",
+				path: "/mnt/project",
+				offset: null,
+				limit: null,
+			});
+		});
+	});
+
+	test("shows the query root contents when display and query roots differ", async () => {
+		mockListSnapshotFiles();
+
+		renderSnapshotTreeBrowser();
+
+		const row = await screen.findByRole("button", { name: "project" });
+		const expandIcon = row.querySelector("svg");
+		if (!expandIcon) {
+			throw new Error("Expected expand icon for folder row");
+		}
+
+		if (!screen.queryByRole("button", { name: "a.txt" })) {
+			fireEvent.click(expandIcon);
+		}
+
+		expect(await screen.findByRole("button", { name: "a.txt" })).toBeTruthy();
+	});
+
+	test("shows available attributes for the selected entry", async () => {
+		mockListSnapshotFiles({
+			files: [
+				{ name: "project", path: "/mnt/project", type: "dir" },
+				{
+					name: "a.txt",
+					path: "/mnt/project/a.txt",
+					type: "file",
+					size: 1024,
+					mode: 0o644,
+					mtime: "2026-08-13T23:35:02Z",
+				},
+			],
+		});
+
+		renderSnapshotTreeBrowser();
+
+		const folder = await screen.findByRole("button", { name: "project" });
+		const expandIcon = folder.querySelector("svg");
+		if (!expandIcon) throw new Error("Expected expand icon for folder row");
+		fireEvent.click(expandIcon);
+
+		await userEvent.click(await screen.findByRole("button", { name: /^a\.txt/ }));
+
+		expect(screen.getByText("/project/a.txt")).toBeTruthy();
+		expect(screen.getAllByText("1 KiB")).toHaveLength(2);
+		expect(screen.getByText("0644")).toBeTruthy();
+	});
+});

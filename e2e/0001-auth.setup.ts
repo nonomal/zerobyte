@@ -1,11 +1,31 @@
 import fs from "fs";
-import { test, expect } from "@playwright/test";
-import { resetDatabase } from "./helpers/db";
+import { test, expect } from "./test";
+import { db, resetDatabase } from "./helpers/db";
 import path from "node:path";
+import { REGISTRATION_ENABLED_KEY } from "~/server/core/constants";
+import { appMetadataTable } from "~/server/db/schema";
+import { gotoAndWaitForAppReady } from "./helpers/page";
 
 const authFile = path.join(process.cwd(), "./playwright/.auth/user.json");
+const enableRegistrations = async () => {
+	const now = Date.now();
 
-// TODO: Run these tests with different users once multi-user support is added
+	await db
+		.insert(appMetadataTable)
+		.values({
+			key: REGISTRATION_ENABLED_KEY,
+			value: JSON.stringify(true),
+			createdAt: now,
+			updatedAt: now,
+		})
+		.onConflictDoUpdate({
+			target: appMetadataTable.key,
+			set: {
+				value: JSON.stringify(true),
+				updatedAt: now,
+			},
+		});
+};
 
 // Run tests in serial mode to avoid conflicts during onboarding
 test.describe.configure({ mode: "serial" });
@@ -15,15 +35,13 @@ test.beforeAll(async () => {
 });
 
 test("should redirect to onboarding", async ({ page }) => {
-	await page.goto("/");
-
-	await page.waitForURL(/onboarding/);
+	await gotoAndWaitForAppReady(page, "/onboarding");
 
 	await expect(page).toHaveTitle(/Zerobyte - Onboarding/);
 });
 
 test("user can register a new account", async ({ page }) => {
-	await page.goto("/onboarding");
+	await gotoAndWaitForAppReady(page, "/onboarding");
 
 	await page.getByRole("textbox", { name: "Email" }).click();
 	await page.getByRole("textbox", { name: "Email" }).fill("test@test.com");
@@ -39,7 +57,7 @@ test("user can register a new account", async ({ page }) => {
 });
 
 test("user can download recovery key", async ({ page }) => {
-	await page.goto("/login");
+	await gotoAndWaitForAppReady(page, "/login");
 
 	await page.getByRole("textbox", { name: "Username" }).fill("test");
 	await page.getByRole("textbox", { name: "Password" }).fill("password");
@@ -69,7 +87,7 @@ test("user can download recovery key", async ({ page }) => {
 });
 
 test("can't create another admin user after initial setup", async ({ page }) => {
-	await page.goto("/onboarding");
+	await gotoAndWaitForAppReady(page, "/onboarding");
 
 	await page.getByRole("textbox", { name: "Email" }).click();
 	await page.getByRole("textbox", { name: "Email" }).fill("test@test.com");
@@ -85,7 +103,7 @@ test("can't create another admin user after initial setup", async ({ page }) => 
 });
 
 test("can login after initial setup", async ({ page }) => {
-	await page.goto("/login");
+	await gotoAndWaitForAppReady(page, "/login");
 
 	await page.getByRole("textbox", { name: "Username" }).fill("test");
 	await page.getByRole("textbox", { name: "Password" }).fill("password");
@@ -93,6 +111,8 @@ test("can login after initial setup", async ({ page }) => {
 
 	await expect(page).toHaveURL("/volumes");
 	await expect(page.getByRole("heading", { name: "No volume" })).toBeVisible();
+
+	await enableRegistrations();
 
 	await page.context().storageState({ path: authFile });
 });

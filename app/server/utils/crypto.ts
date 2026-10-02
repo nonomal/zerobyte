@@ -1,8 +1,5 @@
 import crypto from "node:crypto";
-import fs from "node:fs/promises";
-import path from "node:path";
 import { config } from "../core/config";
-import { isNodeJSErrnoException } from "./fs";
 import { promisify } from "node:util";
 
 const hkdf = promisify(crypto.hkdf);
@@ -11,76 +8,24 @@ const algorithm = "aes-256-gcm" as const;
 const keyLength = 32;
 const encryptionPrefix = "encv1:";
 
-const envSecretPrefix = "env://";
-const fileSecretPrefix = "file://";
+export type SecretTransformer = (value: string) => Promise<string>;
+
+export const transformOptionalSecret = async (
+	value: string | undefined,
+	transformSecret: SecretTransformer,
+): Promise<string | undefined> => {
+	if (!value) {
+		return value;
+	}
+
+	return await transformSecret(value);
+};
 
 /**
  * Checks if a given string is encrypted by looking for the encryption prefix.
  */
 const isEncrypted = (val?: string): boolean => {
 	return typeof val === "string" && val.startsWith(encryptionPrefix);
-};
-
-/**
- * Checks if a string looks like a supported secret reference.
- * - env://VAR_NAME -> reads process.env.VAR_NAME
- * - file://name -> reads a file /run/secrets/name
- */
-const isSecretReference = (val?: string): boolean => {
-	return typeof val === "string" && (val.startsWith(envSecretPrefix) || val.startsWith(fileSecretPrefix));
-};
-
-/**
- * Resolves an environment variable secret reference.
- */
-const resolveEnvSecret = (ref: string): string => {
-	const name = ref.slice(envSecretPrefix.length);
-	if (!name) {
-		throw new Error("env:// reference is missing variable name");
-	}
-
-	const value = process.env[name];
-	if (value === undefined) {
-		throw new Error(`Environment variable not set: ${name}`);
-	}
-
-	return value;
-};
-
-/**
- * Resolves a file-based secret reference.
- * Reads the secret from /run/secrets/{name}
- */
-const resolveFileSecret = async (ref: string): Promise<string> => {
-	const secretName = ref.slice(fileSecretPrefix.length);
-	if (!secretName) {
-		throw new Error("file:// reference is missing secret name");
-	}
-
-	const normalizedName = secretName.replace(/^\/+/, "");
-	if (!normalizedName) {
-		throw new Error("file:// reference is missing secret name");
-	}
-	if (normalizedName.includes("\0") || normalizedName.includes("/") || normalizedName.includes("\\")) {
-		throw new Error("Invalid secret reference: secret name must be a single path segment");
-	}
-
-	const resolvedPath = path.join("/run/secrets", normalizedName);
-
-	try {
-		const content = await fs.readFile(resolvedPath, "utf-8");
-		return content.trimEnd();
-	} catch (error) {
-		if (isNodeJSErrnoException(error)) {
-			if (error.code === "ENOENT") {
-				throw new Error(`Secret file not found: ${resolvedPath}`);
-			}
-			if (error.code === "EACCES") {
-				throw new Error(`Permission denied reading secret file: ${resolvedPath}`);
-			}
-		}
-		throw new Error(`Failed to read secret file ${resolvedPath}: ${(error as Error).message}`);
-	}
 };
 
 /**
@@ -93,7 +38,14 @@ const encrypt = async (data: string) => {
 	}
 
 	if (isEncrypted(data)) {
-		return data;
+		try {
+			await decrypt(data);
+			return data;
+		} catch {
+			throw new Error(
+				"You have provided an encrypted value that cannot be decrypted with the current APP_SECRET. Please use a plain text value.",
+			);
+		}
 	}
 
 	const salt = crypto.randomBytes(16);
@@ -137,27 +89,10 @@ const decrypt = async (encryptedData: string) => {
 
 /**
  * Resolves secret references and encrypted database values.
- *
- * - encv1:... -> decrypt
- * - env://VAR -> read process.env.VAR
- * - file://name -> read /run/secrets/name
- * - otherwise returns value unchanged
  */
 const resolveSecret = async (value: string): Promise<string> => {
-	if (!value) {
-		return value;
-	}
-
 	if (isEncrypted(value)) {
 		return decrypt(value);
-	}
-
-	if (value.startsWith(envSecretPrefix)) {
-		return resolveEnvSecret(value);
-	}
-
-	if (value.startsWith(fileSecretPrefix)) {
-		return resolveFileSecret(value);
 	}
 
 	return value;
@@ -165,21 +100,13 @@ const resolveSecret = async (value: string): Promise<string> => {
 
 /**
  * Prepares a secret value for storage.
- *
- * - env://... and file://... are stored as-is (references)
- * - encv1:... is stored as-is (already encrypted)
- * - otherwise encrypt before storing
  */
 const sealSecret = async (value: string): Promise<string> => {
-	if (!value) {
-		return value;
-	}
-
-	if (isEncrypted(value) || isSecretReference(value)) {
-		return value;
-	}
-
 	return encrypt(value);
+};
+
+const sealOptionalSecret = async (value?: string): Promise<string | undefined> => {
+	return transformOptionalSecret(value, sealSecret);
 };
 
 async function deriveSecret(label: string) {
@@ -192,10 +119,22 @@ function generateResticPassword(): string {
 	return crypto.randomBytes(32).toString("hex");
 }
 
+function timingSafeEqualString(provided: string, expected: string): boolean {
+	const providedBuffer = Buffer.from(provided);
+	const expectedBuffer = Buffer.from(expected);
+
+	return (
+		providedBuffer.byteLength === expectedBuffer.byteLength &&
+		crypto.timingSafeEqual(providedBuffer, expectedBuffer)
+	);
+}
+
 export const cryptoUtils = {
 	resolveSecret,
 	sealSecret,
+	sealOptionalSecret,
 	deriveSecret,
 	generateResticPassword,
+	timingSafeEqualString,
 	isEncrypted,
 };

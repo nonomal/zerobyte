@@ -1,6 +1,6 @@
 import { useMutation, useQuery } from "@tanstack/react-query";
 import { Bell, Plus, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { toast } from "sonner";
 import { Button } from "~/client/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
@@ -17,7 +17,7 @@ import type { NotificationDestination } from "~/client/lib/types";
 import type { GetScheduleNotificationsResponse } from "~/client/api-client";
 
 type Props = {
-	scheduleId: number;
+	scheduleShortId: string;
 	destinations: NotificationDestination[];
 	initialData: GetScheduleNotificationsResponse;
 };
@@ -30,13 +30,24 @@ type NotificationAssignment = {
 	notifyOnFailure: boolean;
 };
 
-export const ScheduleNotificationsConfig = ({ scheduleId, destinations, initialData }: Props) => {
-	const [assignments, setAssignments] = useState<Map<number, NotificationAssignment>>(new Map());
+export const ScheduleNotificationsConfig = ({ scheduleShortId, destinations, initialData }: Props) => {
+	const map = new Map<number, NotificationAssignment>();
+	for (const assignment of initialData) {
+		map.set(assignment.destinationId, {
+			destinationId: assignment.destinationId,
+			notifyOnStart: assignment.notifyOnStart,
+			notifyOnSuccess: assignment.notifyOnSuccess,
+			notifyOnWarning: assignment.notifyOnWarning,
+			notifyOnFailure: assignment.notifyOnFailure,
+		});
+	}
+
+	const [assignments, setAssignments] = useState<Map<number, NotificationAssignment>>(map);
 	const [hasChanges, setHasChanges] = useState(false);
 	const [isAddingNew, setIsAddingNew] = useState(false);
 
 	const { data: currentAssignments } = useQuery({
-		...getScheduleNotificationsOptions({ path: { scheduleId: scheduleId.toString() } }),
+		...getScheduleNotificationsOptions({ path: { shortId: scheduleShortId } }),
 		initialData,
 	});
 
@@ -52,23 +63,6 @@ export const ScheduleNotificationsConfig = ({ scheduleId, destinations, initialD
 			});
 		},
 	});
-
-	useEffect(() => {
-		if (currentAssignments) {
-			const map = new Map<number, NotificationAssignment>();
-			for (const assignment of currentAssignments) {
-				map.set(assignment.destinationId, {
-					destinationId: assignment.destinationId,
-					notifyOnStart: assignment.notifyOnStart,
-					notifyOnSuccess: assignment.notifyOnSuccess,
-					notifyOnWarning: assignment.notifyOnWarning,
-					notifyOnFailure: assignment.notifyOnFailure,
-				});
-			}
-
-			setAssignments(map);
-		}
-	}, [currentAssignments]);
 
 	const addDestination = (destinationId: string) => {
 		const id = Number.parseInt(destinationId, 10);
@@ -113,7 +107,7 @@ export const ScheduleNotificationsConfig = ({ scheduleId, destinations, initialD
 	const handleSave = () => {
 		const assignmentsList = Array.from(assignments.values());
 		updateNotifications.mutate({
-			path: { scheduleId: scheduleId.toString() },
+			path: { shortId: scheduleShortId },
 			body: {
 				assignments: assignmentsList,
 			},

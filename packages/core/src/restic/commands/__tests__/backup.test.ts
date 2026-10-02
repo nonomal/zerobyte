@@ -1,0 +1,477 @@
+import { afterEach, describe, expect, test, vi } from "vitest";
+import { Effect } from "effect";
+import * as cleanupModule from "../../helpers/cleanup-temporary-keys";
+import * as spawnModule from "../../../node/spawn";
+import { ResticError } from "../../error";
+import { backup } from "../backup";
+import type { ResticDeps } from "../../types";
+import type { SafeSpawnParams, SpawnResult } from "../../../node/spawn";
+
+const mockDeps: ResticDeps = {
+	resolveSecret: async (s) => s,
+	getOrganizationResticPassword: async () => "org-restic-password",
+	resticCacheDir: "/tmp/restic-cache",
+	resticPassFile: "/tmp/restic.pass",
+	defaultExcludes: ["/tmp/restic.pass", "/var/lib/zerobyte/repositories"],
+	hostname: "zerobyte",
+	rcloneConfigFile: "/root/.config/rclone/rclone.conf",
+};
+
+const VALID_SUMMARY = JSON.stringify({
+	message_type: "summary",
+	files_new: 10,
+	files_changed: 5,
+	files_unmodified: 85,
+	dirs_new: 2,
+	dirs_changed: 1,
+	dirs_unmodified: 17,
+	data_blobs: 20,
+	tree_blobs: 5,
+	data_added: 1048576,
+	total_files_processed: 100,
+	total_bytes_processed: 2097152,
+	total_duration: 12.34,
+	snapshot_id: "abcd1234",
+});
+
+const VALID_PROGRESS_LINE = JSON.stringify({
+	message_type: "status",
+	seconds_elapsed: 5,
+	percent_done: 0.5,
+	total_files: 100,
+	files_done: 50,
+	total_bytes: 2097152,
+	bytes_done: 1048576,
+});
+
+const config = {
+	backend: "local" as const,
+	path: "/tmp/restic-repo",
+	isExistingRepository: true,
+	customPassword: "custom-password",
+};
+
+type SetupOptions = {
+	spawnResult?: Partial<SpawnResult>;
+	onSpawnCall?: (params: SafeSpawnParams) => void | Promise<void>;
+};
+
+/**
+ * Sets up mocks for safeSpawn and cleanupTemporaryKeys, captures spawn args,
+ * and returns helpers to inspect what was passed to restic.
+ */
+const setup = ({ spawnResult = {}, onSpawnCall }: SetupOptions = {}) => {
+	let capturedArgs: string[] = [];
+	let capturedEnv: SafeSpawnParams["env"];
+	let capturedPriority: SafeSpawnParams["priority"];
+
+	vi.spyOn(cleanupModule, "cleanupTemporaryKeys").mockImplementation(() => Promise.resolve());
+	vi.spyOn(spawnModule, "safeSpawn").mockImplementation((params: SafeSpawnParams) => {
+		capturedArgs = params.args;
+		capturedEnv = params.env;
+		capturedPriority = params.priority;
+		return Promise.resolve(onSpawnCall?.(params)).then(() => ({
+			exitCode: 0,
+			summary: VALID_SUMMARY,
+			error: "",
+			...spawnResult,
+		}));
+	});
+
+	return {
+		getArgs: () => capturedArgs,
+		getEnv: () => capturedEnv,
+		getPriority: () => capturedPriority,
+		hasFlag: (flag: string) => capturedArgs.includes(flag),
+		getOptionValues: (option: string): string[] => {
+			const values: string[] = [];
+			for (let i = 0; i < capturedArgs.length - 1; i++) {
+				if (capturedArgs[i] === option && capturedArgs[i + 1]) {
+					values.push(capturedArgs[i + 1]!);
+				}
+			}
+			return values;
+		},
+	};
+};
+
+const runBackup = (...args: Parameters<typeof backup>) => Effect.runPromise(backup(...args));
+const runBackupError = (...args: Parameters<typeof backup>) => Effect.runPromise(Effect.flip(backup(...args)));
+
+afterEach(() => {
+	vi.restoreAllMocks();
+	delete process.env.RESTIC_PROGRESS_FPS;
+});
+
+describe("backup command", () => {
+	describe("argument construction", () => {
+		test("passes source path as positional arg when no include list is given", async () => {
+			const { getArgs, hasFlag } = setup();
+			await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(getArgs()).toContain("/mnt/data");
+			expect(hasFlag("--files-from")).toBe(false);
+		});
+
+		test("treats flag-like source paths as positional args", async () => {
+			const { getArgs } = setup();
+			const source = "--help";
+
+			await runBackup(config, source, { organizationId: "org-1" }, mockDeps);
+
+			const separatorIndex = getArgs().indexOf("--");
+			expect(separatorIndex).toBeGreaterThan(-1);
+			expect(getArgs()[separatorIndex + 1]).toBe(source);
+			expect(getArgs().at(-1)).toBe(source);
+		});
+
+		test("writes include paths and patterns to separate files instead of passing the source path directly", async () => {
+			const literalDir = "/mnt/data/movies [1]";
+			let rawIncludeContent = "";
+			let patternIncludeContent = "";
+			const { getArgs, hasFlag } = setup({
+				onSpawnCall: async (params) => {
+					const rawIncludeIndex = params.args.indexOf("--files-from-raw");
+					const patternIncludeIndex = params.args.indexOf("--files-from");
+
+					if (rawIncludeIndex > -1) {
+						rawIncludeContent = await Bun.file(params.args[rawIncludeIndex + 1]!).text();
+					}
+
+					if (patternIncludeIndex > -1) {
+						patternIncludeContent = await Bun.file(params.args[patternIncludeIndex + 1]!).text();
+					}
+				},
+			});
+
+			await runBackup(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					includePaths: [literalDir],
+					includePatterns: ["/mnt/data/**/*.zip"],
+				},
+				mockDeps,
+			);
+
+			expect(hasFlag("--files-from-raw")).toBe(true);
+			expect(hasFlag("--files-from")).toBe(true);
+			expect(getArgs()).not.toContain("/mnt/data");
+			expect(rawIncludeContent).toBe(`${literalDir}\0`);
+			expect(patternIncludeContent).toBe("/mnt/data/**/*.zip");
+		});
+
+		test("writes raw include paths containing line breaks as single entries", async () => {
+			const lineBreakDir = "/mnt/data/photos\n2026";
+			const carriageReturnDir = "/mnt/data/photos\r2025";
+			let rawIncludeContent = "";
+			setup({
+				onSpawnCall: async (params) => {
+					const rawIncludeIndex = params.args.indexOf("--files-from-raw");
+
+					if (rawIncludeIndex > -1) {
+						rawIncludeContent = await Bun.file(params.args[rawIncludeIndex + 1]!).text();
+					}
+				},
+			});
+
+			await runBackup(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					includePaths: [lineBreakDir, carriageReturnDir],
+				},
+				mockDeps,
+			);
+
+			expect(rawIncludeContent).toBe(`${lineBreakDir}\0${carriageReturnDir}\0`);
+		});
+
+		test("rejects unsupported characters before writing raw include files", async () => {
+			const { getArgs } = setup();
+
+			const error = await runBackupError(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					includePaths: ["/mnt/data/safe\0/etc/passwd"],
+					includePatterns: ["/mnt/data/**/*.zip"],
+				},
+				mockDeps,
+			);
+
+			expect(String(error.message)).toContain("includePaths contains an unsupported path character");
+			expect(getArgs()).toEqual([]);
+		});
+
+		test("rejects unsupported characters before writing include pattern files", async () => {
+			const { getArgs } = setup();
+
+			for (const includePattern of [
+				"/mnt/data/safe\0/etc/passwd",
+				"/mnt/data/safe\n/etc/passwd",
+				"/mnt/data/safe\r/etc/passwd",
+			]) {
+				const error = await runBackupError(
+					config,
+					"/mnt/data",
+					{
+						organizationId: "org-1",
+						includePatterns: [includePattern],
+					},
+					mockDeps,
+				);
+
+				expect(String(error.message)).toContain("includePatterns contains an unsupported path character");
+				expect(getArgs()).toEqual([]);
+			}
+		});
+
+		test("always includes DEFAULT_EXCLUDES as --exclude args", async () => {
+			const { getOptionValues } = setup();
+			await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(getOptionValues("--exclude").length).toBeGreaterThan(0);
+		});
+
+		test("passes RCLONE_CONFIG when backing up to an rclone repository", async () => {
+			const { getEnv } = setup();
+
+			await runBackup(
+				{
+					backend: "rclone",
+					remote: "remote",
+					path: "/repo",
+					isExistingRepository: true,
+					customPassword: "custom-password",
+				},
+				"/mnt/data",
+				{ organizationId: "org-1" },
+				mockDeps,
+			);
+
+			expect(getEnv()?.RCLONE_CONFIG).toBe(mockDeps.rcloneConfigFile);
+		});
+
+		test("defaults restic progress output to one update per second", async () => {
+			const { getEnv } = setup();
+
+			await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(getEnv()?.RESTIC_PROGRESS_FPS).toBe("1");
+		});
+
+		test("respects an explicit RESTIC_PROGRESS_FPS environment value", async () => {
+			process.env.RESTIC_PROGRESS_FPS = "2";
+			const { getEnv } = setup();
+
+			await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(getEnv()?.RESTIC_PROGRESS_FPS).toBe("2");
+		});
+
+		test("runs restic backup as background-priority work", async () => {
+			const { getPriority } = setup();
+
+			await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(getPriority()).toBe("background");
+		});
+	});
+
+	describe("exit code handling", () => {
+		test("returns parsed result on exit code 0", async () => {
+			setup();
+			const { result, exitCode } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(exitCode).toBe(0);
+			expect(result?.snapshot_id).toBe("abcd1234");
+		});
+
+		test("ignores restic diagnostic stderr on exit code 0", async () => {
+			setup({
+				onSpawnCall: (params) => {
+					params.onStderr?.("Load(<lock/b84b958297>, 0, 0) failed: Key not found");
+				},
+			});
+
+			const { exitCode, warningDetails } = await runBackup(
+				config,
+				"/mnt/data",
+				{ organizationId: "org-1" },
+				mockDeps,
+			);
+
+			expect(exitCode).toBe(0);
+			expect(warningDetails).toBeNull();
+		});
+
+		test("returns result without throwing on exit code 3 (partial read errors)", async () => {
+			setup({ spawnResult: { exitCode: 3 } });
+			const { result, exitCode } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(exitCode).toBe(3);
+			expect(result).not.toBeNull();
+		});
+
+		test("keeps restic stderr on exit code 3", async () => {
+			setup({
+				spawnResult: { exitCode: 3 },
+				onSpawnCall: (params) => {
+					params.onStderr?.("error: open /mnt/data/private.db: permission denied");
+				},
+			});
+
+			const { warningDetails } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(warningDetails).toBe("error: open /mnt/data/private.db: permission denied");
+		});
+
+		test("throws ResticError on non-zero, non-3 exit codes", async () => {
+			setup({ spawnResult: { exitCode: 1, summary: "", error: "fatal error" } });
+
+			const error = await runBackupError(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+			expect(error).toBeInstanceOf(ResticError);
+		});
+
+		test("preserves the exit code inside the thrown ResticError", async () => {
+			setup({ spawnResult: { exitCode: 12, summary: "", error: "wrong password" } });
+
+			const error = await runBackupError(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+			expect(error).toBeInstanceOf(ResticError);
+			expect((error as ResticError).code).toBe(12);
+		});
+
+		test("stores restic summary separately from diagnostic stderr", async () => {
+			setup({
+				spawnResult: {
+					exitCode: 1,
+					summary: "",
+					error: "ssh command exited",
+				},
+				onSpawnCall: (params) => {
+					params.onStderr?.("Permissions 0755 for '/tmp/zerobyte-ssh-key' are too open.");
+					params.onStderr?.("This private key will be ignored.");
+				},
+			});
+
+			const error = await runBackupError(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+			expect(error).toBeInstanceOf(ResticError);
+			expect((error as ResticError).summary).toBe(
+				"Command failed: An error occurred while executing the command.",
+			);
+			expect((error as ResticError).details).toBe(
+				"Permissions 0755 for '/tmp/zerobyte-ssh-key' are too open.\nThis private key will be ignored.",
+			);
+		});
+
+		test("returns the manual-stop warning details when the abort signal is triggered", async () => {
+			const controller = new AbortController();
+			setup({
+				onSpawnCall: () => controller.abort(),
+				spawnResult: { exitCode: 130, summary: "", error: "" },
+			});
+
+			const { result, exitCode, warningDetails } = await runBackup(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					signal: controller.signal,
+				},
+				mockDeps,
+			);
+
+			expect(result).toBeNull();
+			expect(exitCode).toBe(130);
+			expect(warningDetails).toBe("Backup was stopped by the user");
+		});
+	});
+
+	describe("output parsing", () => {
+		test("returns a fully parsed summary object on valid output", async () => {
+			setup();
+			const { result } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(result).toMatchObject({
+				message_type: "summary",
+				snapshot_id: "abcd1234",
+				total_duration: 12.34,
+			});
+		});
+
+		test("returns { result: null } when summary line is not valid JSON", async () => {
+			setup({ spawnResult: { summary: "not-json" } });
+			const { result } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(result).toBeNull();
+		});
+
+		test("returns { result: null } when summary JSON does not satisfy the schema", async () => {
+			setup({ spawnResult: { summary: JSON.stringify({ message_type: "summary" }) } });
+			const { result } = await runBackup(config, "/mnt/data", { organizationId: "org-1" }, mockDeps);
+
+			expect(result).toBeNull();
+		});
+	});
+
+	describe("progress callbacks", () => {
+		test("calls onProgress with parsed data when a valid status line arrives", async () => {
+			const progressUpdates: unknown[] = [];
+			setup({ onSpawnCall: (params) => params.onStdout?.(VALID_PROGRESS_LINE) });
+
+			await runBackup(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					onProgress: (p) => progressUpdates.push(p),
+				},
+				mockDeps,
+			);
+
+			expect(progressUpdates.length).toBeGreaterThan(0);
+			expect(progressUpdates[0]).toMatchObject({
+				message_type: "status",
+				percent_done: 0.5,
+				files_done: 50,
+			});
+		});
+
+		test("ignores non-JSON stdout lines without throwing", async () => {
+			setup({
+				onSpawnCall: (params) => {
+					params.onStdout?.("scanning...");
+					params.onStdout?.("repository opened");
+				},
+			});
+
+			await expect(
+				runBackup(config, "/mnt/data", { organizationId: "org-1", onProgress: () => {} }, mockDeps),
+			).resolves.toBeDefined();
+		});
+
+		test("ignores valid JSON lines that do not match the progress schema", async () => {
+			const progressUpdates: unknown[] = [];
+			setup({
+				onSpawnCall: (params) =>
+					params.onStdout?.(JSON.stringify({ message_type: "verbose_status", action: "scan" })),
+			});
+
+			await runBackup(
+				config,
+				"/mnt/data",
+				{
+					organizationId: "org-1",
+					onProgress: (p) => progressUpdates.push(p),
+				},
+				mockDeps,
+			);
+
+			expect(progressUpdates).toHaveLength(0);
+		});
+	});
+});

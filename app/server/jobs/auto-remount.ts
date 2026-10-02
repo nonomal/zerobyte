@@ -1,6 +1,6 @@
 import { Job } from "../core/scheduler";
 import { volumeService } from "../modules/volumes/volume.service";
-import { logger } from "../utils/logger";
+import { logger } from "@zerobyte/core/node";
 import { db } from "../db/db";
 import { withContext } from "../core/request-context";
 
@@ -13,14 +13,12 @@ export class VolumeAutoRemountJob extends Job {
 		});
 
 		for (const volume of volumes) {
-			if (volume.autoRemount) {
-				try {
-					await withContext({ organizationId: volume.organizationId }, async () => {
-						await volumeService.mountVolume(volume.id);
-					});
-				} catch (err) {
-					logger.error(`Failed to auto-remount volume ${volume.name}:`, err);
-				}
+			try {
+				await withContext({ organizationId: volume.organizationId }, async () => {
+					await volumeService.ensureHealthyVolume(volume.shortId);
+				});
+			} catch (err) {
+				logger.error(`Failed to recover volume ${volume.name}:`, err);
 			}
 		}
 

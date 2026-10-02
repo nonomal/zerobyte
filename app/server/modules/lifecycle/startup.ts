@@ -1,8 +1,6 @@
 import { Scheduler } from "../../core/scheduler";
-import { eq } from "drizzle-orm";
 import { db } from "../../db/db";
-import { backupSchedulesTable } from "../../db/schema";
-import { logger } from "../../utils/logger";
+import { logger } from "@zerobyte/core/node";
 import { volumeService } from "../volumes/volume.service";
 import { CleanupDanglingMountsJob } from "../../jobs/cleanup-dangling";
 import { VolumeHealthCheckJob } from "../../jobs/healthchecks";
@@ -12,16 +10,21 @@ import { repositoriesService } from "../repositories/repositories.service";
 import { notificationsService } from "../notifications/notifications.service";
 import { VolumeAutoRemountJob } from "~/server/jobs/auto-remount";
 import { cache } from "~/server/utils/cache";
-import { initAuth } from "~/server/lib/auth";
-import { toMessage } from "~/server/utils/errors";
 import { withContext } from "~/server/core/request-context";
+import { pruneExpiredMirrorStatus } from "../backups/commands/mirror-status-command";
+import { backupsService } from "../backups/backups.service";
+import { config } from "~/server/core/config";
+import { syncProvisionedResources } from "../provisioning/provisioning";
+import { toMessage } from "~/server/utils/errors";
+import { LOCAL_AGENT_ID } from "../agents/constants";
+import { RESTART_TASK_ERROR, taskStore } from "../tasks/tasks.store";
 
 const ensureLatestConfigurationSchema = async () => {
 	const volumes = await db.query.volumesTable.findMany({});
 
 	for (const volume of volumes) {
 		await withContext({ organizationId: volume.organizationId }, async () => {
-			await volumeService.updateVolume(volume.id, volume).catch((err) => {
+			await volumeService.updateVolume(volume.shortId, volume).catch((err) => {
 				logger.error(`Failed to update volume ${volume.name}: ${err}`);
 			});
 		});
@@ -31,7 +34,7 @@ const ensureLatestConfigurationSchema = async () => {
 
 	for (const repo of repositories) {
 		await withContext({ organizationId: repo.organizationId }, async () => {
-			await repositoriesService.updateRepository(repo.id, {}).catch((err) => {
+			await repositoriesService.updateRepository(repo.shortId, {}).catch((err) => {
 				logger.error(`Failed to update repository ${repo.name}: ${err}`);
 			});
 		});
@@ -48,51 +51,75 @@ const ensureLatestConfigurationSchema = async () => {
 	}
 };
 
-export const startup = async () => {
+export const startup = async (bootstrapStartedAt?: number) => {
 	cache.clear();
+
+	let staleTasks: ReturnType<typeof taskStore.markActiveStale> = [];
+	try {
+		pruneExpiredMirrorStatus();
+		staleTasks = taskStore.markActiveStale({
+			error: RESTART_TASK_ERROR,
+			createdBefore: bootstrapStartedAt,
+		});
+		if (staleTasks.length > 0) {
+			logger.warn(`Marked ${staleTasks.length} active task(s) stale during startup`);
+		}
+	} catch (err) {
+		logger.error(`Failed to mark stale tasks on startup: ${toMessage(err)}`);
+	}
+
+	await backupsService.recoverInterruptedBackups(staleTasks, bootstrapStartedAt).catch((err) => {
+		logger.error(`Failed to recover interrupted backup schedules on startup: ${err.message}`);
+	});
 
 	await Scheduler.start();
 	await Scheduler.clear();
 
-	await initAuth().catch((err) => {
-		logger.error(`Error initializing auth: ${toMessage(err)}`);
-		throw err;
+	await syncProvisionedResources(config.provisioningPath).catch((error) => {
+		logger.error(`Provisioning sync failed: ${toMessage(error)}`);
 	});
 
 	await ensureLatestConfigurationSchema();
 
-	const volumes = await db.query.volumesTable.findMany({
-		where: {
-			OR: [
-				{ status: "mounted" },
-				{
-					AND: [{ autoRemount: true }, { status: "error" }],
-				},
-			],
-		},
+	const { deletedSchedules } = await backupsService.cleanupOrphanedSchedules().catch((err) => {
+		logger.error(`Failed to cleanup orphaned backup schedules on startup: ${err.message}`);
+		return { deletedSchedules: 0 };
 	});
 
-	for (const volume of volumes) {
-		await withContext({ organizationId: volume.organizationId }, async () => {
-			await volumeService.mountVolume(volume.id).catch((err) => {
-				logger.error(`Error auto-remounting volume ${volume.name} on startup: ${err.message}`);
-			});
-		});
+	if (deletedSchedules > 0) {
+		logger.warn(`Removed ${deletedSchedules} orphaned backup schedule(s) during startup`);
 	}
 
-	await db
-		.update(backupSchedulesTable)
-		.set({
-			lastBackupStatus: "warning",
-			lastBackupError: "Zerobyte was restarted during the last scheduled backup",
-			updatedAt: Date.now(),
-		})
-		.where(eq(backupSchedulesTable.lastBackupStatus, "in_progress"))
-		.catch((err) => {
-			logger.error(`Failed to update stuck backup schedules on startup: ${err.message}`);
+	if (!config.flags.enableLocalAgent) {
+		const volumes = await db.query.volumesTable.findMany({
+			where: {
+				AND: [
+					{ agentId: LOCAL_AGENT_ID },
+					{
+						OR: [
+							{ type: "directory" },
+							{ status: "mounted" },
+							{
+								AND: [{ autoRemount: true }, { status: "error" }],
+							},
+						],
+					},
+				],
+			},
 		});
 
-	Scheduler.build(CleanupDanglingMountsJob).schedule("0 * * * *");
+		for (const volume of volumes) {
+			await withContext({ organizationId: volume.organizationId }, async () => {
+				await volumeService.mountVolume(volume.shortId).catch((err) => {
+					logger.error(`Error auto-remounting volume ${volume.name} on startup: ${err.message}`);
+				});
+			});
+		}
+	}
+
+	if (!config.flags.enableLocalAgent) {
+		Scheduler.build(CleanupDanglingMountsJob).schedule("0 * * * *");
+	}
 	Scheduler.build(VolumeHealthCheckJob).schedule("*/30 * * * *");
 	Scheduler.build(RepositoryHealthCheckJob).schedule("50 12 * * *");
 	Scheduler.build(BackupExecutionJob).schedule("* * * * *");

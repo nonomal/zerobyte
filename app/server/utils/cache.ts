@@ -3,13 +3,13 @@ import path from "node:path";
 import fs from "node:fs";
 import { DATABASE_URL } from "../core/constants";
 
-export const ONE_DAY_IN_SECONDS = 60 * 60 * 24;
+const ONE_DAY_IN_SECONDS = 60 * 60 * 24;
 
-export interface CacheOptions {
+interface CacheOptions {
 	dbPath?: string;
 }
 
-export const createCache = (options: CacheOptions = {}) => {
+const createCache = (options: CacheOptions = {}) => {
 	const defaultPath = path.join(path.dirname(DATABASE_URL), "cache.db");
 	const dbPath = options.dbPath || defaultPath;
 
@@ -54,14 +54,20 @@ export const createCache = (options: CacheOptions = {}) => {
 		stmt.run(key);
 	};
 
+	const escapeLikePattern = (pattern: string): string => {
+		return pattern.replace(/\\/g, "\\\\").replace(/%/g, "\\%").replace(/_/g, "\\_");
+	};
+
 	const delByPrefix = (prefix: string) => {
-		const stmt = db.prepare("DELETE FROM cache WHERE key LIKE ?");
-		stmt.run(`${prefix}%`);
+		const escapedPrefix = escapeLikePattern(prefix);
+		const stmt = db.prepare("DELETE FROM cache WHERE key LIKE ? ESCAPE '\\'");
+		stmt.run(`${escapedPrefix}%`);
 	};
 
 	const getByPrefix = <T>(prefix: string): { key: string; value: T }[] => {
-		const stmt = db.prepare("SELECT key, value, expiration FROM cache WHERE key LIKE ?");
-		const rows = stmt.all(`${prefix}%`) as { key: string; value: string; expiration: number }[];
+		const escapedPrefix = escapeLikePattern(prefix);
+		const stmt = db.prepare("SELECT key, value, expiration FROM cache WHERE key LIKE ? ESCAPE '\\'");
+		const rows = stmt.all(`${escapedPrefix}%`) as { key: string; value: string; expiration: number }[];
 
 		const now = Date.now();
 		const results: { key: string; value: T }[] = [];
@@ -97,6 +103,19 @@ export const createCache = (options: CacheOptions = {}) => {
 		getByPrefix,
 		clear,
 	};
+};
+
+export const cacheKeys = {
+	repository: {
+		all: (repositoryId: string) => `repo:${repositoryId}:`,
+		snapshots: (repositoryId: string, backupId = "all") => `repo:${repositoryId}:snapshots:${backupId}`,
+		ls: (repositoryId: string, snapshotId: string, path = "root", offset: number, limit: number) =>
+			`repo:${repositoryId}:ls:${snapshotId}:${path}:${offset}:${limit}`,
+		retention: (repositoryId: string, scheduleId: string) => `repo:${repositoryId}:retention:${scheduleId}`,
+	},
+	system: {
+		githubReleases: (version: string) => `system:updates:${version}`,
+	},
 };
 
 export const cache = createCache();

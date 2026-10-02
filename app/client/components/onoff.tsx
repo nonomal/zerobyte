@@ -15,7 +15,7 @@ export const OnOff = ({ isOn, toggle, enabledLabel, disabledLabel, disabled }: P
 			className={cn(
 				"flex items-center gap-2 rounded-full border px-3 py-1.5 text-xs font-semibold uppercase tracking-wide transition-colors",
 				isOn
-					? "border-green-200 bg-green-50 text-green-700 dark:border-green-500/40 dark:bg-green-500/10 dark:text-green-200"
+					? "border-success/30 bg-success/10 text-success"
 					: "border-muted bg-muted/40 text-muted-foreground dark:border-muted/60 dark:bg-muted/10",
 			)}
 		>

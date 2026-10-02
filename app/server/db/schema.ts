@@ -3,13 +3,20 @@ import { index, int, integer, sqliteTable, text, real, primaryKey, unique, uniqu
 import type {
 	CompressionMode,
 	RepositoryBackend,
-	repositoryConfigSchema,
+	RepositoryConfig,
 	RepositoryStatus,
 	BandwidthUnit,
 	DoctorResult,
-} from "~/schemas/restic";
-import type { BackendStatus, BackendType, volumeConfigSchema } from "~/schemas/volumes";
-import type { NotificationType, notificationConfigSchema } from "~/schemas/notifications";
+	ResticStatsDto,
+} from "@zerobyte/core/restic";
+import type { BackupWebhooks } from "@zerobyte/core/backup-hooks";
+import type { BackendConfig, BackendStatus, BackendType } from "@zerobyte/contracts/volumes";
+import type { NotificationConfig, NotificationType } from "~/schemas/notifications";
+import type { TaskOutcome, TaskPersistenceFormatVersion } from "~/schemas/tasks";
+import type { ShortId } from "~/server/utils/branded";
+import { LOCAL_AGENT_ID } from "../modules/agents/constants";
+
+type SessionAuthSource = "browser-session" | "desktop-session";
 
 /**
  * Users Table
@@ -19,6 +26,8 @@ export const usersTable = sqliteTable("users_table", {
 	username: text().notNull().unique(),
 	passwordHash: text("password_hash"),
 	hasDownloadedResticPassword: int("has_downloaded_restic_password", { mode: "boolean" }).notNull().default(false),
+	dateFormat: text("date_format").notNull().default("MM/DD/YYYY"),
+	timeFormat: text("time_format").notNull().default("12h"),
 	createdAt: int("created_at", { mode: "timestamp_ms" })
 		.notNull()
 		.default(sql`(unixepoch() * 1000)`),
@@ -59,6 +68,7 @@ export const sessionsTable = sqliteTable(
 		userAgent: text("user_agent"),
 		impersonatedBy: text("impersonated_by"),
 		activeOrganizationId: text("active_organization_id"),
+		authSource: text("auth_source").$type<SessionAuthSource>().notNull().default("browser-session"),
 	},
 	(table) => [index("sessionsTable_userId_idx").on(table.userId)],
 );
@@ -126,6 +136,7 @@ export const organization = sqliteTable(
 		logo: text("logo"),
 		createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 		metadata: text("metadata", { mode: "json" }).$type<OrganizationMetadata>(),
+		recoveryKeyExportedAt: integer("recovery_key_exported_at", { mode: "timestamp_ms" }),
 	},
 	(table) => [uniqueIndex("organization_slug_uidx").on(table.slug)],
 );
@@ -172,6 +183,57 @@ export const invitation = sqliteTable(
 	],
 );
 
+export const ssoProvider = sqliteTable("sso_provider", {
+	id: text("id").primaryKey(),
+	providerId: text("provider_id").notNull().unique(),
+	organizationId: text("organization_id")
+		.notNull()
+		.references(() => organization.id, { onDelete: "cascade" }),
+	userId: text("user_id").references(() => usersTable.id, { onDelete: "set null" }),
+	issuer: text("issuer").notNull(),
+	domain: text("domain").notNull(),
+	autoLinkMatchingEmails: int("auto_link_matching_emails", { mode: "boolean" }).notNull().default(false),
+	oidcConfig: text("oidc_config", { mode: "json" }).$type<Record<string, unknown> | null>(),
+	samlConfig: text("saml_config", { mode: "json" }).$type<Record<string, unknown> | null>(),
+	createdAt: integer("created_at", { mode: "timestamp_ms" })
+		.notNull()
+		.default(sql`(unixepoch() * 1000)`),
+	updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+		.notNull()
+		.$onUpdate(() => new Date())
+		.default(sql`(unixepoch() * 1000)`),
+});
+
+export type AgentKind = "local" | "remote";
+export type AgentStatus = "offline" | "connecting" | "online" | "degraded";
+export type AgentCapabilities = Record<string, unknown>;
+
+export const agentsTable = sqliteTable(
+	"agents_table",
+	{
+		id: text("id").primaryKey(),
+		organizationId: text("organization_id").references(() => organization.id, { onDelete: "cascade" }),
+		name: text("name").notNull(),
+		kind: text("kind").$type<AgentKind>().notNull(),
+		status: text("status").$type<AgentStatus>().notNull().default("offline"),
+		capabilities: text("capabilities", { mode: "json" }).$type<AgentCapabilities>().notNull().default({}),
+		lastSeenAt: int("last_seen_at", { mode: "number" }),
+		lastReadyAt: int("last_ready_at", { mode: "number" }),
+		createdAt: int("created_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		updatedAt: int("updated_at", { mode: "number" })
+			.notNull()
+			.$onUpdate(() => Date.now())
+			.default(sql`(unixepoch() * 1000)`),
+	},
+	(table) => [
+		index("agents_table_organization_id_idx").on(table.organizationId),
+		index("agents_table_status_idx").on(table.status),
+	],
+);
+export type Agent = typeof agentsTable.$inferSelect;
+
 /**
  * Volumes Table
  */
@@ -179,7 +241,8 @@ export const volumesTable = sqliteTable(
 	"volumes_table",
 	{
 		id: int().primaryKey({ autoIncrement: true }),
-		shortId: text("short_id").notNull().unique(),
+		shortId: text("short_id").$type<ShortId>().notNull().unique(),
+		provisioningId: text("provisioning_id"),
 		name: text().notNull(),
 		type: text().$type<BackendType>().notNull(),
 		status: text().$type<BackendStatus>().notNull().default("unmounted"),
@@ -194,13 +257,18 @@ export const volumesTable = sqliteTable(
 			.notNull()
 			.$onUpdate(() => Date.now())
 			.default(sql`(unixepoch() * 1000)`),
-		config: text("config", { mode: "json" }).$type<typeof volumeConfigSchema.inferOut>().notNull(),
+		config: text("config", { mode: "json" }).$type<BackendConfig>().notNull(),
 		autoRemount: int("auto_remount", { mode: "boolean" }).notNull().default(true),
+		agentId: text("agent_id").notNull().default(LOCAL_AGENT_ID),
 		organizationId: text("organization_id")
 			.notNull()
 			.references(() => organization.id, { onDelete: "cascade" }),
 	},
-	(table) => [unique().on(table.name, table.organizationId)],
+	(table) => [
+		unique().on(table.name, table.organizationId),
+		index("volumes_table_agent_id_idx").on(table.agentId),
+		uniqueIndex("volumes_table_org_provisioning_id_uidx").on(table.organizationId, table.provisioningId),
+	],
 );
 export type Volume = typeof volumesTable.$inferSelect;
 export type VolumeInsert = typeof volumesTable.$inferInsert;
@@ -208,79 +276,202 @@ export type VolumeInsert = typeof volumesTable.$inferInsert;
 /**
  * Repositories Table
  */
-export const repositoriesTable = sqliteTable("repositories_table", {
-	id: text().primaryKey(),
-	shortId: text("short_id").notNull().unique(),
-	name: text().notNull(),
-	type: text().$type<RepositoryBackend>().notNull(),
-	config: text("config", { mode: "json" }).$type<typeof repositoryConfigSchema.inferOut>().notNull(),
-	compressionMode: text("compression_mode").$type<CompressionMode>().default("auto"),
-	status: text().$type<RepositoryStatus>().default("unknown"),
-	lastChecked: int("last_checked", { mode: "number" }),
-	lastError: text("last_error"),
-	doctorResult: text("doctor_result", { mode: "json" }).$type<DoctorResult>(),
-	uploadLimitEnabled: int("upload_limit_enabled", { mode: "boolean" }).notNull().default(false),
-	uploadLimitValue: real("upload_limit_value").notNull().default(1),
-	uploadLimitUnit: text("upload_limit_unit").$type<BandwidthUnit>().notNull().default("Mbps"),
-	downloadLimitEnabled: int("download_limit_enabled", { mode: "boolean" }).notNull().default(false),
-	downloadLimitValue: real("download_limit_value").notNull().default(1),
-	downloadLimitUnit: text("download_limit_unit").$type<BandwidthUnit>().notNull().default("Mbps"),
-	createdAt: int("created_at", { mode: "number" })
-		.notNull()
-		.default(sql`(unixepoch() * 1000)`),
-	updatedAt: int("updated_at", { mode: "number" })
-		.notNull()
-		.default(sql`(unixepoch() * 1000)`),
-	organizationId: text("organization_id")
-		.notNull()
-		.references(() => organization.id, { onDelete: "cascade" }),
-});
+export const repositoriesTable = sqliteTable(
+	"repositories_table",
+	{
+		id: text().primaryKey(),
+		shortId: text("short_id").$type<ShortId>().notNull().unique(),
+		provisioningId: text("provisioning_id"),
+		name: text().notNull(),
+		type: text().$type<RepositoryBackend>().notNull(),
+		config: text("config", { mode: "json" }).$type<RepositoryConfig>().notNull(),
+		compressionMode: text("compression_mode").$type<CompressionMode>().default("auto"),
+		status: text().$type<RepositoryStatus>().default("unknown"),
+		lastChecked: int("last_checked", { mode: "number" }),
+		lastError: text("last_error"),
+		doctorResult: text("doctor_result", { mode: "json" }).$type<DoctorResult>(),
+		stats: text("stats", { mode: "json" }).$type<ResticStatsDto | null>(),
+		statsUpdatedAt: int("stats_updated_at", { mode: "number" }),
+		uploadLimitEnabled: int("upload_limit_enabled", { mode: "boolean" }).notNull().default(false),
+		uploadLimitValue: real("upload_limit_value").notNull().default(1),
+		uploadLimitUnit: text("upload_limit_unit").$type<BandwidthUnit>().notNull().default("Mbps"),
+		downloadLimitEnabled: int("download_limit_enabled", { mode: "boolean" }).notNull().default(false),
+		downloadLimitValue: real("download_limit_value").notNull().default(1),
+		downloadLimitUnit: text("download_limit_unit").$type<BandwidthUnit>().notNull().default("Mbps"),
+		autoCheckEnabled: int("auto_check_enabled", { mode: "boolean" }).notNull().default(true),
+		createdAt: int("created_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		updatedAt: int("updated_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		organizationId: text("organization_id")
+			.notNull()
+			.references(() => organization.id, { onDelete: "cascade" }),
+	},
+	(table) => [
+		uniqueIndex("repositories_table_org_provisioning_id_uidx").on(table.organizationId, table.provisioningId),
+	],
+);
 export type Repository = typeof repositoriesTable.$inferSelect;
 export type RepositoryInsert = typeof repositoriesTable.$inferInsert;
+
+export type RepositoryLockType = "shared" | "exclusive";
+
+export const repositoryLocksTable = sqliteTable(
+	"repository_locks",
+	{
+		id: text("id").primaryKey(),
+		repositoryId: text("repository_id").notNull(),
+		type: text("type").$type<RepositoryLockType>().notNull(),
+		operation: text("operation").notNull(),
+		ownerId: text("owner_id").notNull(),
+		acquiredAt: int("acquired_at", { mode: "number" }).notNull(),
+		expiresAt: int("expires_at", { mode: "number" }).notNull(),
+		heartbeatAt: int("heartbeat_at", { mode: "number" }).notNull(),
+	},
+	(table) => [
+		index("repository_locks_repository_id_idx").on(table.repositoryId),
+		index("repository_locks_expires_at_idx").on(table.expiresAt),
+		index("repository_locks_owner_id_idx").on(table.ownerId),
+	],
+);
+export type RepositoryLock = typeof repositoryLocksTable.$inferSelect;
+
+export const repositoryLockWaitersTable = sqliteTable(
+	"repository_lock_waiters",
+	{
+		id: text("id").primaryKey(),
+		repositoryId: text("repository_id").notNull(),
+		type: text("type").$type<RepositoryLockType>().notNull(),
+		operation: text("operation").notNull(),
+		ownerId: text("owner_id").notNull(),
+		requestedAt: int("requested_at", { mode: "number" }).notNull(),
+		expiresAt: int("expires_at", { mode: "number" }).notNull(),
+		heartbeatAt: int("heartbeat_at", { mode: "number" }).notNull(),
+	},
+	(table) => [
+		index("repository_lock_waiters_repository_id_idx").on(table.repositoryId),
+		index("repository_lock_waiters_expires_at_idx").on(table.expiresAt),
+		index("repository_lock_waiters_owner_id_idx").on(table.ownerId),
+	],
+);
+export type RepositoryLockWaiter = typeof repositoryLockWaitersTable.$inferSelect;
+
+type TaskJson = Record<string, unknown>;
+
+export const tasksTable = sqliteTable(
+	"tasks",
+	{
+		id: text("id").primaryKey(),
+		organizationId: text("organization_id")
+			.notNull()
+			.references(() => organization.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		status: text("status").notNull(),
+		outcome: text("outcome").$type<TaskOutcome>(),
+		resourceType: text("resource_type").notNull(),
+		resourceId: text("resource_id").notNull(),
+		operationKey: text("operation_key"),
+		persistenceFormatVersion: int("persistence_format_version").$type<TaskPersistenceFormatVersion>(),
+		targetDisplayName: text("target_display_name"),
+		targetAgentId: text("target_agent_id"),
+		input: text("input", { mode: "json" }).$type<TaskJson>().notNull(),
+		progress: text("progress", { mode: "json" }).$type<TaskJson | null>(),
+		result: text("result", { mode: "json" }).$type<TaskJson | null>(),
+		error: text("error"),
+		cancellationRequested: int("cancellation_requested", { mode: "boolean" }).notNull().default(false),
+		createdAt: int("created_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		startedAt: int("started_at", { mode: "number" }),
+		updatedAt: int("updated_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		finishedAt: int("finished_at", { mode: "number" }),
+	},
+	(table) => [
+		index("tasks_org_kind_resource_status_idx").on(
+			table.organizationId,
+			table.kind,
+			table.resourceType,
+			table.resourceId,
+			table.status,
+		),
+		index("tasks_resource_operation_finished_idx").on(
+			table.organizationId,
+			table.kind,
+			table.resourceType,
+			table.resourceId,
+			table.operationKey,
+			table.finishedAt,
+		),
+		index("tasks_org_status_updated_at_idx").on(table.organizationId, table.status, table.updatedAt),
+		index("tasks_org_format_created_at_id_idx").on(
+			table.organizationId,
+			table.persistenceFormatVersion,
+			table.createdAt,
+			table.id,
+		),
+	],
+);
+export type Task = typeof tasksTable.$inferSelect;
+export type TaskInsert = typeof tasksTable.$inferInsert;
 
 /**
  * Backup Schedules Table
  */
-export const backupSchedulesTable = sqliteTable("backup_schedules_table", {
-	id: int().primaryKey({ autoIncrement: true }),
-	shortId: text("short_id").notNull().unique(),
-	name: text().notNull(),
-	volumeId: int("volume_id")
-		.notNull()
-		.references(() => volumesTable.id, { onDelete: "cascade" }),
-	repositoryId: text("repository_id")
-		.notNull()
-		.references(() => repositoriesTable.id, { onDelete: "cascade" }),
-	enabled: int("enabled", { mode: "boolean" }).notNull().default(true),
-	cronExpression: text("cron_expression").notNull(),
-	retentionPolicy: text("retention_policy", { mode: "json" }).$type<{
-		keepLast?: number;
-		keepHourly?: number;
-		keepDaily?: number;
-		keepWeekly?: number;
-		keepMonthly?: number;
-		keepYearly?: number;
-		keepWithinDuration?: string;
-	}>(),
-	excludePatterns: text("exclude_patterns", { mode: "json" }).$type<string[]>().default([]),
-	excludeIfPresent: text("exclude_if_present", { mode: "json" }).$type<string[]>().default([]),
-	includePatterns: text("include_patterns", { mode: "json" }).$type<string[]>().default([]),
-	lastBackupAt: int("last_backup_at", { mode: "number" }),
-	lastBackupStatus: text("last_backup_status").$type<"success" | "error" | "in_progress" | "warning" | null>(),
-	lastBackupError: text("last_backup_error"),
-	nextBackupAt: int("next_backup_at", { mode: "number" }),
-	oneFileSystem: int("one_file_system", { mode: "boolean" }).notNull().default(false),
-	sortOrder: int("sort_order", { mode: "number" }).notNull().default(0),
-	createdAt: int("created_at", { mode: "number" })
-		.notNull()
-		.default(sql`(unixepoch() * 1000)`),
-	updatedAt: int("updated_at", { mode: "number" })
-		.notNull()
-		.default(sql`(unixepoch() * 1000)`),
-	organizationId: text("organization_id")
-		.notNull()
-		.references(() => organization.id, { onDelete: "cascade" }),
-});
+export const backupSchedulesTable = sqliteTable(
+	"backup_schedules_table",
+	{
+		id: int().primaryKey({ autoIncrement: true }),
+		shortId: text("short_id").$type<ShortId>().notNull(),
+		name: text().notNull(),
+		volumeId: int("volume_id")
+			.notNull()
+			.references(() => volumesTable.id, { onDelete: "cascade" }),
+		repositoryId: text("repository_id")
+			.notNull()
+			.references(() => repositoriesTable.id, { onDelete: "cascade" }),
+		enabled: int("enabled", { mode: "boolean" }).notNull().default(true),
+		cronExpression: text("cron_expression").notNull(),
+		retentionPolicy: text("retention_policy", { mode: "json" }).$type<{
+			keepLast?: number;
+			keepHourly?: number;
+			keepDaily?: number;
+			keepWeekly?: number;
+			keepMonthly?: number;
+			keepYearly?: number;
+			keepWithinDuration?: string;
+		}>(),
+		excludePatterns: text("exclude_patterns", { mode: "json" }).$type<string[]>().default([]),
+		excludeIfPresent: text("exclude_if_present", { mode: "json" }).$type<string[]>().default([]),
+		includePaths: text("include_paths", { mode: "json" }).$type<string[]>().default([]),
+		includePatterns: text("include_patterns", { mode: "json" }).$type<string[]>().default([]),
+		lastBackupAt: int("last_backup_at", { mode: "number" }),
+		lastBackupStatus: text("last_backup_status").$type<"success" | "error" | "in_progress" | "warning" | null>(),
+		lastBackupError: text("last_backup_error"),
+		nextBackupAt: int("next_backup_at", { mode: "number" }),
+		oneFileSystem: int("one_file_system", { mode: "boolean" }).notNull().default(false),
+		customResticParams: text("custom_restic_params", { mode: "json" }).$type<string[]>().default([]),
+		compressionMode: text("compression_mode").$type<CompressionMode | null>(),
+		backupWebhooks: text("backup_webhooks", { mode: "json" }).$type<BackupWebhooks | null>(),
+		sortOrder: int("sort_order", { mode: "number" }).notNull().default(0),
+		failureRetryCount: int("failure_retry_count").notNull().default(0),
+		maxRetries: int("max_retries").notNull().default(2),
+		retryDelay: int("retry_delay").notNull().default(900000),
+		createdAt: int("created_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		updatedAt: int("updated_at", { mode: "number" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		organizationId: text("organization_id")
+			.notNull()
+			.references(() => organization.id, { onDelete: "cascade" }),
+	},
+	(table) => [unique().on(table.shortId, table.organizationId)],
+);
 export type BackupScheduleInsert = typeof backupSchedulesTable.$inferInsert;
 
 export type BackupSchedule = typeof backupSchedulesTable.$inferSelect;
@@ -292,8 +483,11 @@ export const notificationDestinationsTable = sqliteTable("notification_destinati
 	id: int().primaryKey({ autoIncrement: true }),
 	name: text().notNull(),
 	enabled: int("enabled", { mode: "boolean" }).notNull().default(true),
+	status: text().$type<"healthy" | "error" | "unknown">().notNull().default("unknown"),
+	lastChecked: int("last_checked", { mode: "number" }),
+	lastError: text("last_error"),
 	type: text().$type<NotificationType>().notNull(),
-	config: text("config", { mode: "json" }).$type<typeof notificationConfigSchema.inferOut>().notNull(),
+	config: text("config", { mode: "json" }).$type<NotificationConfig>().notNull(),
 	createdAt: int("created_at", { mode: "number" })
 		.notNull()
 		.default(sql`(unixepoch() * 1000)`),
@@ -346,7 +540,7 @@ export const backupScheduleMirrorsTable = sqliteTable(
 			.references(() => repositoriesTable.id, { onDelete: "cascade" }),
 		enabled: int("enabled", { mode: "boolean" }).notNull().default(true),
 		lastCopyAt: int("last_copy_at", { mode: "number" }),
-		lastCopyStatus: text("last_copy_status").$type<"success" | "error">(),
+		lastCopyStatus: text("last_copy_status").$type<"success" | "error" | "in_progress">(),
 		lastCopyError: text("last_copy_error"),
 		createdAt: int("created_at", { mode: "number" })
 			.notNull()
@@ -382,6 +576,77 @@ export const twoFactor = sqliteTable(
 		userId: text("user_id")
 			.notNull()
 			.references(() => usersTable.id, { onDelete: "cascade" }),
+		verified: integer("verified", { mode: "boolean" }).notNull().default(true),
+		failedVerificationCount: integer("failed_verification_count").default(0),
+		lockedUntil: integer("locked_until", { mode: "timestamp_ms" }),
 	},
 	(table) => [index("twoFactor_secret_idx").on(table.secret), index("twoFactor_userId_idx").on(table.userId)],
 );
+
+export const passkey = sqliteTable(
+	"passkey",
+	{
+		id: text("id").primaryKey(),
+		name: text("name"),
+		publicKey: text("public_key").notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => usersTable.id, { onDelete: "cascade" }),
+		credentialID: text("credential_id").notNull(),
+		counter: integer("counter").notNull(),
+		deviceType: text("device_type").notNull(),
+		backedUp: integer("backed_up", { mode: "boolean" }).notNull(),
+		transports: text("transports"),
+		createdAt: int("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		aaguid: text("aaguid"),
+	},
+	(table) => [index("passkey_userId_idx").on(table.userId), index("passkey_credentialID_idx").on(table.credentialID)],
+);
+export type Passkey = typeof passkey.$inferSelect;
+
+export type ApiKeyMetadata = {
+	organizationId: string;
+};
+
+export const apikey = sqliteTable(
+	"apikey",
+	{
+		id: text("id").primaryKey(),
+		configId: text("config_id").notNull().default("default"),
+		name: text("name"),
+		start: text("start"),
+		referenceId: text("reference_id")
+			.notNull()
+			.references(() => usersTable.id, { onDelete: "cascade" }),
+		prefix: text("prefix"),
+		key: text("key").notNull(),
+		refillInterval: integer("refill_interval"),
+		refillAmount: integer("refill_amount"),
+		lastRefillAt: integer("last_refill_at", { mode: "timestamp_ms" }),
+		enabled: integer("enabled", { mode: "boolean" }).default(true),
+		rateLimitEnabled: integer("rate_limit_enabled", { mode: "boolean" }).default(false),
+		rateLimitTimeWindow: integer("rate_limit_time_window"),
+		rateLimitMax: integer("rate_limit_max"),
+		requestCount: integer("request_count").default(0),
+		remaining: integer("remaining"),
+		lastRequest: integer("last_request", { mode: "timestamp_ms" }),
+		expiresAt: integer("expires_at", { mode: "timestamp_ms" }),
+		createdAt: integer("created_at", { mode: "timestamp_ms" })
+			.notNull()
+			.default(sql`(unixepoch() * 1000)`),
+		updatedAt: integer("updated_at", { mode: "timestamp_ms" })
+			.notNull()
+			.$onUpdate(() => new Date())
+			.default(sql`(unixepoch() * 1000)`),
+		permissions: text("permissions"),
+		metadata: text("metadata"),
+	},
+	(table) => [
+		index("apikey_configId_idx").on(table.configId),
+		index("apikey_referenceId_idx").on(table.referenceId),
+		uniqueIndex("apikey_key_unique").on(table.key),
+	],
+);
+export type ApiKey = typeof apikey.$inferSelect;

@@ -1,30 +1,25 @@
-import { useMutation, useQuery } from "@tanstack/react-query";
-import { Copy, Plus, Trash2 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMutation, useQuery, useSuspenseQuery } from "@tanstack/react-query";
+import { Copy, Plus } from "lucide-react";
+import { useMemo, useState } from "react";
 import { toast } from "sonner";
-import { Button } from "~/client/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
-import { Switch } from "~/client/components/ui/switch";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "~/client/components/ui/table";
-import { Badge } from "~/client/components/ui/badge";
-import { Tooltip, TooltipContent, TooltipTrigger } from "~/client/components/ui/tooltip";
+import type { GetScheduleMirrorsResponse } from "~/client/api-client";
 import {
-	getScheduleMirrorsOptions,
 	getMirrorCompatibilityOptions,
+	getScheduleMirrorsOptions,
 	updateScheduleMirrorsMutation,
 } from "~/client/api-client/@tanstack/react-query.gen";
+import { RepositoryIcon } from "~/client/components/repository-icon";
+import { Button } from "~/client/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "~/client/components/ui/select";
+import { Tooltip, TooltipContent, TooltipTrigger } from "~/client/components/ui/tooltip";
 import { parseError } from "~/client/lib/errors";
 import type { Repository } from "~/client/lib/types";
-import { RepositoryIcon } from "~/client/components/repository-icon";
-import { StatusDot } from "~/client/components/status-dot";
-import { formatDistanceToNow } from "date-fns";
-import { Link } from "react-router";
 import { cn } from "~/client/lib/utils";
-import type { GetScheduleMirrorsResponse } from "~/client/api-client";
+import { MirrorRepositoriesTable } from "./mirror-repositories-table";
 
 type Props = {
-	scheduleId: number;
+	scheduleShortId: string;
 	primaryRepositoryId: string;
 	repositories: Repository[];
 	initialData: GetScheduleMirrorsResponse;
@@ -33,30 +28,40 @@ type Props = {
 type MirrorAssignment = {
 	repositoryId: string;
 	enabled: boolean;
-	lastCopyAt: number | null;
-	lastCopyStatus: "success" | "error" | null;
-	lastCopyError: string | null;
 };
 
-export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, repositories, initialData }: Props) => {
-	const [assignments, setAssignments] = useState<Map<string, MirrorAssignment>>(new Map());
-	const [hasChanges, setHasChanges] = useState(false);
+const buildAssignments = (mirrors: GetScheduleMirrorsResponse) =>
+	new Map<string, MirrorAssignment>(
+		mirrors.map((mirror) => [
+			mirror.repositoryId,
+			{
+				repositoryId: mirror.repositoryId,
+				enabled: mirror.enabled,
+			},
+		]),
+	);
+
+export const ScheduleMirrorsConfig = ({ scheduleShortId, primaryRepositoryId, repositories, initialData }: Props) => {
+	const [draftAssignments, setAssignments] = useState<Map<string, MirrorAssignment> | null>(null);
+	const hasChanges = draftAssignments !== null;
 	const [isAddingNew, setIsAddingNew] = useState(false);
 
-	const { data: currentMirrors } = useQuery({
-		...getScheduleMirrorsOptions({ path: { scheduleId: scheduleId.toString() } }),
+	const { data: currentMirrors } = useSuspenseQuery({
+		...getScheduleMirrorsOptions({ path: { shortId: scheduleShortId } }),
 		initialData,
 	});
 
+	const assignments = draftAssignments ?? buildAssignments(currentMirrors);
+
 	const { data: compatibility } = useQuery({
-		...getMirrorCompatibilityOptions({ path: { scheduleId: scheduleId.toString() } }),
+		...getMirrorCompatibilityOptions({ path: { shortId: scheduleShortId } }),
 	});
 
 	const updateMirrors = useMutation({
 		...updateScheduleMirrorsMutation(),
 		onSuccess: () => {
 			toast.success("Mirror settings saved successfully");
-			setHasChanges(false);
+			setAssignments(null);
 		},
 		onError: (error) => {
 			toast.error("Failed to save mirror settings", {
@@ -75,35 +80,14 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 		return map;
 	}, [compatibility]);
 
-	useEffect(() => {
-		if (currentMirrors && !hasChanges) {
-			const map = new Map<string, MirrorAssignment>();
-			for (const mirror of currentMirrors) {
-				map.set(mirror.repositoryId, {
-					repositoryId: mirror.repositoryId,
-					enabled: mirror.enabled,
-					lastCopyAt: mirror.lastCopyAt,
-					lastCopyStatus: mirror.lastCopyStatus,
-					lastCopyError: mirror.lastCopyError,
-				});
-			}
-
-			setAssignments(map);
-		}
-	}, [currentMirrors, hasChanges]);
-
 	const addRepository = (repositoryId: string) => {
 		const newAssignments = new Map(assignments);
 		newAssignments.set(repositoryId, {
 			repositoryId,
 			enabled: true,
-			lastCopyAt: null,
-			lastCopyStatus: null,
-			lastCopyError: null,
 		});
 
 		setAssignments(newAssignments);
-		setHasChanges(true);
 		setIsAddingNew(false);
 	};
 
@@ -111,7 +95,6 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 		const newAssignments = new Map(assignments);
 		newAssignments.delete(repositoryId);
 		setAssignments(newAssignments);
-		setHasChanges(true);
 	};
 
 	const toggleEnabled = (repositoryId: string) => {
@@ -125,70 +108,33 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 		});
 
 		setAssignments(newAssignments);
-		setHasChanges(true);
 	};
 
 	const handleSave = () => {
-		const mirrorsList = Array.from(assignments.values()).map((a) => ({
-			repositoryId: a.repositoryId,
-			enabled: a.enabled,
+		const mirrors = Array.from(assignments.values()).map((assignment) => ({
+			repositoryId: assignment.repositoryId,
+			enabled: assignment.enabled,
 		}));
 		updateMirrors.mutate({
-			path: { scheduleId: scheduleId.toString() },
-			body: {
-				mirrors: mirrorsList,
-			},
+			path: { shortId: scheduleShortId },
+			body: { mirrors },
 		});
 	};
 
 	const handleReset = () => {
-		if (currentMirrors) {
-			const map = new Map<string, MirrorAssignment>();
-			for (const mirror of currentMirrors) {
-				map.set(mirror.repositoryId, {
-					repositoryId: mirror.repositoryId,
-					enabled: mirror.enabled,
-					lastCopyAt: mirror.lastCopyAt,
-					lastCopyStatus: mirror.lastCopyStatus,
-					lastCopyError: mirror.lastCopyError,
-				});
-			}
-			setAssignments(map);
-			setHasChanges(false);
-		}
+		setAssignments(null);
 	};
 
-	const selectableRepositories =
-		repositories?.filter((r) => {
-			if (r.id === primaryRepositoryId) return false;
-			if (assignments.has(r.id)) return false;
-			return true;
-		}) || [];
-
-	const hasAvailableRepositories = selectableRepositories.some((r) => {
-		const compat = compatibilityMap.get(r.id);
-		return compat?.compatible !== false;
+	const selectableRepositories = repositories.filter((repository) => {
+		if (repository.shortId === primaryRepositoryId) return false;
+		if (assignments.has(repository.shortId)) return false;
+		return true;
 	});
-
-	const assignedRepositories = Array.from(assignments.keys())
-		.map((id) => repositories?.find((r) => r.id === id))
-		.filter((r) => r !== undefined);
-
-	const getStatusVariant = (status: "success" | "error" | null) => {
-		if (status === "success") return "success";
-		if (status === "error") return "error";
-		return "neutral";
-	};
-
-	const getStatusLabel = (assignment: MirrorAssignment) => {
-		if (assignment.lastCopyStatus === "error" && assignment.lastCopyError) {
-			return assignment.lastCopyError;
-		}
-		if (assignment.lastCopyStatus === "success") {
-			return "Last copy successful";
-		}
-		return "Never copied";
-	};
+	const hasAvailableRepositories = selectableRepositories.some((repository) => {
+		const repositoryCompatibility = compatibilityMap.get(repository.shortId);
+		return repositoryCompatibility?.compatible !== false;
+	});
+	const showAddMirrorButton = !isAddingNew && selectableRepositories.length > 0;
 
 	return (
 		<Card>
@@ -200,10 +146,11 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 							Mirror Repositories
 						</CardTitle>
 						<CardDescription className="hidden @md:block mt-1">
-							Configure secondary repositories where snapshots will be automatically copied after each backup
+							Configure secondary repositories where snapshots will be automatically copied after each
+							backup
 						</CardDescription>
 					</div>
-					{!isAddingNew && selectableRepositories.length > 0 && (
+					{showAddMirrorButton && (
 						<Button variant="outline" size="sm" onClick={() => setIsAddingNew(true)}>
 							<Plus className="h-4 w-4 mr-2" />
 							Add mirror
@@ -220,25 +167,43 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 							</SelectTrigger>
 							<SelectContent>
 								{selectableRepositories.map((repository) => {
-									const compat = compatibilityMap.get(repository.id);
+									const repositoryCompatibility = compatibilityMap.get(repository.shortId);
+									const repositoryCompatible = repositoryCompatibility?.compatible ?? false;
+									const compatibilityReason =
+										repositoryCompatibility?.reason ??
+										"This repository is not compatible for mirroring.";
 
 									return (
-										<Tooltip key={repository.id}>
+										<Tooltip key={repository.shortId}>
 											<TooltipTrigger asChild>
 												<div>
-													<SelectItem value={repository.id} disabled={!compat?.compatible}>
+													<SelectItem
+														value={repository.shortId}
+														disabled={!repositoryCompatible}
+													>
 														<div className="flex items-center gap-2">
-															<RepositoryIcon backend={repository.type} className="h-4 w-4" />
+															<RepositoryIcon
+																backend={repository.type}
+																className="h-4 w-4"
+															/>
 															<span>{repository.name}</span>
-															<span className="text-xs uppercase text-muted-foreground">({repository.type})</span>
+															<span className="text-xs uppercase text-muted-foreground">
+																({repository.type})
+															</span>
 														</div>
 													</SelectItem>
 												</div>
 											</TooltipTrigger>
-											<TooltipContent side="right" className={cn("max-w-xs", { hidden: compat?.compatible })}>
-												<p>{compat?.reason || "This repository is not compatible for mirroring."}</p>
+											<TooltipContent
+												side="right"
+												className={cn("max-w-xs", {
+													hidden: repositoryCompatible,
+												})}
+											>
+												<p>{compatibilityReason}</p>
 												<p className="mt-1 text-xs text-muted-foreground">
-													Consider creating a new backup scheduler with the desired destination instead.
+													Consider creating a new backup scheduler with the desired
+													destination instead.
 												</p>
 											</TooltipContent>
 										</Tooltip>
@@ -249,7 +214,8 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 										All available repositories have conflicting backends.
 										<br />
 										<span className="text-xs">
-											Consider creating a new backup scheduler with the desired destination instead.
+											Consider creating a new backup scheduler with the desired destination
+											instead.
 										</span>
 									</div>
 								)}
@@ -261,83 +227,15 @@ export const ScheduleMirrorsConfig = ({ scheduleId, primaryRepositoryId, reposit
 					</div>
 				)}
 
-				{assignedRepositories.length === 0 ? (
-					<div className="flex flex-col items-center justify-center py-8 text-center text-muted-foreground">
-						<Copy className="h-8 w-8 mb-2 opacity-20" />
-						<p className="text-sm">No mirror repositories configured for this schedule.</p>
-						<p className="text-xs mt-1">Click "Add mirror" to replicate backups to additional repositories.</p>
-					</div>
-				) : (
-					<div className="rounded-md border">
-						<Table>
-							<TableHeader>
-								<TableRow>
-									<TableHead>Repository</TableHead>
-									<TableHead className="text-center w-25">Enabled</TableHead>
-									<TableHead className="w-45">Last Copy</TableHead>
-									<TableHead className="w-12.5"></TableHead>
-								</TableRow>
-							</TableHeader>
-							<TableBody>
-								{assignedRepositories.map((repository) => {
-									const assignment = assignments.get(repository.id);
-									if (!assignment) return null;
-
-									return (
-										<TableRow key={repository.id}>
-											<TableCell>
-												<div className="flex items-center gap-2">
-													<Link
-														to={`/repositories/${repository.shortId}`}
-														className="hover:underline flex items-center gap-2"
-													>
-														<RepositoryIcon backend={repository.type} className="h-4 w-4" />
-														<span className="font-medium">{repository.name}</span>
-													</Link>
-													<Badge variant="outline" className="text-[10px] align-middle">
-														{repository.type}
-													</Badge>
-												</div>
-											</TableCell>
-											<TableCell className="text-center">
-												<Switch
-													className="align-middle"
-													checked={assignment.enabled}
-													onCheckedChange={() => toggleEnabled(repository.id)}
-												/>
-											</TableCell>
-											<TableCell>
-												{assignment.lastCopyAt ? (
-													<div className="flex items-center gap-2">
-														<StatusDot
-															variant={getStatusVariant(assignment.lastCopyStatus)}
-															label={getStatusLabel(assignment)}
-														/>
-														<span className="text-sm text-muted-foreground">
-															{formatDistanceToNow(new Date(assignment.lastCopyAt), { addSuffix: true })}
-														</span>
-													</div>
-												) : (
-													<span className="text-sm text-muted-foreground">Never</span>
-												)}
-											</TableCell>
-											<TableCell>
-												<Button
-													variant="ghost"
-													size="icon"
-													onClick={() => removeRepository(repository.id)}
-													className="h-8 w-8 text-muted-foreground hover:text-destructive align-baseline"
-												>
-													<Trash2 className="h-4 w-4" />
-												</Button>
-											</TableCell>
-										</TableRow>
-									);
-								})}
-							</TableBody>
-						</Table>
-					</div>
-				)}
+				<MirrorRepositoriesTable
+					scheduleShortId={scheduleShortId}
+					repositories={repositories}
+					currentMirrors={currentMirrors}
+					assignments={assignments}
+					hasChanges={hasChanges}
+					onToggleEnabled={toggleEnabled}
+					onRemove={removeRepository}
+				/>
 
 				{hasChanges && (
 					<div className="flex gap-2 justify-end mt-4 pt-4">

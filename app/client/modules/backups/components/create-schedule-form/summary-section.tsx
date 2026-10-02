@@ -1,19 +1,32 @@
+import type { DeepPartial } from "react-hook-form";
 import { useQuery } from "@tanstack/react-query";
 import { listRepositoriesOptions } from "~/client/api-client/@tanstack/react-query.gen";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "~/client/components/ui/card";
+import { cn } from "~/client/lib/utils";
 import type { Volume } from "~/client/lib/types";
 import type { InternalFormValues } from "./types";
 
 type SummarySectionProps = {
 	volume: Volume;
-	frequency: string;
-	formValues: InternalFormValues;
+	frequency: string | undefined;
+	formValues: DeepPartial<InternalFormValues>;
 };
 
 export const SummarySection = ({ volume, frequency, formValues }: SummarySectionProps) => {
 	const { data: repositoriesData } = useQuery({
 		...listRepositoriesOptions(),
 	});
+	const retentionSummary = [
+		["last", formValues.keepLast],
+		["hourly", formValues.keepHourly],
+		["daily", formValues.keepDaily],
+		["weekly", formValues.keepWeekly],
+		["monthly", formValues.keepMonthly],
+		["yearly", formValues.keepYearly],
+	]
+		.filter(([, value]) => Boolean(value))
+		.map(([label, value]) => `${value} ${label}`)
+		.join(", ");
 
 	return (
 		<Card>
@@ -30,28 +43,38 @@ export const SummarySection = ({ volume, frequency, formValues }: SummarySection
 				</div>
 				<div>
 					<p className="text-xs uppercase text-muted-foreground">Schedule</p>
-					<p className="font-medium">{frequency ? frequency.charAt(0).toUpperCase() + frequency.slice(1) : "-"}</p>
+					<p className="font-medium">
+						<span className={cn({ hidden: frequency !== "manual" })}>Manual only</span>
+						<span className={cn({ hidden: !frequency || frequency === "manual" })}>
+							{frequency ? frequency.charAt(0).toUpperCase() + frequency.slice(1) : null}
+						</span>
+						<span className={cn({ hidden: Boolean(frequency) })}>-</span>
+					</p>
 				</div>
 				<div>
 					<p className="text-xs uppercase text-muted-foreground">Repository</p>
-					<p className="font-medium">{repositoriesData?.find((r) => r.id === formValues.repositoryId)?.name || "—"}</p>
+					<p className="font-medium">
+						{repositoriesData?.find((r) => r.shortId === formValues.repositoryId)?.name || "—"}
+					</p>
 				</div>
-				{(formValues.includePatterns && formValues.includePatterns.length > 0) || formValues.includePatternsText ? (
+				{(formValues.includePaths && formValues.includePaths.length > 0) || formValues.includePatterns ? (
 					<div>
 						<p className="text-xs uppercase text-muted-foreground">Include paths/patterns</p>
 						<div className="flex flex-col gap-1">
-							{formValues.includePatterns?.slice(0, 20).map((path) => (
+							{formValues.includePaths?.slice(0, 20).map((path) => (
 								<span key={path} className="text-xs font-mono bg-accent px-1.5 py-0.5 rounded">
 									{path}
 								</span>
 							))}
-							{formValues.includePatterns && formValues.includePatterns.length > 20 && (
-								<span className="text-xs text-muted-foreground">+ {formValues.includePatterns.length - 20} more</span>
+							{formValues.includePaths && formValues.includePaths.length > 20 && (
+								<span className="text-xs text-muted-foreground">
+									+ {formValues.includePaths.length - 20} more
+								</span>
 							)}
-							{formValues.includePatternsText
+							{formValues.includePatterns
 								?.split("\n")
 								.filter(Boolean)
-								.slice(0, 20 - (formValues.includePatterns?.length || 0))
+								.slice(0, 20 - (formValues.includePaths?.length || 0))
 								.map((pattern) => (
 									<span key={pattern} className="text-xs font-mono bg-accent px-1.5 py-0.5 rounded">
 										{pattern.trim()}
@@ -95,16 +118,12 @@ export const SummarySection = ({ volume, frequency, formValues }: SummarySection
 					<p className="font-medium">{formValues.oneFileSystem ? "Enabled" : "Disabled"}</p>
 				</div>
 				<div>
+					<p className="text-xs uppercase text-muted-foreground">Compression</p>
+					<p className="font-medium">{formValues.compressionMode ?? "Inherit (repository default)"}</p>
+				</div>
+				<div>
 					<p className="text-xs uppercase text-muted-foreground">Retention</p>
-					<p className="font-medium">
-						{Object.entries(formValues)
-							.filter(([key, value]) => key.startsWith("keep") && Boolean(value))
-							.map(([key, value]) => {
-								const label = key.replace("keep", "").toLowerCase();
-								return `${value.toString()} ${label}`;
-							})
-							.join(", ") || "-"}
-					</p>
+					<p className="font-medium">{retentionSummary || "-"}</p>
 				</div>
 			</CardContent>
 		</Card>

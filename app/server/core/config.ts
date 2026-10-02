@@ -1,62 +1,74 @@
 import { readFileSync } from "node:fs";
-import os from "node:os";
-import { type } from "arktype";
+import { prettifyError, z } from "zod";
 import "dotenv/config";
+import { resolveResticHostname } from "../../../apps/agent/src/restic/hostname";
+import { buildAllowedHosts } from "../lib/auth/base-url";
+import { toMessage } from "@zerobyte/core/utils";
 
-const getResticHostname = () => {
-	try {
-		const mountinfo = readFileSync("/proc/self/mountinfo", "utf-8");
-		const hostnameLine = mountinfo.split("\n").find((line) => line.includes(" /etc/hostname "));
-		const hostname = os.hostname();
+const unquote = (str: string) => str.trim().replace(/^(['"])(.*)\1$/, "$2");
 
-		if (hostnameLine) {
-			const containerIdMatch = hostnameLine.match(/[0-9a-f]{64}/);
-			const containerId = containerIdMatch ? containerIdMatch[0] : null;
+const envSchema = z
+	.object({
+		NODE_ENV: z.enum(["development", "production", "test"]).default("production"),
+		SERVER_IP: z.string().default("localhost"),
+		SERVER_IDLE_TIMEOUT: z.coerce
+			.number()
+			.int()
+			.transform((timeout) => Math.min(255, Math.max(1, timeout)))
+			.default(60),
+		WEBHOOK_TIMEOUT: z.coerce.number().int().default(60),
+		RESTIC_HOSTNAME: z.string().optional(),
+		PORT: z.coerce.number().int().default(4096),
+		MIGRATIONS_PATH: z.string().optional(),
+		APP_VERSION: z.string().default("dev"),
+		TRUSTED_ORIGINS: z.string().optional(),
+		PORTLESS_URL: z.string().optional(),
+		PORTLESS_TAILSCALE_URL: z.string().optional(),
+		TRUST_PROXY: z.string().default("false"),
+		DISABLE_RATE_LIMITING: z.string().default("false"),
+		APP_SECRET: z.preprocess((value) => (value === "" ? undefined : value), z.string().min(32).max(256).optional()),
+		APP_SECRET_FILE: z.string().optional(),
+		BASE_URL: z.string(),
+		ENABLE_DEV_PANEL: z.string().default("false"),
+		ENABLE_LOCAL_AGENT: z.string().default("false"),
+		WEBHOOK_ALLOWED_ORIGINS: z.string().optional(),
+		PROVISIONING_PATH: z.string().optional(),
+		RESTIC_COMMAND: z.string().default("restic"),
+		ZEROBYTE_RUNTIME: z.enum(["server", "desktop"]).default("server"),
+		ZEROBYTE_DESKTOP_RESOURCES_DIR: z.string().optional(),
+		ZEROBYTE_DESKTOP_LAUNCH_SECRET: z.preprocess(
+			(value) => (value === "" ? undefined : value),
+			z
+				.string()
+				.min(32, "ZEROBYTE_DESKTOP_LAUNCH_SECRET must be between 32 and 256 characters long.")
+				.max(256, "ZEROBYTE_DESKTOP_LAUNCH_SECRET must be between 32 and 256 characters long.")
+				.optional(),
+		),
+	})
+	.transform((s, ctx) => {
+		let baseUrl = unquote(s.BASE_URL);
+		const trustedOrigins = s.TRUSTED_ORIGINS?.split(",").map(unquote).filter(Boolean) ?? [];
 
-			if (containerId?.startsWith(hostname)) {
-				return "zerobyte";
+		if (s.NODE_ENV === "development") {
+			if (s.PORTLESS_URL) {
+				trustedOrigins.push(unquote(s.PORTLESS_URL));
 			}
 
-			return hostname || "zerobyte";
+			if (s.PORTLESS_TAILSCALE_URL) {
+				baseUrl = unquote(s.PORTLESS_TAILSCALE_URL);
+				trustedOrigins.push(baseUrl);
+			}
 		}
-	} catch {}
 
-	return "zerobyte";
-};
+		trustedOrigins.push(baseUrl);
+		const uniqueTrustedOrigins = Array.from(new Set(trustedOrigins));
+		const webhookAllowedOrigins = s.WEBHOOK_ALLOWED_ORIGINS?.split(",").map(unquote).filter(Boolean) ?? [];
+		const authOrigins = [baseUrl, ...uniqueTrustedOrigins];
+		const { allowedHosts, invalidOrigins } = buildAllowedHosts(authOrigins);
+		let appSecret = s.APP_SECRET;
+		const resticCommand = unquote(s.RESTIC_COMMAND);
 
-const envSchema = type({
-	NODE_ENV: type.enumerated("development", "production", "test").default("production"),
-	SERVER_IP: 'string = "localhost"',
-	SERVER_IDLE_TIMEOUT: 'string.integer.parse = "60"',
-	RESTIC_HOSTNAME: "string?",
-	PORT: 'string.integer.parse = "4096"',
-	MIGRATIONS_PATH: "string?",
-	APP_VERSION: "string = 'dev'",
-	TRUSTED_ORIGINS: "string?",
-	DISABLE_RATE_LIMITING: 'string = "false"',
-	APP_SECRET: "32 <= string <= 256",
-	BASE_URL: "string",
-}).pipe((s) => ({
-	__prod__: s.NODE_ENV === "production",
-	environment: s.NODE_ENV,
-	serverIp: s.SERVER_IP,
-	serverIdleTimeout: s.SERVER_IDLE_TIMEOUT,
-	resticHostname: s.RESTIC_HOSTNAME || getResticHostname(),
-	port: s.PORT,
-	migrationsPath: s.MIGRATIONS_PATH,
-	appVersion: s.APP_VERSION,
-	trustedOrigins: s.TRUSTED_ORIGINS?.split(",").map((origin) => origin.trim()),
-	disableRateLimiting: s.DISABLE_RATE_LIMITING === "true",
-	appSecret: s.APP_SECRET,
-	baseUrl: s.BASE_URL,
-	isSecure: s.BASE_URL?.startsWith("https://") ?? false,
-}));
-
-const parseConfig = (env: unknown) => {
-	const result = envSchema(env);
-
-	if (result instanceof type.errors) {
-		if (!process.env.APP_SECRET) {
+		if (!appSecret && !s.APP_SECRET_FILE) {
 			const errorMessage = [
 				"",
 				"================================================================================",
@@ -72,16 +84,100 @@ const parseConfig = (env: unknown) => {
 				"IMPORTANT: Store this secret securely and back it up. If lost, encrypted data",
 				"in the database will be unrecoverable.",
 				"================================================================================",
-				"",
 			].join("\n");
 
-			console.error(errorMessage);
+			ctx.addIssue({
+				code: "custom",
+				message: errorMessage,
+			});
 		}
-		console.error(`Environment variable validation failed: ${result.summary}`);
-		throw new Error("Invalid environment variables");
+
+		if (s.APP_SECRET && s.APP_SECRET_FILE) {
+			ctx.addIssue({
+				code: "custom",
+				message: "Both APP_SECRET and APP_SECRET_FILE are set. Please set only one of these.",
+			});
+		}
+
+		if (s.APP_SECRET_FILE) {
+			try {
+				appSecret = readFileSync(s.APP_SECRET_FILE, "utf-8").trim();
+				if (appSecret.length < 32 || appSecret.length > 256) {
+					ctx.addIssue({
+						code: "custom",
+						message: "The secret read from APP_SECRET_FILE must be between 32 and 256 characters long.",
+					});
+				}
+			} catch (err) {
+				ctx.addIssue({
+					code: "custom",
+					message: `Failed to read APP_SECRET from file: ${toMessage(err)}`,
+				});
+			}
+		}
+
+		for (const origin of invalidOrigins) {
+			console.warn(
+				`Ignoring invalid origin in configuration: ${origin}. Make sure it is a valid URL with a protocol (e.g. https://example.com)`,
+			);
+		}
+
+		if (allowedHosts.length === 0) {
+			ctx.addIssue({
+				code: "custom",
+				message:
+					"No valid trusted origins provided. Please check the BASE_URL and TRUSTED_ORIGINS environment variables.",
+			});
+		}
+
+		return {
+			__prod__: s.NODE_ENV === "production",
+			environment: s.NODE_ENV,
+			serverIp: s.SERVER_IP,
+			serverIdleTimeout: s.SERVER_IDLE_TIMEOUT,
+			webhookTimeout: s.WEBHOOK_TIMEOUT,
+			resticHostname: s.RESTIC_HOSTNAME || resolveResticHostname(),
+			port: s.PORT,
+			migrationsPath: s.MIGRATIONS_PATH,
+			appVersion: s.APP_VERSION,
+			trustedOrigins: uniqueTrustedOrigins,
+			trustProxy: s.TRUST_PROXY === "true",
+			appSecret: appSecret ?? "",
+			baseUrl,
+			isSecure: baseUrl.startsWith("https://"),
+			flags: {
+				disableRateLimiting: s.DISABLE_RATE_LIMITING === "true" || s.NODE_ENV === "test",
+				enableDevPanel: s.ENABLE_DEV_PANEL === "true",
+				enableLocalAgent: s.ENABLE_LOCAL_AGENT === "true",
+			},
+			provisioningPath: s.PROVISIONING_PATH,
+			allowedHosts,
+			webhookAllowedOrigins,
+			runtime: s.ZEROBYTE_RUNTIME,
+			desktop: {
+				resourcesDir: s.ZEROBYTE_DESKTOP_RESOURCES_DIR,
+				launchSecret: s.ZEROBYTE_DESKTOP_LAUNCH_SECRET,
+			},
+			resticCommand,
+		};
+	});
+
+export const parseConfig = (env: unknown) => {
+	const result = envSchema.safeParse(env);
+
+	if (!result.success) {
+		console.error(`Environment variable validation failed: ${prettifyError(result.error)}`);
+		process.exit(1);
 	}
 
-	return result;
+	if (!result.data.appSecret) {
+		console.error(
+			"APP_SECRET is required but was not provided. Please set the APP_SECRET environment variable or provide a file with APP_SECRET_FILE.",
+		);
+		process.exit(1);
+	}
+
+	return result.data;
 };
 
 export const config = parseConfig(process.env);
